@@ -1,0 +1,26 @@
+[project]
+name = "sttm-automate"
+version = "0.1.0"
+description = "Automated Gurbani projection for live kirtan using SikhiToTheMax"
+requires-python = ">=3.11"
+dependencies = [
+    "faster-whisper>=1.0.0",
+    "sounddevice>=0.4.6",
+    "numpy>=1.24.0",
+    "banidb>=0.4.1",
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "websockets>=12.0",
+    "httpx>=0.25.0",
+    "playwright>=1.40.0",
+    "pydantic>=2.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[project.scripts]
+sttm-automate = "src.main:main"
