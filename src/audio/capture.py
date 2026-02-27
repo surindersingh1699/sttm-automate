@@ -82,3 +82,34 @@ class AudioCapture:
                     "default": i == sd.default.device[0],
                 })
         return inputs
+
+    @staticmethod
+    def find_blackhole_device() -> int | None:
+        """Find BlackHole virtual audio device index, if installed."""
+        devices = sd.query_devices()
+        for i, dev in enumerate(devices):
+            if dev["max_input_channels"] > 0 and "blackhole" in dev["name"].lower():
+                return i
+        return None
+
+    @staticmethod
+    def find_best_device() -> int | None:
+        """
+        Auto-select the best audio input device.
+        Priority: BlackHole > Multi-Output > system default.
+        """
+        devices = sd.query_devices()
+        for i, dev in enumerate(devices):
+            if dev["max_input_channels"] > 0:
+                name = dev["name"].lower()
+                if "blackhole" in name:
+                    print(f"[AudioCapture] Using BlackHole: {dev['name']} (device {i})")
+                    return i
+        for i, dev in enumerate(devices):
+            if dev["max_input_channels"] > 0:
+                name = dev["name"].lower()
+                if "multi-output" in name or "aggregate" in name:
+                    print(f"[AudioCapture] Using aggregate device: {dev['name']} (device {i})")
+                    return i
+        # Fall back to system default
+        return None

@@ -31,6 +31,9 @@ class PipelineOrchestrator:
         broadcast: BroadcastFn | None = None,
         audio_device: int | None = None,
     ):
+        # Auto-detect best audio device (BlackHole > aggregate > default)
+        if audio_device is None:
+            audio_device = AudioCapture.find_best_device()
         self.audio = AudioCapture(device=audio_device)
         self.buffer = AudioRingBuffer()
         self.transcriber = TranscriptionEngine()
