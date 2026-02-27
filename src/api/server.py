@@ -11,7 +11,6 @@ from fastapi.responses import FileResponse
 
 from src.config import config
 from src.controller.sttm_http import STTMHttpController
-from src.controller.sttm_playwright import STTMPlaywrightController
 from src.pipeline.orchestrator import PipelineOrchestrator
 
 # Connected WebSocket clients
@@ -41,13 +40,12 @@ async def lifespan(app: FastAPI):
     """Start pipeline on app startup, stop on shutdown."""
     global pipeline
 
-    # Try HTTP controller first, fall back to Playwright
+    # Try HTTP controller — if STTM isn't running, pipeline still works in monitor mode
     controller = STTMHttpController()
     connected = await controller.connect()
     if not connected:
-        print("[Server] HTTP controller failed. Trying Playwright...")
-        await controller.disconnect()
-        controller = STTMPlaywrightController()
+        print("[Server] STTM not detected. Running in monitor-only mode.")
+        print("[Server] Start STTM Desktop to enable auto-display.")
 
     pipeline = PipelineOrchestrator(
         controller=controller,

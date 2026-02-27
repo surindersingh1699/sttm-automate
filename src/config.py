@@ -19,8 +19,9 @@ class WhisperConfig(BaseModel):
     language: str = "pa"  # Punjabi
     beam_size: int = 5
     vad_filter: bool = True
-    vad_min_silence_ms: int = 500
-    vad_speech_pad_ms: int = 200
+    vad_threshold: float = 0.3  # lower = more sensitive to speech
+    vad_min_silence_ms: int = 300
+    vad_speech_pad_ms: int = 300
 
 
 class MatcherConfig(BaseModel):
@@ -38,14 +39,14 @@ class MatcherConfig(BaseModel):
 
 
 class STTMConfig(BaseModel):
-    ports: list[int] = [1397, 1469, 1539, 1552, 1574, 1581, 1606, 1644, 1661, 1665, 1675, 1708]
+    ports: list[int] = [8000, 1397, 1469, 1539, 1552, 1574, 1581, 1606, 1644, 1661, 1665, 1675, 1708]
     connect_timeout: float = 1.0  # seconds per port attempt
     cdp_port: int = 9222  # Chrome DevTools Protocol port for Playwright
 
 
 class DashboardConfig(BaseModel):
     host: str = "0.0.0.0"
-    port: int = 8000
+    port: int = 8080
     max_candidates: int = 5  # top N candidates to show
 
 

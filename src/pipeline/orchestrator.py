@@ -105,6 +105,8 @@ class PipelineOrchestrator:
 
     async def _run_loop(self):
         """Main processing loop."""
+        import numpy as np
+
         while self.running:
             try:
                 # 1. Get audio chunk
@@ -115,9 +117,28 @@ class PipelineOrchestrator:
                 # Apply overlap buffer
                 window = self.buffer.process(chunk)
 
+                # Log audio level
+                rms = float(np.sqrt(np.mean(window**2)))
+                has_vocals = bool(self.transcriber.has_vocal_content(window))
+                await self._broadcast({
+                    "type": "audio_level",
+                    "rms": round(rms, 4),
+                    "has_vocals": has_vocals,
+                })
+
                 if self.paused:
                     await self._broadcast({"type": "paused"})
                     await asyncio.sleep(0.1)
+                    continue
+
+                # Skip transcription if no vocal content (just music/silence)
+                if not has_vocals:
+                    await self._broadcast({
+                        "type": "transcription",
+                        "text": "",
+                        "first_letters": "",
+                        "status": "music_only",
+                    })
                     continue
 
                 # 2. Transcribe

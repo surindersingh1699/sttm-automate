@@ -78,6 +78,9 @@ function handleMessage(data) {
             isPaused = data.paused;
             updatePauseButton();
             break;
+        case "audio_level":
+            updateAudioLevel(data.rms, data.has_vocals);
+            break;
         case "error":
             showError(data.message);
             break;
@@ -92,10 +95,33 @@ function updateTranscription(data) {
 
     if (data.text) {
         el.textContent = data.text;
+        el.className = "";
+    } else if (data.status === "music_only") {
+        el.textContent = "Music playing... (waiting for vocals)";
+        el.className = "placeholder";
+    } else {
+        el.textContent = "Listening... (no speech detected)";
+        el.className = "placeholder";
     }
 
     if (data.first_letters) {
-        lettersEl.textContent = data.first_letters;
+        lettersEl.textContent = "First letters: " + data.first_letters;
+    } else {
+        lettersEl.textContent = "";
+    }
+}
+
+function updateAudioLevel(rms, hasVocals) {
+    var el = document.getElementById("audio-level");
+    if (!el) return;
+    var pct = Math.min(rms * 500, 100);
+    el.style.width = pct + "%";
+    if (hasVocals) {
+        el.className = "audio-fill active";
+    } else if (rms > 0.01) {
+        el.className = "audio-fill music";
+    } else {
+        el.className = "audio-fill";
     }
 }
 
