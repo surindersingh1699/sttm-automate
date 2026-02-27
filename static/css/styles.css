@@ -1,0 +1,241 @@
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #1a1a2e;
+    color: #eee;
+    min-height: 100vh;
+}
+
+header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 24px;
+    background: #16213e;
+    border-bottom: 1px solid #0f3460;
+}
+
+header h1 {
+    font-size: 1.2rem;
+    color: #e94560;
+}
+
+.controls {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.status-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    display: inline-block;
+}
+
+.status-connecting { background: #f0a500; }
+.status-running { background: #4ecca3; }
+.status-paused { background: #e94560; }
+.status-error { background: #ff4444; }
+
+#status-text {
+    font-size: 0.85rem;
+    color: #999;
+}
+
+.btn {
+    padding: 6px 16px;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.85rem;
+    font-weight: 500;
+    transition: opacity 0.2s;
+}
+
+.btn:hover { opacity: 0.85; }
+.btn-warning { background: #f0a500; color: #000; }
+.btn-primary { background: #4ecca3; color: #000; }
+.btn-small { padding: 4px 10px; font-size: 0.8rem; background: #0f3460; color: #eee; }
+.btn-small:hover { background: #1a4a7a; }
+
+main {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: auto auto;
+    gap: 16px;
+    padding: 16px 24px;
+    max-width: 1400px;
+    margin: 0 auto;
+}
+
+.panel {
+    background: #16213e;
+    border: 1px solid #0f3460;
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+.panel h2 {
+    font-size: 0.9rem;
+    padding: 10px 16px;
+    background: #0f3460;
+    color: #4ecca3;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.panel-content {
+    padding: 16px;
+}
+
+.scrollable {
+    max-height: 250px;
+    overflow-y: auto;
+}
+
+.placeholder {
+    color: #666;
+    font-style: italic;
+    font-size: 0.9rem;
+}
+
+/* Transcription panel */
+#transcription-text {
+    font-size: 1.1rem;
+    line-height: 1.6;
+    min-height: 60px;
+    padding: 8px;
+    background: #1a1a2e;
+    border-radius: 4px;
+}
+
+.first-letters {
+    margin-top: 8px;
+    font-family: monospace;
+    font-size: 1.2rem;
+    color: #f0a500;
+    letter-spacing: 2px;
+}
+
+/* Candidates */
+.candidate-item {
+    display: flex;
+    align-items: center;
+    padding: 8px 12px;
+    margin-bottom: 6px;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background 0.2s;
+    border-left: 4px solid transparent;
+}
+
+.candidate-item:hover { background: #1a1a2e; }
+.candidate-item.action-auto { border-left-color: #4ecca3; }
+.candidate-item.action-suggest { border-left-color: #f0a500; }
+.candidate-item.action-ignore { border-left-color: #666; }
+
+.candidate-text {
+    flex: 1;
+    font-size: 0.95rem;
+}
+
+.candidate-text .gurmukhi {
+    font-size: 1.05rem;
+}
+
+.candidate-text .english {
+    font-size: 0.8rem;
+    color: #999;
+    margin-top: 2px;
+}
+
+.confidence-bar {
+    width: 60px;
+    height: 6px;
+    background: #1a1a2e;
+    border-radius: 3px;
+    overflow: hidden;
+    margin-left: 12px;
+}
+
+.confidence-fill {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.3s;
+}
+
+.confidence-fill.high { background: #4ecca3; }
+.confidence-fill.medium { background: #f0a500; }
+.confidence-fill.low { background: #666; }
+
+.confidence-label {
+    font-size: 0.75rem;
+    color: #999;
+    width: 40px;
+    text-align: right;
+    margin-left: 8px;
+}
+
+/* Current shabad */
+.current-shabad {
+    min-height: 80px;
+}
+
+.current-shabad .gurmukhi {
+    font-size: 1.3rem;
+    line-height: 1.8;
+    color: #fff;
+}
+
+.current-shabad .english {
+    font-size: 0.9rem;
+    color: #999;
+    margin-top: 8px;
+}
+
+.current-shabad .shabad-id {
+    font-size: 0.75rem;
+    color: #666;
+    margin-top: 4px;
+}
+
+.line-nav {
+    display: flex;
+    gap: 8px;
+    margin-top: 12px;
+}
+
+/* History */
+.history-item {
+    display: flex;
+    align-items: center;
+    padding: 6px 12px;
+    margin-bottom: 4px;
+    border-radius: 4px;
+    cursor: pointer;
+    background: #1a1a2e;
+    transition: background 0.2s;
+}
+
+.history-item:hover { background: #0f3460; }
+
+.history-item .gurmukhi {
+    flex: 1;
+    font-size: 0.9rem;
+}
+
+.history-item .time {
+    font-size: 0.75rem;
+    color: #666;
+}
+
+/* Scrollbar */
+.scrollable::-webkit-scrollbar { width: 6px; }
+.scrollable::-webkit-scrollbar-track { background: #1a1a2e; }
+.scrollable::-webkit-scrollbar-thumb { background: #0f3460; border-radius: 3px; }

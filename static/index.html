@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>STTM Automate</title>
+    <link rel="stylesheet" href="/static/css/styles.css">
+</head>
+<body>
+    <header>
+        <h1>STTM Automate</h1>
+        <div class="controls">
+            <button id="btn-pause" class="btn btn-warning" onclick="togglePause()">Pause</button>
+            <span id="status-indicator" class="status-dot status-connecting"></span>
+            <span id="status-text">Connecting...</span>
+        </div>
+    </header>
+
+    <main>
+        <!-- Live Transcription -->
+        <section class="panel" id="panel-transcription">
+            <h2>Live Transcription</h2>
+            <div class="panel-content">
+                <div id="transcription-text" class="scrollable">Waiting for audio...</div>
+                <div id="first-letters" class="first-letters"></div>
+            </div>
+        </section>
+
+        <!-- Candidate Matches -->
+        <section class="panel" id="panel-candidates">
+            <h2>Matched Shabads</h2>
+            <div class="panel-content">
+                <div id="candidates-list" class="scrollable">
+                    <p class="placeholder">Listening for kirtan...</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Current Shabad -->
+        <section class="panel" id="panel-current">
+            <h2>Current Shabad</h2>
+            <div class="panel-content">
+                <div id="current-shabad" class="current-shabad">
+                    <p class="placeholder">No shabad selected</p>
+                </div>
+                <div class="line-nav">
+                    <button class="btn btn-small" onclick="navigateLine('prev')">&#9650; Prev Line</button>
+                    <button class="btn btn-small" onclick="navigateLine('next')">&#9660; Next Line</button>
+                </div>
+            </div>
+        </section>
+
+        <!-- History Archive -->
+        <section class="panel" id="panel-history">
+            <h2>History</h2>
+            <div class="panel-content">
+                <div id="history-list" class="scrollable">
+                    <p class="placeholder">No previous shabads</p>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
