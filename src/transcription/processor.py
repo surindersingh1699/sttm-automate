@@ -14,6 +14,11 @@ _GARBAGE_PATTERNS = [
     re.compile(r'[\uac00-\ud7af]'),                  # Korean
     re.compile(r'(?i)subscribe|like|comment|video'),  # YouTube artifacts
     re.compile(r'(?i)thank you for watching'),
+    re.compile(r'ॐ'),                                # Om hallucination from music/tabla
+    re.compile(r'^[ॐ\s]+$'),                         # only Om symbols
+    re.compile(r'(?i)^(music|tabla|harmonium|dhol)'), # instrument labels
+    re.compile(r'^\W+$'),                            # only non-word characters
+    re.compile(r'^(.{1,10})\1{2,}'),                 # short phrase repeated 3+ times
 ]
 
 # Valid script ranges for Punjabi/Hindi transcription
@@ -70,6 +75,9 @@ class TranscriptionProcessor:
 
         combined = " ".join(seg.text for seg in valid_segments)
 
+        # De-stutter: remove repeated words (Google often repeats words in singing)
+        combined = self._remove_repeated_words(combined)
+
         # Remove repeated text from overlap with previous window
         if self._last_text and combined.startswith(self._last_text[:20]):
             overlap_len = min(len(self._last_text), len(combined) // 2)
@@ -88,6 +96,18 @@ class TranscriptionProcessor:
 
         self._last_text = combined
         return combined
+
+    @staticmethod
+    def _remove_repeated_words(text: str) -> str:
+        """Remove consecutive duplicate words (e.g. 'ਕੋਇ ਕੋਇ ਕੋਇ' → 'ਕੋਇ')."""
+        words = text.split()
+        if not words:
+            return text
+        deduped = [words[0]]
+        for word in words[1:]:
+            if word != deduped[-1]:
+                deduped.append(word)
+        return " ".join(deduped)
 
     def reset(self):
         """Reset state for a new session."""

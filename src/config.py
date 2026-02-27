@@ -7,21 +7,21 @@ class AudioConfig(BaseModel):
     samplerate: int = 16000
     channels: int = 1
     dtype: str = "float32"
-    chunk_duration: float = 5.0  # seconds per transcription window
-    overlap_duration: float = 1.0  # overlap between windows
+    step_duration: float = 3.0  # seconds of new audio per cycle (controls latency)
+    window_duration: float = 10.0  # seconds of audio fed to Whisper (controls context)
     device: int | None = None  # None = system default
 
 
 class WhisperConfig(BaseModel):
-    model_size: str = "base"  # tiny, base, small, medium, large-v3
+    model_size: str = "small"  # tiny, base, small, medium, large-v3 (small = best accuracy/speed for Punjabi)
     device: str = "cpu"
     compute_type: str = "int8"  # int8 for CPU, float16 for GPU
     language: str = "pa"  # Punjabi
     beam_size: int = 5
     vad_filter: bool = True
-    vad_threshold: float = 0.3  # lower = more sensitive to speech
-    vad_min_silence_ms: int = 300
-    vad_speech_pad_ms: int = 300
+    vad_threshold: float = 0.35  # lower = more sensitive to speech
+    vad_min_silence_ms: int = 800  # kirtan has natural pauses between lines (~1s)
+    vad_speech_pad_ms: int = 500  # pad more to catch singing onset/offset
 
 
 class MatcherConfig(BaseModel):

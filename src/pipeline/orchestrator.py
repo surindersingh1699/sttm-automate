@@ -163,7 +163,9 @@ class PipelineOrchestrator:
                     continue
 
                 # 6. Search BaniDB
-                candidates = self.searcher.search(first_letters)
+                candidates = await asyncio.to_thread(
+                    self.searcher.search, first_letters
+                )
 
                 # 7. Score candidates
                 current_id = self.tracker.current.shabad_id if self.tracker.current else None

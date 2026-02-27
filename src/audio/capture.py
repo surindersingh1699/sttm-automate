@@ -38,10 +38,10 @@ class AudioCapture:
 
     def get_chunk(self, timeout: float = 10.0) -> np.ndarray | None:
         """
-        Collect audio blocks until we have chunk_duration worth of audio.
+        Collect audio blocks until we have step_duration worth of new audio.
         Returns a flat float32 numpy array, or None if stopped.
         """
-        samples_needed = int(config.audio.chunk_duration * self.samplerate)
+        samples_needed = int(config.audio.step_duration * self.samplerate)
         collected: list[np.ndarray] = []
         collected_samples = 0
 

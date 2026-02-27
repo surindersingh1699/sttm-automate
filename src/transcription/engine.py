@@ -1,11 +1,11 @@
-"""Faster-whisper transcription engine for Punjabi audio."""
+"""Transcription engine — Google Speech-to-Text for Punjabi kirtan audio."""
 
+import io
+import wave
 from dataclasses import dataclass
 
 import numpy as np
-from faster_whisper import WhisperModel
-
-from src.config import config
+import speech_recognition as sr
 
 
 @dataclass
@@ -16,83 +16,68 @@ class TranscriptionSegment:
 
 
 class TranscriptionEngine:
-    """Loads faster-whisper and transcribes audio chunks to Punjabi text."""
+    """Transcribes audio using Google Web Speech API (free, no key needed)."""
 
     def __init__(self):
-        self._model: WhisperModel | None = None
+        self._recognizer: sr.Recognizer | None = None
 
     def load(self):
-        """Load the Whisper model. Call once at startup."""
-        print(f"[Whisper] Loading '{config.whisper.model_size}' model "
-              f"(device={config.whisper.device}, compute={config.whisper.compute_type})...")
-        self._model = WhisperModel(
-            config.whisper.model_size,
-            device=config.whisper.device,
-            compute_type=config.whisper.compute_type,
-        )
-        print("[Whisper] Model loaded.")
+        """Initialize the recognizer."""
+        print("[Google STT] Initializing recognizer...")
+        self._recognizer = sr.Recognizer()
+        # Tune for kirtan: lower energy threshold since audio comes via BlackHole
+        self._recognizer.energy_threshold = 50
+        self._recognizer.dynamic_energy_threshold = False
+        print("[Google STT] Ready.")
 
     def transcribe(self, audio: np.ndarray) -> list[TranscriptionSegment]:
         """
-        Transcribe an audio chunk (16kHz float32 mono).
-        Auto-normalizes quiet audio before transcription.
-        Returns list of segments with timestamps and text.
+        Transcribe audio chunk (16kHz float32 mono) via Google Speech API.
+        Returns list of segments with text.
         """
-        if self._model is None:
-            raise RuntimeError("Model not loaded. Call load() first.")
+        if self._recognizer is None:
+            raise RuntimeError("Recognizer not loaded. Call load() first.")
 
-        # Auto-gain: normalize quiet audio so Whisper can detect speech
-        audio = self._normalize(audio)
+        # Skip near-silence
+        rms = float(np.sqrt(np.mean(audio**2)))
+        if rms < 0.001:
+            return []
 
-        segments_iter, info = self._model.transcribe(
-            audio,
-            language=config.whisper.language,
-            beam_size=config.whisper.beam_size,
-            vad_filter=config.whisper.vad_filter,
-            vad_parameters=dict(
-                threshold=config.whisper.vad_threshold,
-                min_silence_duration_ms=config.whisper.vad_min_silence_ms,
-                speech_pad_ms=config.whisper.vad_speech_pad_ms,
-            ),
-        )
+        # Convert float32 audio to WAV bytes
+        audio_data = self._to_speech_recognition(audio)
 
-        results = []
-        for seg in segments_iter:
-            text = seg.text.strip()
+        try:
+            text = self._recognizer.recognize_google(
+                audio_data, language="pa-IN"
+            )
+            text = text.strip()
             if text:
-                results.append(TranscriptionSegment(
-                    start=seg.start,
-                    end=seg.end,
-                    text=text,
-                ))
+                duration = len(audio) / 16000
+                return [TranscriptionSegment(start=0.0, end=duration, text=text)]
+        except sr.UnknownValueError:
+            pass  # Google couldn't understand — normal for instrumental sections
+        except sr.RequestError as e:
+            print(f"[Google STT] API error: {e}")
 
-        return results
+        return []
 
     @staticmethod
-    def _normalize(audio: np.ndarray, target_peak: float = 0.7) -> np.ndarray:
-        """Normalize audio to a target peak level for consistent Whisper input."""
-        peak = np.max(np.abs(audio))
-        if peak < 0.005:
-            return audio  # near-silence, don't amplify noise
-        gain = min(target_peak / peak, 20.0)
-        if gain > 1.2:
-            return np.clip(audio * gain, -1.0, 1.0).astype(np.float32)
-        return audio
+    def _to_speech_recognition(audio: np.ndarray) -> sr.AudioData:
+        """Convert numpy float32 audio to SpeechRecognition AudioData."""
+        audio_int16 = (audio * 32767).astype(np.int16)
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(audio_int16.tobytes())
+        buf.seek(0)
+        with sr.AudioFile(buf) as source:
+            recognizer = sr.Recognizer()
+            return recognizer.record(source)
 
     @staticmethod
     def has_vocal_content(audio: np.ndarray, samplerate: int = 16000) -> bool:
-        """
-        Detect if audio contains vocal content vs just instrumental music.
-        Uses zero-crossing rate (vocals have higher ZCR than instruments)
-        and spectral centroid heuristics.
-        """
+        """Check if audio has any content worth transcribing."""
         rms = np.sqrt(np.mean(audio**2))
-        if rms < 0.005:
-            return False  # silence
-
-        # Zero-crossing rate: vocals typically 0.02-0.15, pure music lower
-        zero_crossings = np.sum(np.abs(np.diff(np.sign(audio)))) / (2.0 * len(audio))
-
-        # For kirtan with background music, even if ZCR is moderate,
-        # we should try transcription. Only skip if very low energy.
-        return rms > 0.01 or zero_crossings > 0.03
+        return rms > 0.001

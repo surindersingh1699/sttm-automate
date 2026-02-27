@@ -1,4 +1,4 @@
-"""Ring buffer for producing overlapping audio windows."""
+"""Sliding window buffer: short step, long context for Whisper."""
 
 import numpy as np
 
@@ -7,41 +7,26 @@ from src.config import config
 
 class AudioRingBuffer:
     """
-    Maintains a sliding window of audio data.
-    Produces overlapping chunks for continuous transcription.
+    Maintains a sliding window of audio.
+    Each call to process() appends new audio (step_duration)
+    and returns the full window (window_duration) for Whisper.
     """
 
     def __init__(self):
         self.samplerate = config.audio.samplerate
-        self.chunk_samples = int(config.audio.chunk_duration * self.samplerate)
-        self.overlap_samples = int(config.audio.overlap_duration * self.samplerate)
-        self.advance_samples = self.chunk_samples - self.overlap_samples
-
-        # Buffer holds current chunk + overlap from previous
-        self._previous_tail: np.ndarray | None = None
+        self.window_samples = int(config.audio.window_duration * self.samplerate)
+        # Start with silence so Whisper always gets a full window
+        self._buffer = np.zeros(self.window_samples, dtype=np.float32)
 
     def process(self, new_audio: np.ndarray) -> np.ndarray:
         """
-        Take new audio and prepend overlap from previous chunk.
-        Returns a window of chunk_duration length.
+        Append new audio, shift window, return full window_duration of audio.
         """
-        if self._previous_tail is not None:
-            window = np.concatenate([self._previous_tail, new_audio])
-        else:
-            window = new_audio
-
-        # Save the tail for overlap with next chunk
-        if len(new_audio) >= self.overlap_samples:
-            self._previous_tail = new_audio[-self.overlap_samples:]
-        else:
-            self._previous_tail = new_audio.copy()
-
-        # Trim to chunk size
-        if len(window) > self.chunk_samples:
-            window = window[-self.chunk_samples:]
-
-        return window
+        n = len(new_audio)
+        # Shift old audio left, append new audio at the end
+        self._buffer = np.concatenate([self._buffer[n:], new_audio])
+        return self._buffer.copy()
 
     def reset(self):
-        """Clear the overlap buffer."""
-        self._previous_tail = None
+        """Clear the buffer."""
+        self._buffer = np.zeros(self.window_samples, dtype=np.float32)
