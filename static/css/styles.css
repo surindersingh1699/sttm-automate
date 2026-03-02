@@ -66,12 +66,17 @@ header h1 {
 
 main {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: 1fr 1fr 1fr;
     grid-template-rows: auto auto;
     gap: 16px;
     padding: 16px 24px;
-    max-width: 1400px;
+    max-width: 1800px;
     margin: 0 auto;
+}
+
+#panel-pangati {
+    grid-column: 3;
+    grid-row: 1 / 3;
 }
 
 .panel {
@@ -259,6 +264,50 @@ main {
 .history-item .time {
     font-size: 0.75rem;
     color: #666;
+}
+
+/* Pangati (Shabad Lines) */
+#panel-pangati .scrollable {
+    max-height: 560px;
+}
+
+.pangati-item {
+    padding: 8px 12px;
+    margin-bottom: 4px;
+    border-radius: 4px;
+    border-left: 3px solid transparent;
+    background: #1a1a2e;
+    transition: background 0.3s, border-color 0.3s;
+}
+
+.pangati-item .gurmukhi {
+    font-size: 1rem;
+    line-height: 1.6;
+}
+
+.pangati-item .english {
+    font-size: 0.78rem;
+    color: #777;
+    margin-top: 2px;
+}
+
+.pangati-item .line-num {
+    font-size: 0.7rem;
+    color: #555;
+    float: right;
+}
+
+.pangati-item.active {
+    border-left-color: #4ecca3;
+    background: #0f3460;
+}
+
+.pangati-item.active .gurmukhi {
+    color: #fff;
+}
+
+.pangati-item.active .english {
+    color: #aaa;
 }
 
 /* Scrollbar */

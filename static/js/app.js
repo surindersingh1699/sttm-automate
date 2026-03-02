@@ -6,6 +6,8 @@
 let ws = null;
 let isPaused = false;
 let reconnectTimer = null;
+let currentVerses = [];
+let currentLineIndex = -1;
 
 // --- Safe DOM Helpers ---
 
@@ -67,12 +69,33 @@ function handleMessage(data) {
         case "candidates":
             updateCandidates(data.matches);
             break;
+        case "shabad_locked":
+            if (data.verses) {
+                currentVerses = data.verses;
+                currentLineIndex = 0;
+                renderPangati();
+                highlightPangati(0);
+            }
+            highlightAutoSelected();
+            break;
+        case "line_aligned":
+            highlightPangati(data.line_index);
+            break;
+        case "shabad_switched":
+            clearPangati();
+            break;
         case "auto_selected":
             highlightAutoSelected();
             break;
         case "state":
             updateCurrentShabad(data.current);
             updateHistory(data.history);
+            if (data.current && data.current.current_line !== undefined) {
+                highlightPangati(data.current.current_line);
+            }
+            if (data.pipeline_state === "searching" && currentVerses.length > 0) {
+                clearPangati();
+            }
             break;
         case "status":
             isPaused = data.paused;
@@ -173,8 +196,58 @@ function updateCurrentShabad(current) {
     el.appendChild(createElement("div", "gurmukhi", current.unicode || current.gurmukhi || ""));
     el.appendChild(createElement("div", "english", current.english || ""));
     el.appendChild(createElement("div", "shabad-id",
-        "ID: " + current.shabad_id + " | Line: " + current.current_line));
+        "ID: " + current.shabad_id + " | Line: " + (current.current_line + 1) + "/" + (current.total_lines || "?")));
 }
+
+// --- Pangati (Shabad Lines) ---
+
+function renderPangati() {
+    var container = document.getElementById("pangati-list");
+    clearChildren(container);
+
+    if (!currentVerses || currentVerses.length === 0) {
+        container.appendChild(createElement("p", "placeholder", "Lock a shabad to see its lines"));
+        return;
+    }
+
+    currentVerses.forEach(function(v, i) {
+        var item = createElement("div", "pangati-item");
+        item.setAttribute("data-index", i);
+
+        item.appendChild(createElement("span", "line-num", (i + 1) + ""));
+        item.appendChild(createElement("div", "gurmukhi", v.unicode || ""));
+        item.appendChild(createElement("div", "english", v.english || ""));
+
+        container.appendChild(item);
+    });
+}
+
+function highlightPangati(index) {
+    if (index < 0 || !currentVerses.length) return;
+    currentLineIndex = index;
+
+    var container = document.getElementById("pangati-list");
+    var items = container.querySelectorAll(".pangati-item");
+
+    items.forEach(function(item) {
+        item.classList.remove("active");
+    });
+
+    if (index < items.length) {
+        items[index].classList.add("active");
+        items[index].scrollIntoView({ block: "center", behavior: "smooth" });
+    }
+}
+
+function clearPangati() {
+    currentVerses = [];
+    currentLineIndex = -1;
+    var container = document.getElementById("pangati-list");
+    clearChildren(container);
+    container.appendChild(createElement("p", "placeholder", "Lock a shabad to see its lines"));
+}
+
+// --- History ---
 
 function updateHistory(history) {
     var container = document.getElementById("history-list");

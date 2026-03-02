@@ -96,9 +96,14 @@ class PipelineOrchestrator:
                 candidate.gurmukhi, candidate.unicode, candidate.english, verses
             )
         await self._broadcast({
-            "type": "manual_selected",
+            "type": "shabad_locked",
             "shabad_id": shabad_id,
             "state": self.tracker.state.value,
+            "total_lines": len(verses) if verses else 0,
+            "verses": [
+                {"unicode": v.unicode, "english": v.english}
+                for v in (verses or [])
+            ],
         })
 
     async def manual_navigate(self, direction: str):
@@ -112,9 +117,16 @@ class PipelineOrchestrator:
         found = self.tracker.recall_from_history(shabad_id)
         if found:
             await self.controller.display_shabad(shabad_id)
+            current = self.tracker.current
+            verses = current.verses if current else []
             await self._broadcast({
-                "type": "recalled",
+                "type": "shabad_locked",
                 "shabad_id": shabad_id,
+                "total_lines": len(verses),
+                "verses": [
+                    {"unicode": v.unicode, "english": v.english}
+                    for v in verses
+                ],
             })
 
     async def _run_loop(self):
@@ -227,6 +239,10 @@ class PipelineOrchestrator:
                     "type": "shabad_locked",
                     "shabad": top,
                     "total_lines": len(verses),
+                    "verses": [
+                        {"unicode": v.unicode, "english": v.english}
+                        for v in verses
+                    ],
                 })
                 print(f"  [LOCKED] Shabad {top['shabad_id']} — {top['unicode'][:60]}")
 
