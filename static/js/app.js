@@ -8,6 +8,7 @@ let isPaused = false;
 let reconnectTimer = null;
 let currentVerses = [];
 let currentLineIndex = -1;
+let currentShabadId = null;
 
 // --- Safe DOM Helpers ---
 
@@ -71,12 +72,16 @@ function handleMessage(data) {
             updateCandidates(data.matches);
             break;
         case "shabad_locked":
-            console.log("[LOCKED] verses:", data.verses ? data.verses.length : "NONE");
+            var lockedShabadId = data.shabad_id || (data.shabad && data.shabad.shabad_id) || null;
             if (data.verses && data.verses.length > 0) {
+                currentShabadId = lockedShabadId;
                 currentVerses = data.verses;
                 currentLineIndex = 0;
                 renderPangati();
                 highlightPangati(0);
+            } else if (lockedShabadId) {
+                // Verses missing from broadcast — fetch via REST
+                fetchVerses(lockedShabadId);
             }
             highlightAutoSelected();
             break;
@@ -92,16 +97,26 @@ function handleMessage(data) {
         case "state":
             updateCurrentShabad(data.current);
             updateHistory(data.history);
-            // Populate pangati from state message if we don't have them yet
-            if (data.verses && data.verses.length > 0 && currentVerses.length === 0) {
-                currentVerses = data.verses;
-                renderPangati();
-            }
-            if (data.current && data.current.current_line !== undefined) {
-                highlightPangati(data.current.current_line);
-            }
-            if (data.pipeline_state === "searching" && currentVerses.length > 0) {
-                clearPangati();
+            if (data.pipeline_state === "searching") {
+                if (currentVerses.length > 0) {
+                    clearPangati();
+                }
+            } else if (data.current) {
+                var shabadId = data.current.shabad_id;
+                // Populate pangati if we have verses and shabad changed or verses empty
+                if (data.verses && data.verses.length > 0) {
+                    if (currentVerses.length === 0 || currentShabadId !== shabadId) {
+                        currentShabadId = shabadId;
+                        currentVerses = data.verses;
+                        renderPangati();
+                    }
+                } else if (shabadId && (currentVerses.length === 0 || currentShabadId !== shabadId)) {
+                    // No verses in broadcast — fetch via REST
+                    fetchVerses(shabadId);
+                }
+                if (data.current.current_line !== undefined) {
+                    highlightPangati(data.current.current_line);
+                }
             }
             break;
         case "status":
@@ -249,9 +264,26 @@ function highlightPangati(index) {
 function clearPangati() {
     currentVerses = [];
     currentLineIndex = -1;
+    currentShabadId = null;
     var container = document.getElementById("pangati-list");
     clearChildren(container);
     container.appendChild(createElement("p", "placeholder", "Lock a shabad to see its lines"));
+}
+
+function fetchVerses(shabadId) {
+    // Track the most recent shabad requested so stale responses can be ignored.
+    currentShabadId = shabadId;
+    fetch("/api/verses/" + shabadId)
+        .then(function(resp) { return resp.json(); })
+        .then(function(data) {
+            if (data.verses && data.verses.length > 0 && currentShabadId === shabadId) {
+                currentVerses = data.verses;
+                renderPangati();
+            }
+        })
+        .catch(function(err) {
+            console.error("[fetchVerses] Error:", err);
+        });
 }
 
 // --- History ---

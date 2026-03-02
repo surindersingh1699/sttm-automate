@@ -82,31 +82,29 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     clients.append(websocket)
 
-    # Send initial state
+    # Send initial state (include verses so pangati panel populates immediately)
     if pipeline:
-        await websocket.send_text(json.dumps({
+        current = pipeline.tracker.current
+        init_state = {
             "type": "state",
             "pipeline_state": pipeline.tracker.state.value,
-            "current": pipeline.tracker.current.to_dict() if pipeline.tracker.current else None,
+            "current": current.to_dict() if current else None,
             "history": pipeline.tracker.get_history_list(),
-        }, ensure_ascii=False))
-
-        # If a shabad is already locked, send verses so pangati panel populates
-        current = pipeline.tracker.current
+        }
         if current and current.verses:
-            await websocket.send_text(json.dumps({
-                "type": "shabad_locked",
-                "shabad_id": current.shabad_id,
-                "total_lines": len(current.verses),
-                "verses": [
-                    {"unicode": v.unicode, "english": v.english}
-                    for v in current.verses
-                ],
-            }, ensure_ascii=False))
+            init_state["verses"] = [
+                {"unicode": v.unicode, "english": v.english}
+                for v in current.verses
+            ]
+        await websocket.send_text(json.dumps(init_state, ensure_ascii=False))
 
     try:
         while True:
-            data = await websocket.receive_text()
+            try:
+                data = await websocket.receive_text()
+            except (WebSocketDisconnect, RuntimeError):
+                break
+
             msg = json.loads(data)
 
             if not pipeline:
@@ -136,8 +134,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 pipeline.resume()
                 await broadcast({"type": "status", "paused": False})
 
-    except WebSocketDisconnect:
-        clients.remove(websocket)
+    finally:
+        if websocket in clients:
+            clients.remove(websocket)
 
 
 @app.get("/api/status")
@@ -151,6 +150,35 @@ async def get_status():
         "pipeline_state": pipeline.tracker.state.value,
         "current": pipeline.tracker.current.to_dict() if pipeline.tracker.current else None,
         "history_count": len(pipeline.tracker.history),
+    }
+
+
+@app.get("/api/verses/{shabad_id}")
+async def get_verses(shabad_id: int):
+    """Fetch all verses for a shabad (fallback for when WebSocket broadcast misses)."""
+    if not pipeline:
+        return {"verses": []}
+
+    # First try the cached verses from the tracker
+    current = pipeline.tracker.current
+    if current and current.shabad_id == shabad_id and current.verses:
+        return {
+            "shabad_id": shabad_id,
+            "verses": [
+                {"unicode": v.unicode, "english": v.english}
+                for v in current.verses
+            ],
+        }
+
+    # Otherwise fetch from BaniDB
+    import asyncio
+    verses = await asyncio.to_thread(pipeline.searcher.fetch_all_verses, shabad_id)
+    return {
+        "shabad_id": shabad_id,
+        "verses": [
+            {"unicode": v.unicode, "english": v.english}
+            for v in verses
+        ],
     }
 
 

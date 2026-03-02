@@ -245,6 +245,7 @@ class PipelineOrchestrator:
                 )
                 await self._broadcast({
                     "type": "shabad_locked",
+                    "shabad_id": top["shabad_id"],
                     "shabad": top,
                     "total_lines": len(verses),
                     "verses": [
