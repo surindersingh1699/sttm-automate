@@ -91,6 +91,19 @@ async def websocket_endpoint(websocket: WebSocket):
             "history": pipeline.tracker.get_history_list(),
         }, ensure_ascii=False))
 
+        # If a shabad is already locked, send verses so pangati panel populates
+        current = pipeline.tracker.current
+        if current and current.verses:
+            await websocket.send_text(json.dumps({
+                "type": "shabad_locked",
+                "shabad_id": current.shabad_id,
+                "total_lines": len(current.verses),
+                "verses": [
+                    {"unicode": v.unicode, "english": v.english}
+                    for v in current.verses
+                ],
+            }, ensure_ascii=False))
+
     try:
         while True:
             data = await websocket.receive_text()
