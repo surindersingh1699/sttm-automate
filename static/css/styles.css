@@ -29,6 +29,27 @@ header h1 {
     display: flex;
     align-items: center;
     gap: 12px;
+    flex-wrap: wrap;
+}
+
+.control-input {
+    width: 130px;
+    padding: 6px 8px;
+    border: 1px solid #0f3460;
+    border-radius: 4px;
+    background: #1a1a2e;
+    color: #eee;
+    font-size: 0.85rem;
+}
+
+.control-input::placeholder {
+    color: #777;
+}
+
+.pin-status {
+    font-size: 0.8rem;
+    color: #999;
+    min-width: 110px;
 }
 
 .status-dot {

@@ -41,9 +41,10 @@ class MatcherConfig(BaseModel):
 
 
 class STTMConfig(BaseModel):
-    ports: list[int] = [8000, 1397, 1469, 1539, 1552, 1574, 1581, 1606, 1644, 1661, 1665, 1675, 1708]
+    ports: list[int] = [8001, 8000, 1397, 1469, 1539, 1552, 1574, 1581, 1606, 1644, 1661, 1665, 1675, 1708]
     connect_timeout: float = 1.0  # seconds per port attempt
     cdp_port: int = 9222  # Chrome DevTools Protocol port for Playwright
+    controller_pin: int | None = 8945  # Optional Bani Controller PIN for authenticated control payloads
 
 
 class DashboardConfig(BaseModel):

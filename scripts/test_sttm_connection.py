@@ -21,7 +21,7 @@ except ImportError:
     sys.exit(1)
 
 
-STTM_PORTS = [1397, 1469, 1539, 1552, 1574, 1581, 1606, 1644, 1661, 1665, 1675, 1708]
+STTM_PORTS = [8001, 8000, 1397, 1469, 1539, 1552, 1574, 1581, 1606, 1644, 1661, 1665, 1675, 1708]
 
 
 async def discover_sttm_port() -> str | None:

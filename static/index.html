@@ -11,6 +11,10 @@
         <h1>STTM Automate</h1>
         <div class="controls">
             <button id="btn-pause" class="btn btn-warning" onclick="togglePause()">Pause</button>
+            <input id="controller-pin" class="control-input" type="number" inputmode="numeric" placeholder="Controller PIN">
+            <button class="btn btn-small" onclick="setControllerPin()">Set PIN</button>
+            <button class="btn btn-small" onclick="clearControllerPin()">Clear</button>
+            <span id="pin-status" class="pin-status"></span>
             <span id="status-indicator" class="status-dot status-connecting"></span>
             <span id="status-text">Connecting...</span>
         </div>

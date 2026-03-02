@@ -5,6 +5,8 @@ import httpx
 from src.config import config
 from src.controller.base import STTMController
 
+_BANIDB_API_BASE = "https://api.banidb.com/v2"
+
 
 class STTMHttpController(STTMController):
     """
@@ -17,6 +19,9 @@ class STTMHttpController(STTMController):
     def __init__(self):
         self.base_url: str | None = None
         self._client = httpx.AsyncClient(timeout=config.sttm.connect_timeout)
+        self._banidb = httpx.AsyncClient(base_url=_BANIDB_API_BASE, timeout=8.0)
+        self._active_shabad_id: int | None = None
+        self._first_verse_cache: dict[int, int] = {}
 
     async def connect(self) -> bool:
         """Discover STTM's port and verify connectivity."""
@@ -34,36 +39,59 @@ class STTMHttpController(STTMController):
         return False
 
     async def search_shabad(self, query: str) -> bool:
-        """Send a search command to STTM."""
-        return await self._send_control({
-            "type": "search",
-            "query": query,
-        })
+        """Search is not used in the current STTM controller integration."""
+        return False
 
     async def select_result(self, index: int = 0) -> bool:
-        """Select a search result."""
-        return await self._send_control({
-            "type": "select",
-            "index": index,
-        })
+        """Selecting a result is not supported via the current STTM controller payloads."""
+        return False
 
     async def display_shabad(self, shabad_id: int) -> bool:
         """Display a shabad by its ID."""
-        return await self._send_control({
+        first_verse_id = await self._get_first_verse_id(shabad_id)
+        ok = await self._send_control({
             "type": "shabad",
             "shabadId": shabad_id,
+            # Compatibility fields observed in STTM desktop internals.
+            "id": shabad_id,
+            "verseId": first_verse_id,
+            "lineCount": 1,
+            "highlight": first_verse_id,
+            "homeId": first_verse_id,
         })
+        if ok:
+            self._active_shabad_id = shabad_id
+        return ok
 
     async def navigate_line(self, direction: str = "next") -> bool:
-        """Navigate lines within current shabad."""
-        return await self._send_control({
-            "type": "navigate",
-            "direction": direction,
-        })
+        """
+        STTM's remote listener does not handle a dedicated 'navigate' message type.
+        Sending unknown types can destabilize the remote controller UI, so this is a safe no-op.
+        """
+        return self._active_shabad_id is not None
 
     async def disconnect(self):
         """Close the HTTP client."""
         await self._client.aclose()
+        await self._banidb.aclose()
+
+    async def _get_first_verse_id(self, shabad_id: int) -> int:
+        """Resolve and cache the first verseId for a shabad (needed by STTM controller payload)."""
+        cached = self._first_verse_cache.get(shabad_id)
+        if cached is not None:
+            return cached
+        try:
+            resp = await self._banidb.get(f"/shabads/{shabad_id}")
+            resp.raise_for_status()
+            data = resp.json()
+            verses = data.get("verses", [])
+            if verses:
+                verse_id = int(verses[0].get("verseId", 1))
+                self._first_verse_cache[shabad_id] = verse_id
+                return verse_id
+        except Exception as e:
+            print(f"[STTM HTTP] Could not resolve verseId for shabad {shabad_id}: {e}")
+        return 1
 
     async def _send_control(self, data: dict) -> bool:
         """
@@ -77,15 +105,33 @@ class STTMHttpController(STTMController):
         The payloads here are our best guess and will need refinement.
         """
         if not self.base_url:
-            print("[STTM HTTP] Not connected")
-            return False
+            connected = await self.connect()
+            if not connected:
+                print("[STTM HTTP] Not connected")
+                return False
+
+        payload = dict(data)
+        if config.sttm.controller_pin is not None and "pin" not in payload:
+            payload["pin"] = str(config.sttm.controller_pin)
 
         try:
             resp = await self._client.post(
                 f"{self.base_url}/api/bani-control",
-                json=data,
+                json=payload,
             )
             return resp.status_code == 200
         except Exception as e:
-            print(f"[STTM HTTP] Error: {e}")
-            return False
+            print(f"[STTM HTTP] Error on {self.base_url}: {e}. Rediscovering port...")
+            self.base_url = None
+            connected = await self.connect()
+            if not connected:
+                return False
+            try:
+                retry = await self._client.post(
+                    f"{self.base_url}/api/bani-control",
+                    json=payload,
+                )
+                return retry.status_code == 200
+            except Exception as retry_error:
+                print(f"[STTM HTTP] Retry failed: {retry_error}")
+                return False

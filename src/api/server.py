@@ -90,6 +90,7 @@ async def websocket_endpoint(websocket: WebSocket):
             "pipeline_state": pipeline.tracker.state.value,
             "current": current.to_dict() if current else None,
             "history": pipeline.tracker.get_history_list(),
+            "controller_pin": config.sttm.controller_pin,
         }
         if current and current.verses:
             init_state["verses"] = [
@@ -133,6 +134,17 @@ async def websocket_endpoint(websocket: WebSocket):
             elif msg_type == "resume":
                 pipeline.resume()
                 await broadcast({"type": "status", "paused": False})
+
+            elif msg_type == "set_controller_pin":
+                pin = msg.get("controller_pin")
+                if pin in (None, ""):
+                    config.sttm.controller_pin = None
+                else:
+                    config.sttm.controller_pin = int(pin)
+                await broadcast({
+                    "type": "controller_pin_updated",
+                    "controller_pin": config.sttm.controller_pin,
+                })
 
     finally:
         if websocket in clients:

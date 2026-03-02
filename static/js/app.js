@@ -97,6 +97,7 @@ function handleMessage(data) {
         case "state":
             updateCurrentShabad(data.current);
             updateHistory(data.history);
+            updatePinStatus(data.controller_pin);
             if (data.pipeline_state === "searching") {
                 if (currentVerses.length > 0) {
                     clearPangati();
@@ -122,6 +123,9 @@ function handleMessage(data) {
         case "status":
             isPaused = data.paused;
             updatePauseButton();
+            break;
+        case "controller_pin_updated":
+            updatePinStatus(data.controller_pin);
             break;
         case "audio_level":
             updateAudioLevel(data.rms, data.has_vocals);
@@ -327,6 +331,20 @@ function setStatus(state, text) {
     label.textContent = text;
 }
 
+function updatePinStatus(pinValue) {
+    var status = document.getElementById("pin-status");
+    var input = document.getElementById("controller-pin");
+    if (!status || !input) return;
+
+    if (pinValue === null || pinValue === undefined || pinValue === "") {
+        status.textContent = "PIN: not set";
+        input.value = "";
+    } else {
+        status.textContent = "PIN: " + pinValue;
+        input.value = pinValue;
+    }
+}
+
 // --- User Actions ---
 
 function selectShabad(shabadId) {
@@ -345,6 +363,21 @@ function togglePause() {
     isPaused = !isPaused;
     send({ type: isPaused ? "pause" : "resume" });
     updatePauseButton();
+}
+
+function setControllerPin() {
+    var input = document.getElementById("controller-pin");
+    if (!input) return;
+    var value = input.value ? parseInt(input.value, 10) : NaN;
+    if (Number.isNaN(value)) {
+        updatePinStatus(null);
+        return;
+    }
+    send({ type: "set_controller_pin", controller_pin: value });
+}
+
+function clearControllerPin() {
+    send({ type: "set_controller_pin", controller_pin: null });
 }
 
 function updatePauseButton() {
