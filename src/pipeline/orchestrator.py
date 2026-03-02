@@ -192,13 +192,20 @@ class PipelineOrchestrator:
                 else:
                     await self._handle_locked(first_letters)
 
-                # 7. Broadcast current state
-                await self._broadcast({
+                # 7. Broadcast current state (include verses when locked)
+                current = self.tracker.current
+                state_msg = {
                     "type": "state",
                     "pipeline_state": self.tracker.state.value,
-                    "current": self.tracker.current.to_dict() if self.tracker.current else None,
+                    "current": current.to_dict() if current else None,
                     "history": self.tracker.get_history_list(),
-                })
+                }
+                if current and current.verses:
+                    state_msg["verses"] = [
+                        {"unicode": v.unicode, "english": v.english}
+                        for v in current.verses
+                    ]
+                await self._broadcast(state_msg)
 
             except Exception as e:
                 print(f"[Pipeline] Error in loop: {e}")
@@ -245,7 +252,7 @@ class PipelineOrchestrator:
                         for v in verses
                     ],
                 })
-                print(f"  [LOCKED] Shabad {top['shabad_id']} — {top['unicode'][:60]}")
+                print(f"  [LOCKED] Shabad {top['shabad_id']} — {top['unicode'][:60]} ({len(verses)} verses)")
 
             elif result["action"] == "pending":
                 await self._broadcast({

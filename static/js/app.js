@@ -62,6 +62,7 @@ function send(data) {
 // --- Message Handlers ---
 
 function handleMessage(data) {
+    console.log("[WS]", data.type, data);
     switch (data.type) {
         case "transcription":
             updateTranscription(data);
@@ -70,7 +71,8 @@ function handleMessage(data) {
             updateCandidates(data.matches);
             break;
         case "shabad_locked":
-            if (data.verses) {
+            console.log("[LOCKED] verses:", data.verses ? data.verses.length : "NONE");
+            if (data.verses && data.verses.length > 0) {
                 currentVerses = data.verses;
                 currentLineIndex = 0;
                 renderPangati();
@@ -90,6 +92,11 @@ function handleMessage(data) {
         case "state":
             updateCurrentShabad(data.current);
             updateHistory(data.history);
+            // Populate pangati from state message if we don't have them yet
+            if (data.verses && data.verses.length > 0 && currentVerses.length === 0) {
+                currentVerses = data.verses;
+                renderPangati();
+            }
             if (data.current && data.current.current_line !== undefined) {
                 highlightPangati(data.current.current_line);
             }
