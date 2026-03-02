@@ -21,7 +21,9 @@ class STTMHttpController(STTMController):
         self._client = httpx.AsyncClient(timeout=config.sttm.connect_timeout)
         self._banidb = httpx.AsyncClient(base_url=_BANIDB_API_BASE, timeout=8.0)
         self._active_shabad_id: int | None = None
+        self._active_line_idx: int = 0
         self._first_verse_cache: dict[int, int] = {}
+        self._verse_ids_cache: dict[int, list[int]] = {}
 
     async def connect(self) -> bool:
         """Discover STTM's port and verify connectivity."""
@@ -48,7 +50,8 @@ class STTMHttpController(STTMController):
 
     async def display_shabad(self, shabad_id: int) -> bool:
         """Display a shabad by its ID."""
-        first_verse_id = await self._get_first_verse_id(shabad_id)
+        verse_ids = await self._get_verse_ids(shabad_id)
+        first_verse_id = verse_ids[0] if verse_ids else await self._get_first_verse_id(shabad_id)
         ok = await self._send_control({
             "type": "shabad",
             "shabadId": shabad_id,
@@ -61,14 +64,36 @@ class STTMHttpController(STTMController):
         })
         if ok:
             self._active_shabad_id = shabad_id
+            self._active_line_idx = 0
         return ok
 
     async def navigate_line(self, direction: str = "next") -> bool:
-        """
-        STTM's remote listener does not handle a dedicated 'navigate' message type.
-        Sending unknown types can destabilize the remote controller UI, so this is a safe no-op.
-        """
-        return self._active_shabad_id is not None
+        """Move line by re-sending shabad payload with the target verseId."""
+        if self._active_shabad_id is None:
+            return False
+
+        verse_ids = await self._get_verse_ids(self._active_shabad_id)
+        if not verse_ids:
+            return False
+
+        if direction == "prev":
+            next_idx = max(0, self._active_line_idx - 1)
+        else:
+            next_idx = min(len(verse_ids) - 1, self._active_line_idx + 1)
+
+        verse_id = verse_ids[next_idx]
+        ok = await self._send_control({
+            "type": "shabad",
+            "shabadId": self._active_shabad_id,
+            "id": self._active_shabad_id,
+            "verseId": verse_id,
+            "lineCount": next_idx + 1,
+            "highlight": verse_id,
+            "homeId": verse_ids[0],
+        })
+        if ok:
+            self._active_line_idx = next_idx
+        return ok
 
     async def disconnect(self):
         """Close the HTTP client."""
@@ -92,6 +117,29 @@ class STTMHttpController(STTMController):
         except Exception as e:
             print(f"[STTM HTTP] Could not resolve verseId for shabad {shabad_id}: {e}")
         return 1
+
+    async def _get_verse_ids(self, shabad_id: int) -> list[int]:
+        """Resolve and cache verseId list for line navigation."""
+        cached = self._verse_ids_cache.get(shabad_id)
+        if cached is not None:
+            return cached
+        try:
+            resp = await self._banidb.get(f"/shabads/{shabad_id}")
+            resp.raise_for_status()
+            data = resp.json()
+            verse_ids = [
+                int(v.get("verseId", 0))
+                for v in data.get("verses", [])
+                if int(v.get("verseId", 0)) > 0
+            ]
+            if verse_ids:
+                self._verse_ids_cache[shabad_id] = verse_ids
+                self._first_verse_cache[shabad_id] = verse_ids[0]
+                return verse_ids
+        except Exception as e:
+            print(f"[STTM HTTP] Could not resolve verse list for shabad {shabad_id}: {e}")
+        fallback = self._first_verse_cache.get(shabad_id)
+        return [fallback] if fallback else []
 
     async def _send_control(self, data: dict) -> bool:
         """
