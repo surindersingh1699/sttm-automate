@@ -26,23 +26,22 @@ class ConfidenceScorer:
         """
         Score a candidate against the query. Returns 0.0 to 1.0.
         """
-        # Extract first letter of each word from the gurmukhi (ASCII romanized) field
+        # Extract first Gurmukhi letter of each word from the unicode field
         candidate_letters = "".join(
-            w[0] for w in candidate.gurmukhi.split() if w and w[0] != "]"
+            w[0] for w in candidate.unicode.split()
+            if w and "\u0A00" <= w[0] <= "\u0A7F"
         )
 
         if not query_letters or not candidate_letters:
             return 0.0
 
-        # 1. Overall sequence similarity
+        # 1. Overall sequence similarity (no .lower() needed — Gurmukhi has no case)
         letter_ratio = SequenceMatcher(
-            None, query_letters.lower(), candidate_letters.lower()
+            None, query_letters, candidate_letters
         ).ratio()
 
         # 2. Consecutive match bonus
-        consec = self._longest_consecutive_match(
-            query_letters.lower(), candidate_letters.lower()
-        )
+        consec = self._longest_consecutive_match(query_letters, candidate_letters)
         consec_ratio = consec / max(len(query_letters), 1)
 
         # 3. Context: boost if different from current (we're looking for matches)
