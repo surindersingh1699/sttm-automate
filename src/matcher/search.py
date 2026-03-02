@@ -5,6 +5,7 @@ the banidb Python library, which fetches all result pages and is too slow.
 """
 
 from dataclasses import dataclass
+import time
 
 import httpx
 
@@ -46,32 +47,45 @@ class ShabadSearcher:
 
     def __init__(self) -> None:
         self._client = httpx.Client(base_url=_API_BASE, timeout=_TIMEOUT)
+        self._cache_ttl_s = 4.0
+        self._search_cache: dict[tuple[str, int, int], tuple[float, list[ShabadCandidate]]] = {}
 
-    def search(self, first_letters: str, max_results: int = 10) -> list[ShabadCandidate]:
+    def search(
+        self, first_letters: str, max_results: int = 10, mode: str = "balanced"
+    ) -> list[ShabadCandidate]:
         """
         Search BaniDB with multiple strategies, merge and deduplicate results.
 
-        Strategies tried in order:
-        1. searchtype=0: First letter beginning (primary, romanized codes)
-        2. searchtype=4: First letter anywhere (broader fallback)
-        3. Substring search: Try shorter substrings if full query gets no results
+        Modes:
+        - fast: only first-letter-beginning (searchtype=0), lowest latency.
+        - balanced: first-letter-beginning, then anywhere fallback if needed.
+        - broad: balanced + substring retries when still weak.
         """
         if len(first_letters) < 3:
             return []
 
+        if mode not in {"fast", "balanced", "broad"}:
+            mode = "balanced"
+
         candidates: list[ShabadCandidate] = []
         seen_ids: set[int] = set()
 
-        # Strategy 1: First letter beginning (primary)
+        # Stage 1: First letter beginning (primary)
         results = self._search_api(first_letters, searchtype=0, limit=max_results)
         self._add_unique(results, candidates, seen_ids)
 
-        # Strategy 2: First letter anywhere (broader fallback)
+        if mode == "fast":
+            return candidates
+
+        # Stage 2: First letter anywhere (fallback when primary is sparse)
         if len(candidates) < 3:
             results = self._search_api(first_letters, searchtype=4, limit=max_results)
             self._add_unique(results, candidates, seen_ids)
 
-        # Strategy 3: Try shorter substrings if we still have few results
+        if mode != "broad":
+            return candidates
+
+        # Stage 3: Substring retries for noisy/partial recognition
         if len(candidates) < 2 and len(first_letters) > 4:
             for sub in [first_letters[:4], first_letters[-4:]]:
                 results = self._search_api(sub, searchtype=0, limit=5)
@@ -129,6 +143,12 @@ class ShabadSearcher:
 
     def _search_api(self, query: str, searchtype: int, limit: int) -> list[ShabadCandidate]:
         """Call BaniDB REST API directly and parse results."""
+        key = (query, searchtype, limit)
+        now = time.monotonic()
+        cached = self._search_cache.get(key)
+        if cached and (now - cached[0]) <= self._cache_ttl_s:
+            return list(cached[1])
+
         try:
             resp = self._client.get(
                 f"/search/{query}",
@@ -153,11 +173,23 @@ class ShabadSearcher:
                     source_id=entry.get("source", {}).get("sourceId", "G"),
                     page_no=entry.get("pageNo", 0),
                 ))
+            self._search_cache[key] = (now, candidates)
+            if len(self._search_cache) > 256:
+                self._prune_cache(now)
             return candidates
 
         except Exception as e:
             print(f"[Search] API error (type={searchtype}): {e}")
             return []
+
+    def _prune_cache(self, now: float) -> None:
+        """Drop stale cache entries to keep memory bounded."""
+        stale = [
+            key for key, (ts, _) in self._search_cache.items()
+            if (now - ts) > self._cache_ttl_s
+        ]
+        for key in stale:
+            self._search_cache.pop(key, None)
 
     def _add_unique(
         self,

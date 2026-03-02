@@ -51,6 +51,7 @@ class PipelineOrchestrator:
         self._broadcast = broadcast or self._noop_broadcast
         self.running = False
         self.paused = False
+        self._silence_s = 0.0
 
     async def start(self):
         """Initialize components and start the processing loop."""
@@ -159,6 +160,7 @@ class PipelineOrchestrator:
 
                 # Skip transcription if no vocal content (just music/silence)
                 if not has_vocals:
+                    self._silence_s += config.audio.step_duration
                     await self._broadcast({
                         "type": "transcription",
                         "text": "",
@@ -166,6 +168,19 @@ class PipelineOrchestrator:
                         "status": "music_only",
                     })
                     continue
+
+                if self._silence_s >= config.matcher.long_vocal_break_s:
+                    if self.tracker.state == PipelineState.LOCKED:
+                        print(
+                            f"  [BREAK] {self._silence_s:.1f}s vocal gap — releasing lock for fresh shabad detection"
+                        )
+                        self.tracker.release_lock()
+                        await self._broadcast({
+                            "type": "long_break_reset",
+                            "silence_s": round(self._silence_s, 1),
+                            "pipeline_state": self.tracker.state.value,
+                        })
+                self._silence_s = 0.0
 
                 # 2. Transcribe
                 segments = await asyncio.to_thread(self.transcriber.transcribe, window)
@@ -213,12 +228,29 @@ class PipelineOrchestrator:
                 await asyncio.sleep(1)
 
     async def _handle_searching(self, first_letters: str):
-        """SEARCHING state: broad search, score candidates, try to lock."""
-        # Broad BaniDB search
-        candidates = await asyncio.to_thread(self.searcher.search, first_letters)
+        """SEARCHING state: low-latency primary search, then broaden only if needed."""
+        search_limit = max(config.dashboard.max_candidates * 2, 10)
+        # First pass: fastest/high-precision search (first-letter beginning only).
+        primary = await asyncio.to_thread(
+            self.searcher.search, first_letters, search_limit, "fast"
+        )
 
         # Score candidates
-        scored = self._score_candidates(first_letters, candidates)
+        scored = self._score_candidates(first_letters, primary)
+
+        # If primary is weak/sparse, broaden retrieval to improve recall.
+        need_fallback = (
+            not scored
+            or scored[0]["action"] != "auto"
+            or len(scored) < config.dashboard.max_candidates
+        )
+        if need_fallback:
+            expanded = await asyncio.to_thread(
+                self.searcher.search, first_letters, search_limit, "balanced"
+            )
+            merged = self._merge_candidates(primary, expanded)
+            scored = self._score_candidates(first_letters, merged)
+
         top_candidates = scored[:config.dashboard.max_candidates]
 
         # Broadcast candidates
@@ -235,24 +267,7 @@ class PipelineOrchestrator:
             result = self.tracker.try_lock(top["shabad_id"], top["score"], instant=instant)
 
             if result["action"] == "locked":
-                # Confirmed — display and fetch verses
-                await self.controller.display_shabad(top["shabad_id"])
-                verses = await asyncio.to_thread(
-                    self.searcher.fetch_all_verses, top["shabad_id"]
-                )
-                self.tracker.set_shabad_details(
-                    top["gurmukhi"], top["unicode"], top["english"], verses
-                )
-                await self._broadcast({
-                    "type": "shabad_locked",
-                    "shabad_id": top["shabad_id"],
-                    "shabad": top,
-                    "total_lines": len(verses),
-                    "verses": [
-                        {"unicode": v.unicode, "english": v.english}
-                        for v in verses
-                    ],
-                })
+                verses = await self._lock_and_broadcast(top)
                 print(f"  [LOCKED] Shabad {top['shabad_id']} — {top['unicode'][:60]} ({len(verses)} verses)")
 
             elif result["action"] == "pending":
@@ -303,7 +318,9 @@ class PipelineOrchestrator:
 
         # Poor line match — do a broad search for potential challenger
         print(f"  [WEAK] line_score={best_line_score:.2f}, searching for challenger...")
-        candidates = await asyncio.to_thread(self.searcher.search, first_letters)
+        candidates = await asyncio.to_thread(
+            self.searcher.search, first_letters, 12, "broad"
+        )
         scored = self._score_candidates(first_letters, candidates)
 
         # Broadcast candidates (for dashboard visibility)
@@ -326,6 +343,19 @@ class PipelineOrchestrator:
 
         if top["action"] != "auto":
             # Not confident enough to challenge
+            return
+
+        # Very strong challenger: switch immediately to reduce lock-to-lock latency.
+        instant_switch = (
+            top["score"] >= config.matcher.instant_lock_threshold
+            and (top["score"] - best_line_score) >= (config.matcher.challenger_margin + 0.10)
+        )
+        if instant_switch:
+            print(f"  [FAST SWITCH] {current.shabad_id} -> {top['shabad_id']} "
+                  f"(new={top['score']:.2f}, current={best_line_score:.2f})")
+            self.tracker.manual_lock(top["shabad_id"])
+            verses = await self._lock_and_broadcast(top)
+            print(f"  [LOCKED] Shabad {top['shabad_id']} — {top['unicode'][:60]} ({len(verses)} verses)")
             return
 
         result = self.tracker.challenge(
@@ -371,6 +401,43 @@ class PipelineOrchestrator:
             })
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored
+
+    async def _lock_and_broadcast(self, candidate: dict) -> list:
+        """Display, cache verses, and broadcast lock event for a chosen shabad."""
+        shabad_id = candidate["shabad_id"]
+        await self.controller.display_shabad(shabad_id)
+        verses = await asyncio.to_thread(self.searcher.fetch_all_verses, shabad_id)
+        self.tracker.set_shabad_details(
+            candidate.get("gurmukhi", ""),
+            candidate.get("unicode", ""),
+            candidate.get("english", ""),
+            verses,
+        )
+        await self._broadcast({
+            "type": "shabad_locked",
+            "shabad_id": shabad_id,
+            "shabad": candidate,
+            "total_lines": len(verses),
+            "verses": [
+                {"unicode": v.unicode, "english": v.english}
+                for v in verses
+            ],
+        })
+        return verses
+
+    @staticmethod
+    def _merge_candidates(
+        primary: list[ShabadCandidate], secondary: list[ShabadCandidate]
+    ) -> list[ShabadCandidate]:
+        """Merge candidate lists by shabad_id while preserving first-seen order."""
+        merged: list[ShabadCandidate] = []
+        seen: set[int] = set()
+        for candidate in primary + secondary:
+            if candidate.shabad_id in seen:
+                continue
+            seen.add(candidate.shabad_id)
+            merged.append(candidate)
+        return merged
 
     @staticmethod
     async def _noop_broadcast(data: dict):

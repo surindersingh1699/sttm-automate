@@ -37,7 +37,8 @@ class MatcherConfig(BaseModel):
     # State machine
     min_search_letters: int = 3  # minimum first letters before searching
     challenger_margin: float = 0.10  # how much better challenger must score vs current line
-    challenger_windows: int = 3  # consecutive windows challenger must win before switching
+    challenger_windows: int = 2  # consecutive windows challenger must win before switching
+    long_vocal_break_s: float = 10.0  # after this silence, treat next vocals as potential new shabad start
 
 
 class STTMConfig(BaseModel):

@@ -203,6 +203,16 @@ class ShabadTracker:
         """Force-lock a shabad from the dashboard (bypasses state machine)."""
         self._lock_shabad(shabad_id)
 
+    def release_lock(self):
+        """Release current lock and return to SEARCHING (used after long vocal breaks)."""
+        if self.current:
+            self.history.append(self.current)
+        self.current = None
+        self.state = PipelineState.SEARCHING
+        self._challenger = None
+        self._pending_id = None
+        self._pending_confidence = 0.0
+
     def recall_from_history(self, shabad_id: int) -> bool:
         """Bring a shabad from history back as the current shabad."""
         for i, state in enumerate(self.history):
