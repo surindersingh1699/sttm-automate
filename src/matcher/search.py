@@ -47,7 +47,12 @@ class ShabadSearcher:
     def __init__(self) -> None:
         self._client = httpx.Client(base_url=_API_BASE, timeout=_TIMEOUT)
 
-    def search(self, first_letters: str, max_results: int = 10) -> list[ShabadCandidate]:
+    def search(
+        self,
+        first_letters: str,
+        max_results: int = 10,
+        start_mode: bool = False,
+    ) -> list[ShabadCandidate]:
         """
         Search BaniDB with multiple strategies, merge and deduplicate results.
 
@@ -62,18 +67,25 @@ class ShabadSearcher:
         candidates: list[ShabadCandidate] = []
         seen_ids: set[int] = set()
 
+        query = first_letters
+        if start_mode:
+            # Keep early-start queries focused and fast.
+            query = first_letters[: min(8, len(first_letters))]
+
         # Strategy 1: First letter beginning (primary)
-        results = self._search_api(first_letters, searchtype=0, limit=max_results)
+        results = self._search_api(query, searchtype=0, limit=max_results)
         self._add_unique(results, candidates, seen_ids)
 
         # Strategy 2: First letter anywhere (broader fallback)
-        if len(candidates) < 3:
-            results = self._search_api(first_letters, searchtype=4, limit=max_results)
+        # In start_mode, require stronger start evidence first; only broaden if empty.
+        should_broaden = len(candidates) < 3 and (not start_mode or len(candidates) == 0)
+        if should_broaden:
+            results = self._search_api(query, searchtype=4, limit=max_results)
             self._add_unique(results, candidates, seen_ids)
 
         # Strategy 3: Try shorter substrings if we still have few results
-        if len(candidates) < 2 and len(first_letters) > 4:
-            for sub in [first_letters[:4], first_letters[-4:]]:
+        if len(candidates) < 2 and len(query) > 4:
+            for sub in [query[:4], query[-4:]]:
                 results = self._search_api(sub, searchtype=0, limit=5)
                 self._add_unique(results, candidates, seen_ids)
 

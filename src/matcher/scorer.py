@@ -52,7 +52,6 @@ class ConfidenceScorer:
 
         # 4. Source priority (G = SGGS, highest priority)
         source_score = 1.0 if candidate.source_id == "G" else 0.5
-
         return (
             config.matcher.weight_letter_match * letter_ratio
             + config.matcher.weight_consecutive * consec_ratio
