@@ -82,6 +82,7 @@ header h1 {
 .btn:hover { opacity: 0.85; }
 .btn-warning { background: #f0a500; color: #000; }
 .btn-primary { background: #4ecca3; color: #000; }
+.btn-danger { background: #e94560; color: #fff; }
 .btn-small { padding: 4px 10px; font-size: 0.8rem; background: #0f3460; color: #eee; }
 .btn-small:hover { background: #1a4a7a; }
 

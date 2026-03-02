@@ -11,6 +11,12 @@
         <h1>STTM Automate</h1>
         <div class="controls">
             <button id="btn-pause" class="btn btn-warning" onclick="togglePause()">Pause</button>
+            <button class="btn btn-danger" onclick="forceUnlock()">Force Unlock</button>
+            <select id="confidence-mode" class="control-input" onchange="setConfidenceMode(this.value)">
+                <option value="conservative">Conservative</option>
+                <option value="balanced" selected>Balanced</option>
+                <option value="fast">Fast</option>
+            </select>
             <input id="controller-pin" class="control-input" type="number" inputmode="numeric" placeholder="Controller PIN">
             <button class="btn btn-small" onclick="setControllerPin()">Set PIN</button>
             <button class="btn btn-small" onclick="clearControllerPin()">Clear</button>

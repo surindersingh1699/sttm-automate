@@ -18,6 +18,39 @@ clients: list[WebSocket] = []
 
 # Pipeline instance (initialized on startup)
 pipeline: PipelineOrchestrator | None = None
+runtime_settings_path = Path(__file__).parent.parent.parent / ".runtime_settings.json"
+confidence_mode = "balanced"
+
+
+def load_runtime_settings():
+    """Load persisted runtime settings (if present)."""
+    global confidence_mode
+    if not runtime_settings_path.exists():
+        return
+    try:
+        data = json.loads(runtime_settings_path.read_text(encoding="utf-8"))
+        if "controller_pin" in data:
+            value = data["controller_pin"]
+            config.sttm.controller_pin = int(value) if value not in (None, "") else None
+        mode = data.get("confidence_mode", "balanced")
+        confidence_mode = mode if mode in ("conservative", "balanced", "fast") else "balanced"
+    except Exception as e:
+        print(f"[Server] Could not load runtime settings: {e}")
+
+
+def save_runtime_settings():
+    """Persist runtime settings so they survive app restarts."""
+    payload = {
+        "controller_pin": config.sttm.controller_pin,
+        "confidence_mode": confidence_mode,
+    }
+    try:
+        runtime_settings_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        print(f"[Server] Could not save runtime settings: {e}")
 
 
 async def broadcast(data: dict):
@@ -39,6 +72,7 @@ async def broadcast(data: dict):
 async def lifespan(app: FastAPI):
     """Start pipeline on app startup, stop on shutdown."""
     global pipeline
+    load_runtime_settings()
 
     # Try HTTP controller — if STTM isn't running, pipeline still works in monitor mode
     controller = STTMHttpController()
@@ -51,6 +85,7 @@ async def lifespan(app: FastAPI):
         controller=controller,
         broadcast=broadcast,
     )
+    pipeline.set_confidence_mode(confidence_mode)
 
     # Start pipeline in background
     task = asyncio.create_task(pipeline.start())
@@ -79,6 +114,7 @@ async def index():
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """WebSocket endpoint for real-time dashboard communication."""
+    global confidence_mode
     await websocket.accept()
     clients.append(websocket)
 
@@ -91,6 +127,8 @@ async def websocket_endpoint(websocket: WebSocket):
             "current": current.to_dict() if current else None,
             "history": pipeline.tracker.get_history_list(),
             "controller_pin": config.sttm.controller_pin,
+            "confidence_mode": pipeline.confidence_mode,
+            "hypotheses": pipeline.tracker.get_hypotheses(),
         }
         if current and current.verses:
             init_state["verses"] = [
@@ -141,9 +179,25 @@ async def websocket_endpoint(websocket: WebSocket):
                     config.sttm.controller_pin = None
                 else:
                     config.sttm.controller_pin = int(pin)
+                save_runtime_settings()
                 await broadcast({
                     "type": "controller_pin_updated",
                     "controller_pin": config.sttm.controller_pin,
+                })
+
+            elif msg_type == "force_unlock":
+                await pipeline.force_unlock()
+
+            elif msg_type == "set_confidence_mode":
+                mode = msg.get("mode", "balanced")
+                if mode not in ("conservative", "balanced", "fast"):
+                    mode = "balanced"
+                confidence_mode = mode
+                pipeline.set_confidence_mode(mode)
+                save_runtime_settings()
+                await broadcast({
+                    "type": "confidence_mode_updated",
+                    "mode": confidence_mode,
                 })
 
     finally:
@@ -162,6 +216,8 @@ async def get_status():
         "pipeline_state": pipeline.tracker.state.value,
         "current": pipeline.tracker.current.to_dict() if pipeline.tracker.current else None,
         "history_count": len(pipeline.tracker.history),
+        "confidence_mode": pipeline.confidence_mode,
+        "hypotheses": pipeline.tracker.get_hypotheses(),
     }
 
 

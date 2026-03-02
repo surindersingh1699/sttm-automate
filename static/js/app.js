@@ -9,6 +9,10 @@ let reconnectTimer = null;
 let currentVerses = [];
 let currentLineIndex = -1;
 let currentShabadId = null;
+let currentShabadState = null;
+let historyState = [];
+let confidenceMode = "balanced";
+const DASHBOARD_STATE_KEY = "sttm_automate_dashboard_state_v1";
 
 // --- Safe DOM Helpers ---
 
@@ -60,6 +64,52 @@ function send(data) {
     }
 }
 
+function persistDashboardState() {
+    try {
+        localStorage.setItem(
+            DASHBOARD_STATE_KEY,
+            JSON.stringify({
+                currentShabadId: currentShabadId,
+                currentLineIndex: currentLineIndex,
+                currentVerses: currentVerses,
+                currentShabadState: currentShabadState,
+                historyState: historyState,
+                confidenceMode: confidenceMode,
+            })
+        );
+    } catch (err) {
+        console.warn("[state] persist failed", err);
+    }
+}
+
+function restoreDashboardState() {
+    try {
+        const raw = localStorage.getItem(DASHBOARD_STATE_KEY);
+        if (!raw) return;
+        const data = JSON.parse(raw);
+
+        currentShabadId = data.currentShabadId || null;
+        currentLineIndex = Number.isInteger(data.currentLineIndex) ? data.currentLineIndex : -1;
+        currentVerses = Array.isArray(data.currentVerses) ? data.currentVerses : [];
+        currentShabadState = data.currentShabadState || null;
+        historyState = Array.isArray(data.historyState) ? data.historyState : [];
+        confidenceMode = data.confidenceMode || "balanced";
+        updateConfidenceMode(confidenceMode);
+
+        updateCurrentShabad(currentShabadState);
+        updateHistory(historyState);
+
+        if (currentVerses.length > 0) {
+            renderPangati();
+            if (currentLineIndex >= 0) {
+                highlightPangati(currentLineIndex);
+            }
+        }
+    } catch (err) {
+        console.warn("[state] restore failed", err);
+    }
+}
+
 // --- Message Handlers ---
 
 function handleMessage(data) {
@@ -79,6 +129,7 @@ function handleMessage(data) {
                 currentLineIndex = 0;
                 renderPangati();
                 highlightPangati(0);
+                persistDashboardState();
             } else if (lockedShabadId) {
                 // Verses missing from broadcast — fetch via REST
                 fetchVerses(lockedShabadId);
@@ -87,9 +138,11 @@ function handleMessage(data) {
             break;
         case "line_aligned":
             highlightPangati(data.line_index);
+            persistDashboardState();
             break;
         case "shabad_switched":
             clearPangati();
+            persistDashboardState();
             break;
         case "auto_selected":
             highlightAutoSelected();
@@ -97,8 +150,13 @@ function handleMessage(data) {
         case "state":
             updateCurrentShabad(data.current);
             updateHistory(data.history);
-            updatePinStatus(data.controller_pin);
-            if (data.pipeline_state === "searching") {
+            if (Object.prototype.hasOwnProperty.call(data, "controller_pin")) {
+                updatePinStatus(data.controller_pin);
+            }
+            if (Object.prototype.hasOwnProperty.call(data, "confidence_mode")) {
+                updateConfidenceMode(data.confidence_mode);
+            }
+            if (data.pipeline_state === "searching" || data.pipeline_state === "candidate_lock") {
                 if (currentVerses.length > 0) {
                     clearPangati();
                 }
@@ -119,6 +177,7 @@ function handleMessage(data) {
                     highlightPangati(data.current.current_line);
                 }
             }
+            persistDashboardState();
             break;
         case "status":
             isPaused = data.paused;
@@ -126,6 +185,10 @@ function handleMessage(data) {
             break;
         case "controller_pin_updated":
             updatePinStatus(data.controller_pin);
+            break;
+        case "confidence_mode_updated":
+            updateConfidenceMode(data.mode);
+            persistDashboardState();
             break;
         case "audio_level":
             updateAudioLevel(data.rms, data.has_vocals);
@@ -211,6 +274,7 @@ function updateCandidates(matches) {
 }
 
 function updateCurrentShabad(current) {
+    currentShabadState = current || null;
     var el = document.getElementById("current-shabad");
     clearChildren(el);
 
@@ -283,6 +347,7 @@ function fetchVerses(shabadId) {
             if (data.verses && data.verses.length > 0 && currentShabadId === shabadId) {
                 currentVerses = data.verses;
                 renderPangati();
+                persistDashboardState();
             }
         })
         .catch(function(err) {
@@ -293,6 +358,7 @@ function fetchVerses(shabadId) {
 // --- History ---
 
 function updateHistory(history) {
+    historyState = Array.isArray(history) ? history : [];
     var container = document.getElementById("history-list");
     clearChildren(container);
 
@@ -336,7 +402,10 @@ function updatePinStatus(pinValue) {
     var input = document.getElementById("controller-pin");
     if (!status || !input) return;
 
-    if (pinValue === null || pinValue === undefined || pinValue === "") {
+    // Ignore missing field on incremental state updates.
+    if (pinValue === undefined) return;
+
+    if (pinValue === null || pinValue === "") {
         status.textContent = "PIN: not set";
         input.value = "";
     } else {
@@ -370,7 +439,6 @@ function setControllerPin() {
     if (!input) return;
     var value = input.value ? parseInt(input.value, 10) : NaN;
     if (Number.isNaN(value)) {
-        updatePinStatus(null);
         return;
     }
     send({ type: "set_controller_pin", controller_pin: value });
@@ -378,6 +446,27 @@ function setControllerPin() {
 
 function clearControllerPin() {
     send({ type: "set_controller_pin", controller_pin: null });
+}
+
+function forceUnlock() {
+    send({ type: "force_unlock" });
+}
+
+function setConfidenceMode(mode) {
+    updateConfidenceMode(mode);
+    send({ type: "set_confidence_mode", mode: mode });
+    persistDashboardState();
+}
+
+function updateConfidenceMode(mode) {
+    if (mode !== "conservative" && mode !== "balanced" && mode !== "fast") {
+        mode = "balanced";
+    }
+    confidenceMode = mode;
+    var select = document.getElementById("confidence-mode");
+    if (select && select.value !== mode) {
+        select.value = mode;
+    }
 }
 
 function updatePauseButton() {
@@ -394,4 +483,5 @@ function updatePauseButton() {
 }
 
 // --- Initialize ---
+restoreDashboardState();
 connect();

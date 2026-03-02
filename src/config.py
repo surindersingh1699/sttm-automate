@@ -9,6 +9,8 @@ class AudioConfig(BaseModel):
     dtype: str = "float32"
     step_duration: float = 3.0  # seconds of new audio per cycle (controls latency)
     window_duration: float = 10.0  # seconds of audio fed to Whisper (controls context)
+    start_window_duration: float = 4.5  # shorter window right after a vocal break
+    locked_window_duration: float = 7.0  # medium window while following a locked shabad
     device: int | None = None  # None = system default
 
 
@@ -41,6 +43,17 @@ class MatcherConfig(BaseModel):
     weak_line_recovery_score: float = 0.35  # treat locked line match below this as weak
     weak_line_recovery_windows: int = 3  # consecutive weak locked windows before releasing lock
     recovery_challenger_score: float = 0.65  # allow non-auto challenger in recovery mode
+    local_line_follow_threshold: float = 0.42  # allow nearby line updates at lower confidence
+    local_line_follow_window: int = 2  # consider +/- N lines around current line for fallback
+    vocal_break_min_windows: int = 2  # consecutive non-vocal windows to mark a vocal break
+    post_break_boost_windows: int = 3  # windows to stay in start-detection mode after break
+    silence_autolock_min_score: float = 0.82  # minimum score to lock during no-lyrics gap
+    silence_autolock_windows: int = 2  # how long a strong candidate stays eligible during silence
+    hypothesis_top_k: int = 5  # keep top-K shabad hypotheses
+    hypothesis_ttl_seconds: float = 5.0  # keep hypotheses alive for this long
+    hypothesis_decay: float = 0.85  # cumulative evidence decay each window
+    candidate_lock_windows: int = 2  # confirmations required in CANDIDATE_LOCK state
+    progression_high_confidence_bypass: float = 0.88  # skip proximity penalty above this
 
 
 class STTMConfig(BaseModel):
