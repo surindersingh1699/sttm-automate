@@ -38,6 +38,9 @@ class MatcherConfig(BaseModel):
     min_search_letters: int = 3  # minimum first letters before searching
     challenger_margin: float = 0.10  # how much better challenger must score vs current line
     challenger_windows: int = 3  # consecutive windows challenger must win before switching
+    weak_line_recovery_score: float = 0.35  # treat locked line match below this as weak
+    weak_line_recovery_windows: int = 3  # consecutive weak locked windows before releasing lock
+    recovery_challenger_score: float = 0.65  # allow non-auto challenger in recovery mode
 
 
 class STTMConfig(BaseModel):

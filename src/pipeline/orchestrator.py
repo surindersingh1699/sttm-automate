@@ -51,6 +51,7 @@ class PipelineOrchestrator:
         self._broadcast = broadcast or self._noop_broadcast
         self.running = False
         self.paused = False
+        self._weak_line_windows = 0
 
     async def start(self):
         """Initialize components and start the processing loop."""
@@ -292,6 +293,7 @@ class PipelineOrchestrator:
 
         # If current line matches well, just update position
         if best_line_score >= config.matcher.suggest_threshold:
+            self._weak_line_windows = 0
             old_line = current.current_line
             self.tracker.update_line(best_line_idx, best_line_score)
             # Navigate STTM forward if line advanced
@@ -299,6 +301,26 @@ class PipelineOrchestrator:
                 for _ in range(best_line_idx - old_line):
                     await self.controller.navigate_line("next")
             print(f"  [LINE {best_line_idx}/{len(current.verses)}] score={best_line_score:.2f} — {best_verse.unicode[:50]}")
+            return
+
+        if best_line_score < config.matcher.weak_line_recovery_score:
+            self._weak_line_windows += 1
+        else:
+            self._weak_line_windows = max(0, self._weak_line_windows - 1)
+
+        if self._weak_line_windows >= config.matcher.weak_line_recovery_windows:
+            print(
+                f"  [RECOVERY] weak line for {self._weak_line_windows} windows "
+                f"(score={best_line_score:.2f}) — releasing lock from shabad {current.shabad_id}"
+            )
+            self.tracker.release_lock()
+            self._weak_line_windows = 0
+            await self._broadcast({
+                "type": "shabad_switched",
+                "old_shabad_id": current.shabad_id,
+                "new_shabad_id": None,
+                "reason": "weak_locked_recovery",
+            })
             return
 
         # Poor line match — do a broad search for potential challenger
@@ -324,15 +346,28 @@ class PipelineOrchestrator:
             self.tracker.update_line(best_line_idx, best_line_score)
             return
 
-        if top["action"] != "auto":
+        recovery_mode = (
+            self._weak_line_windows >= max(1, config.matcher.weak_line_recovery_windows - 1)
+            and best_line_score < config.matcher.weak_line_recovery_score
+        )
+        if top["action"] != "auto" and not (
+            recovery_mode and top["score"] >= config.matcher.recovery_challenger_score
+        ):
             # Not confident enough to challenge
             return
+
+        if recovery_mode and top["action"] != "auto":
+            print(
+                f"  [RECOVERY] allowing challenger {top['shabad_id']} "
+                f"with score={top['score']:.2f} (current line={best_line_score:.2f})"
+            )
 
         result = self.tracker.challenge(
             top["shabad_id"], top["score"], best_line_score
         )
 
         if result["action"] == "switched":
+            self._weak_line_windows = 0
             new_id = result["new_shabad_id"]
             print(f"  [SWITCH] Challenger {new_id} wins! Transitioning...")
             await self._broadcast({
