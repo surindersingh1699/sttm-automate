@@ -60,6 +60,26 @@ class ConfidenceScorer:
             + config.matcher.weight_source * source_score
         )
 
+    def score_line(self, query_letters: str, line_first_letters: str) -> float:
+        """
+        Score how well query matches a single verse line.
+
+        Simpler than full score() — just letter similarity + consecutive bonus.
+        Used in LOCKED state for line alignment within a known shabad.
+        """
+        if not query_letters or not line_first_letters:
+            return 0.0
+
+        letter_ratio = SequenceMatcher(
+            None, query_letters, line_first_letters
+        ).ratio()
+
+        consec = self._longest_consecutive_match(query_letters, line_first_letters)
+        consec_ratio = consec / max(len(query_letters), 1)
+
+        # Equal weight: overall similarity + consecutive match bonus
+        return 0.5 * letter_ratio + 0.5 * consec_ratio
+
     def classify(self, score: float) -> str:
         """Classify score into action: 'auto', 'suggest', or 'ignore'."""
         if score >= config.matcher.auto_threshold:

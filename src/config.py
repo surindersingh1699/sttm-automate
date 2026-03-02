@@ -33,9 +33,10 @@ class MatcherConfig(BaseModel):
     weight_consecutive: float = 0.3
     weight_context: float = 0.2
     weight_source: float = 0.1
-    # Transition detection
-    transition_count: int = 3  # consecutive matches to new shabad before switching
+    # State machine
     min_search_letters: int = 3  # minimum first letters before searching
+    challenger_margin: float = 0.10  # how much better challenger must score vs current line
+    challenger_windows: int = 3  # consecutive windows challenger must win before switching
 
 
 class STTMConfig(BaseModel):

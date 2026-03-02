@@ -83,10 +83,11 @@ async def websocket_endpoint(websocket: WebSocket):
     clients.append(websocket)
 
     # Send initial state
-    if pipeline and pipeline.tracker.current:
+    if pipeline:
         await websocket.send_text(json.dumps({
             "type": "state",
-            "current": pipeline.tracker.current.to_dict(),
+            "pipeline_state": pipeline.tracker.state.value,
+            "current": pipeline.tracker.current.to_dict() if pipeline.tracker.current else None,
             "history": pipeline.tracker.get_history_list(),
         }, ensure_ascii=False))
 
@@ -134,6 +135,7 @@ async def get_status():
     return {
         "running": pipeline.running,
         "paused": pipeline.paused,
+        "pipeline_state": pipeline.tracker.state.value,
         "current": pipeline.tracker.current.to_dict() if pipeline.tracker.current else None,
         "history_count": len(pipeline.tracker.history),
     }

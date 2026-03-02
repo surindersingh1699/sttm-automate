@@ -11,7 +11,7 @@ from src.transcription.processor import TranscriptionProcessor
 from src.transcription.transliterate import extract_first_letters
 from src.matcher.search import ShabadSearcher, ShabadCandidate
 from src.matcher.scorer import ConfidenceScorer
-from src.matcher.tracker import ShabadTracker
+from src.matcher.tracker import ShabadTracker, PipelineState
 from src.controller.base import STTMController
 
 
@@ -21,8 +21,11 @@ BroadcastFn = Callable[[dict], Awaitable[None]]
 
 class PipelineOrchestrator:
     """
-    Wires all components into a continuous processing loop:
-    audio capture → transcription → transliteration → search → score → control → broadcast
+    Wires all components into a continuous processing loop.
+
+    Uses a SEARCHING/LOCKED state machine:
+    - SEARCHING: broad BaniDB search, confirm strong match before locking
+    - LOCKED: track line position within shabad, only switch on sustained challenger
     """
 
     def __init__(
@@ -41,7 +44,8 @@ class PipelineOrchestrator:
         self.searcher = ShabadSearcher()
         self.scorer = ConfidenceScorer()
         self.tracker = ShabadTracker(
-            transition_threshold=config.matcher.transition_count
+            challenger_windows=config.matcher.challenger_windows,
+            challenger_margin=config.matcher.challenger_margin,
         )
         self.controller = controller
         self._broadcast = broadcast or self._noop_broadcast
@@ -82,12 +86,19 @@ class PipelineOrchestrator:
 
     async def manual_select(self, shabad_id: int):
         """Manually select a shabad (override from dashboard)."""
-        result = self.tracker.update(shabad_id, confidence=1.0)
+        self.tracker.manual_lock(shabad_id)
         await self.controller.display_shabad(shabad_id)
+        # Fetch verses for line tracking
+        verses = await asyncio.to_thread(self.searcher.fetch_all_verses, shabad_id)
+        candidate = await asyncio.to_thread(self.searcher.search_by_id, shabad_id)
+        if candidate and verses:
+            self.tracker.set_shabad_details(
+                candidate.gurmukhi, candidate.unicode, candidate.english, verses
+            )
         await self._broadcast({
             "type": "manual_selected",
             "shabad_id": shabad_id,
-            "tracker": result,
+            "state": self.tracker.state.value,
         })
 
     async def manual_navigate(self, direction: str):
@@ -107,7 +118,7 @@ class PipelineOrchestrator:
             })
 
     async def _run_loop(self):
-        """Main processing loop."""
+        """Main processing loop with state machine dispatch."""
         import numpy as np
 
         while self.running:
@@ -151,67 +162,28 @@ class PipelineOrchestrator:
                 # 3. Extract first letters
                 first_letters = extract_first_letters(text)
 
-                # 4. Broadcast transcription to dashboard
+                # 4. Broadcast transcription
                 await self._broadcast({
                     "type": "transcription",
                     "text": text,
                     "first_letters": first_letters,
+                    "pipeline_state": self.tracker.state.value,
                 })
 
                 # 5. Skip if too few letters
                 if len(first_letters) < config.matcher.min_search_letters:
                     continue
 
-                # 6. Search BaniDB
-                candidates = await asyncio.to_thread(
-                    self.searcher.search, first_letters
-                )
+                # 6. Dispatch to state handler
+                if self.tracker.state == PipelineState.SEARCHING:
+                    await self._handle_searching(first_letters)
+                else:
+                    await self._handle_locked(first_letters)
 
-                # 7. Score candidates
-                current_id = self.tracker.current.shabad_id if self.tracker.current else None
-                scored = []
-                for candidate in candidates:
-                    score = self.scorer.score(first_letters, candidate, current_id)
-                    action = self.scorer.classify(score)
-                    scored.append({
-                        "shabad_id": candidate.shabad_id,
-                        "gurmukhi": candidate.gurmukhi,
-                        "unicode": candidate.unicode,
-                        "english": candidate.english,
-                        "score": round(score, 3),
-                        "action": action,
-                    })
-
-                scored.sort(key=lambda x: x["score"], reverse=True)
-                top_candidates = scored[:config.dashboard.max_candidates]
-
-                # 8. Broadcast candidates to dashboard
-                await self._broadcast({
-                    "type": "candidates",
-                    "matches": top_candidates,
-                })
-
-                # 9. Act on top match
-                if top_candidates and top_candidates[0]["action"] == "auto":
-                    top = top_candidates[0]
-                    tracker_result = self.tracker.update(
-                        top["shabad_id"], top["score"]
-                    )
-
-                    if tracker_result["action"] in ("started", "switched"):
-                        await self.controller.display_shabad(top["shabad_id"])
-                        self.tracker.set_shabad_details(
-                            top["gurmukhi"], top["unicode"], top["english"]
-                        )
-                        await self._broadcast({
-                            "type": "auto_selected",
-                            "shabad": top,
-                            "tracker": tracker_result,
-                        })
-
-                # 10. Broadcast current state
+                # 7. Broadcast current state
                 await self._broadcast({
                     "type": "state",
+                    "pipeline_state": self.tracker.state.value,
                     "current": self.tracker.current.to_dict() if self.tracker.current else None,
                     "history": self.tracker.get_history_list(),
                 })
@@ -221,17 +193,167 @@ class PipelineOrchestrator:
                 await self._broadcast({"type": "error", "message": str(e)})
                 await asyncio.sleep(1)
 
+    async def _handle_searching(self, first_letters: str):
+        """SEARCHING state: broad search, score candidates, try to lock."""
+        # Broad BaniDB search
+        candidates = await asyncio.to_thread(self.searcher.search, first_letters)
+
+        # Score candidates
+        scored = self._score_candidates(first_letters, candidates)
+        top_candidates = scored[:config.dashboard.max_candidates]
+
+        # Broadcast candidates
+        await self._broadcast({
+            "type": "candidates",
+            "matches": top_candidates,
+            "pipeline_state": "searching",
+        })
+
+        # Try to lock on strong match
+        if top_candidates and top_candidates[0]["action"] == "auto":
+            top = top_candidates[0]
+            result = self.tracker.try_lock(top["shabad_id"], top["score"])
+
+            if result["action"] == "locked":
+                # Confirmed — display and fetch verses
+                await self.controller.display_shabad(top["shabad_id"])
+                verses = await asyncio.to_thread(
+                    self.searcher.fetch_all_verses, top["shabad_id"]
+                )
+                self.tracker.set_shabad_details(
+                    top["gurmukhi"], top["unicode"], top["english"], verses
+                )
+                await self._broadcast({
+                    "type": "shabad_locked",
+                    "shabad": top,
+                    "total_lines": len(verses),
+                })
+                print(f"  [LOCKED] Shabad {top['shabad_id']} — {top['unicode'][:60]}")
+
+            elif result["action"] == "pending":
+                await self._broadcast({
+                    "type": "pending_lock",
+                    "shabad": top,
+                })
+                print(f"  [PENDING] Confirming shabad {top['shabad_id']}...")
+
+    async def _handle_locked(self, first_letters: str):
+        """LOCKED state: align line within shabad, check for challenger."""
+        current = self.tracker.current
+        if not current or not current.verses:
+            # No verses cached — fall back to searching
+            self.tracker.state = PipelineState.SEARCHING
+            return
+
+        # Score against each line of the locked shabad
+        best_line_idx = 0
+        best_line_score = 0.0
+        for i, verse in enumerate(current.verses):
+            score = self.scorer.score_line(first_letters, verse.first_letters)
+            if score > best_line_score:
+                best_line_score = score
+                best_line_idx = i
+
+        # Broadcast line alignment
+        best_verse = current.verses[best_line_idx]
+        await self._broadcast({
+            "type": "line_aligned",
+            "line_index": best_line_idx,
+            "line_score": round(best_line_score, 3),
+            "line_unicode": best_verse.unicode,
+            "line_english": best_verse.english,
+            "pipeline_state": "locked",
+        })
+
+        # If current line matches well, just update position
+        if best_line_score >= config.matcher.suggest_threshold:
+            old_line = current.current_line
+            self.tracker.update_line(best_line_idx, best_line_score)
+            # Navigate STTM forward if line advanced
+            if best_line_idx > old_line:
+                for _ in range(best_line_idx - old_line):
+                    await self.controller.navigate_line("next")
+            print(f"  [LINE {best_line_idx}/{len(current.verses)}] score={best_line_score:.2f} — {best_verse.unicode[:50]}")
+            return
+
+        # Poor line match — do a broad search for potential challenger
+        print(f"  [WEAK] line_score={best_line_score:.2f}, searching for challenger...")
+        candidates = await asyncio.to_thread(self.searcher.search, first_letters)
+        scored = self._score_candidates(first_letters, candidates)
+
+        # Broadcast candidates (for dashboard visibility)
+        await self._broadcast({
+            "type": "candidates",
+            "matches": scored[:config.dashboard.max_candidates],
+            "pipeline_state": "locked",
+            "reason": "weak_line_match",
+        })
+
+        if not scored:
+            return
+
+        top = scored[0]
+        # Only challenge if top result is a different shabad
+        if top["shabad_id"] == current.shabad_id:
+            # Still matching current shabad (just a different line)
+            self.tracker.update_line(best_line_idx, best_line_score)
+            return
+
+        if top["action"] != "auto":
+            # Not confident enough to challenge
+            return
+
+        result = self.tracker.challenge(
+            top["shabad_id"], top["score"], best_line_score
+        )
+
+        if result["action"] == "switched":
+            new_id = result["new_shabad_id"]
+            print(f"  [SWITCH] Challenger {new_id} wins! Transitioning...")
+            await self._broadcast({
+                "type": "shabad_switched",
+                "new_shabad_id": new_id,
+                "old_shabad_id": current.shabad_id,
+            })
+            # The tracker moved to SEARCHING with pending_id pre-seeded,
+            # so next cycle's try_lock will confirm and lock the new shabad
+
+        elif result["action"] == "challenging":
+            print(f"  [CHALLENGER] {top['shabad_id']} wins {result['wins']}/{result['needed']}")
+            await self._broadcast({
+                "type": "challenger_update",
+                "challenger": top,
+                "wins": result["wins"],
+                "needed": result["needed"],
+            })
+
+    def _score_candidates(
+        self, first_letters: str, candidates: list[ShabadCandidate]
+    ) -> list[dict]:
+        """Score and sort a list of candidates. Returns list of dicts."""
+        current_id = self.tracker.current.shabad_id if self.tracker.current else None
+        scored = []
+        for candidate in candidates:
+            score = self.scorer.score(first_letters, candidate, current_id)
+            action = self.scorer.classify(score)
+            scored.append({
+                "shabad_id": candidate.shabad_id,
+                "gurmukhi": candidate.gurmukhi,
+                "unicode": candidate.unicode,
+                "english": candidate.english,
+                "score": round(score, 3),
+                "action": action,
+            })
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        return scored
+
     @staticmethod
     async def _noop_broadcast(data: dict):
         """Default no-op broadcast (prints to console)."""
         msg_type = data.get("type", "")
         if msg_type == "transcription" and data.get("text"):
-            print(f"  [Heard] {data['text']}")
+            state = data.get("pipeline_state", "?")
+            print(f"  [{state.upper()}] Heard: {data['text']}")
             print(f"  [Letters] {data['first_letters']}")
-        elif msg_type == "candidates" and data.get("matches"):
-            top = data["matches"][0]
-            print(f"  [Match] {top['unicode']} (score: {top['score']}, action: {top['action']})")
-        elif msg_type == "auto_selected":
-            print(f"  [AUTO] Selected shabad {data['shabad']['shabad_id']}")
         elif msg_type == "error":
             print(f"  [ERROR] {data['message']}")

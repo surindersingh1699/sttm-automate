@@ -12,6 +12,25 @@ _API_BASE = "https://api.banidb.com/v2"
 _TIMEOUT = 8.0
 
 
+def _extract_verse_first_letters(unicode_text: str) -> str:
+    """Extract first Gurmukhi letter of each word from a verse's unicode field."""
+    letters = []
+    for word in unicode_text.split():
+        if word and "\u0A00" <= word[0] <= "\u0A7F":
+            letters.append(word[0])
+    return "".join(letters)
+
+
+@dataclass
+class ShabadVerse:
+    """A single verse/line within a shabad, with pre-extracted first letters."""
+    verse_id: int
+    unicode: str
+    gurmukhi: str
+    english: str
+    first_letters: str  # pre-extracted Gurmukhi first letters for scoring
+
+
 @dataclass
 class ShabadCandidate:
     shabad_id: int
@@ -81,6 +100,32 @@ class ShabadSearcher:
         except Exception as e:
             print(f"[Search] Error fetching shabad {shabad_id}: {e}")
         return None
+
+    def fetch_all_verses(self, shabad_id: int) -> list[ShabadVerse]:
+        """Fetch all verses of a shabad for line-level tracking."""
+        try:
+            resp = self._client.get(f"/shabads/{shabad_id}")
+            resp.raise_for_status()
+            data = resp.json()
+
+            verses: list[ShabadVerse] = []
+            for entry in data.get("verses", []):
+                verse = entry.get("verse", {})
+                unicode_text = verse.get("unicode", "")
+                # Pre-extract first letters for efficient scoring
+                first_letters = _extract_verse_first_letters(unicode_text)
+                verses.append(ShabadVerse(
+                    verse_id=entry.get("verseId", 0),
+                    unicode=unicode_text,
+                    gurmukhi=verse.get("gurmukhi", ""),
+                    english=entry.get("translation", {}).get("en", {}).get("bdb", ""),
+                    first_letters=first_letters,
+                ))
+            return verses
+
+        except Exception as e:
+            print(f"[Search] Error fetching verses for shabad {shabad_id}: {e}")
+            return []
 
     def _search_api(self, query: str, searchtype: int, limit: int) -> list[ShabadCandidate]:
         """Call BaniDB REST API directly and parse results."""
