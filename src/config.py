@@ -26,7 +26,8 @@ class WhisperConfig(BaseModel):
 
 class MatcherConfig(BaseModel):
     # Confidence thresholds
-    auto_threshold: float = 0.85
+    auto_threshold: float = 0.75  # auto-select (2-cycle confirm at 75-84%, instant lock at 85%+)
+    instant_lock_threshold: float = 0.85  # skip confirmation at this confidence
     suggest_threshold: float = 0.60
     # Scoring weights (must sum to 1.0)
     weight_letter_match: float = 0.4

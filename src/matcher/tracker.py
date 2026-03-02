@@ -67,14 +67,19 @@ class ShabadTracker:
 
     # --- SEARCHING state ---
 
-    def try_lock(self, shabad_id: int, confidence: float) -> dict:
+    def try_lock(self, shabad_id: int, confidence: float, instant: bool = False) -> dict:
         """
         Called in SEARCHING state when a strong candidate is found.
 
-        First call: stores as pending.
-        Second call with same shabad: confirms and locks.
-        Returns action dict.
+        instant=True: lock immediately (high confidence, skip confirmation).
+        instant=False: requires 2-cycle confirmation.
         """
+        if instant:
+            self._lock_shabad(shabad_id)
+            self._pending_id = None
+            self._pending_confidence = 0.0
+            return {"action": "locked", "shabad_id": shabad_id}
+
         if self._pending_id is None:
             # First strong match — store as pending
             self._pending_id = shabad_id

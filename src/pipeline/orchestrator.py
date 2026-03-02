@@ -224,7 +224,8 @@ class PipelineOrchestrator:
         # Try to lock on strong match
         if top_candidates and top_candidates[0]["action"] == "auto":
             top = top_candidates[0]
-            result = self.tracker.try_lock(top["shabad_id"], top["score"])
+            instant = top["score"] >= config.matcher.instant_lock_threshold
+            result = self.tracker.try_lock(top["shabad_id"], top["score"], instant=instant)
 
             if result["action"] == "locked":
                 # Confirmed — display and fetch verses
