@@ -1,0 +1,98 @@
+name: Release Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Build macOS app bundle
+        run: |
+          pyinstaller \
+            --noconfirm \
+            --windowed \
+            --name "STTM Automate" \
+            --paths . \
+            --add-data "static:static" \
+            --collect-all faster_whisper \
+            --collect-all webview \
+            scripts/mac_app_entry.py
+
+      - name: Package app bundle
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          ditto -c -k --sequesterRsrc --keepParent "dist/STTM Automate.app" "STTM-Automate-mac-${VERSION}.zip"
+
+      - name: Upload mac artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: STTM-Automate-mac
+          path: STTM-Automate-mac-*.zip
+          if-no-files-found: error
+
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build EXE
+        shell: pwsh
+        run: ./scripts/build_windows_exe.ps1
+
+      - name: Rename EXE with version
+        shell: pwsh
+        run: |
+          $version = "${env:GITHUB_REF_NAME}"
+          Copy-Item "dist/STTM-Automate.exe" "STTM-Automate-windows-$version.exe"
+
+      - name: Upload windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: STTM-Automate-windows
+          path: STTM-Automate-windows-*.exe
+          if-no-files-found: error
+
+  publish-release:
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release-assets/STTM-Automate-mac/*.zip
+            release-assets/STTM-Automate-windows/*.exe

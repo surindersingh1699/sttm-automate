@@ -10,3 +10,4 @@ build/
 cache.dat
 *.log
 .DS_Store
+*.spec

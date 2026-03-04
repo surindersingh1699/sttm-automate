@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import fcntl
 import socket
 import threading
 import time
+from pathlib import Path
 
 import httpx
 import uvicorn
@@ -82,6 +84,36 @@ class DashboardServer:
             self._thread.join(timeout=6.0)
 
 
+class SingleInstanceLock:
+    """Prevent multiple desktop app instances from running at once."""
+
+    def __init__(self, lock_path: str = "/tmp/sttm-automate-mac-app.lock"):
+        self.lock_path = Path(lock_path)
+        self._file = None
+
+    def acquire(self) -> bool:
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = self.lock_path.open("w")
+        try:
+            fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._file.write(str(self.lock_path))
+            self._file.flush()
+            return True
+        except BlockingIOError:
+            self._file.close()
+            self._file = None
+            return False
+
+    def release(self) -> None:
+        if self._file is None:
+            return
+        try:
+            fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._file.close()
+            self._file = None
+
+
 def run_mac_app() -> None:
     """Start the local dashboard in a native desktop window."""
     try:
@@ -90,6 +122,11 @@ def run_mac_app() -> None:
         raise RuntimeError(
             "Missing dependency 'pywebview'. Run: pip install pywebview"
         ) from exc
+
+    lock = SingleInstanceLock()
+    if not lock.acquire():
+        print("[MacApp] Another STTM Automate app instance is already running.")
+        return
 
     server = DashboardServer()
     server.start()
@@ -110,3 +147,4 @@ def run_mac_app() -> None:
         webview.start(debug=False)
     finally:
         server.stop()
+        lock.release()

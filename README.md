@@ -76,6 +76,30 @@ Windows `.exe` builds are automated via GitHub Actions:
 
 You can trigger it from GitHub Actions (`Build Windows EXE`), then download the artifact and share the `.exe`.
 
+## Host Downloads Online (recommended)
+
+Use GitHub Releases as your download host:
+
+1. Create and push a tag:
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+2. Workflow `Release Binaries` builds and publishes:
+- macOS zip (`STTM-Automate-mac-*.zip`)
+- Windows exe (`STTM-Automate-windows-*.exe`)
+
+3. Landing page auto-fetches latest release assets from:
+
+```text
+https://api.github.com/repos/surindersingh1699/sttm-automate/releases/latest
+```
+
+See full details:
+- `docs/download-hosting.md`
+
 ## Update
 
 Re-run the same install command:
