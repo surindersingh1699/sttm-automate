@@ -15,6 +15,7 @@ python -m pip install pyinstaller
 Write-Host "[build-win] Building .exe..."
 pyinstaller `
   --noconfirm `
+  --onefile `
   --windowed `
   --name $AppName `
   --paths $RootDir `

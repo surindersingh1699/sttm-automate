@@ -34,3 +34,4 @@ jobs:
         with:
           name: STTM-Automate-windows-exe
           path: dist/STTM-Automate.exe
+          if-no-files-found: error
