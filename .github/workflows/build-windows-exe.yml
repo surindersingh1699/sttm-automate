@@ -1,0 +1,36 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - "src/**"
+      - "scripts/build_windows_exe.ps1"
+      - "scripts/windows_app_entry.py"
+      - "requirements.txt"
+      - "pyproject.toml"
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build EXE
+        shell: pwsh
+        run: ./scripts/build_windows_exe.ps1
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: STTM-Automate-windows-exe
+          path: dist/STTM-Automate.exe

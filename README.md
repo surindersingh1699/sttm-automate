@@ -66,6 +66,16 @@ Output:
 dist/STTM Automate.app
 ```
 
+## Build Windows .exe (shareable)
+
+Windows `.exe` builds are automated via GitHub Actions:
+
+- Workflow: `.github/workflows/build-windows-exe.yml`
+- Job artifact: `STTM-Automate-windows-exe`
+- Output binary inside artifact: `dist/STTM-Automate.exe`
+
+You can trigger it from GitHub Actions (`Build Windows EXE`), then download the artifact and share the `.exe`.
+
 ## Update
 
 Re-run the same install command:
