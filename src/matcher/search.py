@@ -58,7 +58,7 @@ class ShabadSearcher:
 
         Strategies tried in order:
         1. searchtype=0: First letter beginning (primary, romanized codes)
-        2. searchtype=4: First letter anywhere (broader fallback)
+        2. searchtype=1: First letter anywhere (broader fallback)
         3. Substring search: Try shorter substrings if full query gets no results
         """
         if len(first_letters) < 3:
@@ -80,7 +80,7 @@ class ShabadSearcher:
         # In start_mode, require stronger start evidence first; only broaden if empty.
         should_broaden = len(candidates) < 3 and (not start_mode or len(candidates) == 0)
         if should_broaden:
-            results = self._search_api(query, searchtype=4, limit=max_results)
+            results = self._search_api(query, searchtype=1, limit=max_results)
             self._add_unique(results, candidates, seen_ids)
 
         # Strategy 3: Try shorter substrings if we still have few results
