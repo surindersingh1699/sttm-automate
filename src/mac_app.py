@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import fcntl
+import os
+import re
 import socket
+import subprocess
 import threading
 import time
+import traceback
+import webbrowser
 from pathlib import Path
 
 import httpx
@@ -13,6 +18,8 @@ import uvicorn
 
 from src.api.server import app
 from src.config import config
+
+LOG_PATH = Path.home() / "Library/Logs/STTM-Automate.log"
 
 
 def _is_port_open(host: str, port: int) -> bool:
@@ -28,6 +35,99 @@ def _pick_port(host: str, preferred: int, attempts: int = 12) -> int:
     raise RuntimeError(
         f"No free port available near {preferred}. Stop any old STTM Automate instance and retry."
     )
+
+
+def _find_running_dashboard_url(host: str, preferred: int, attempts: int = 12) -> str | None:
+    with httpx.Client(timeout=0.4) as client:
+        for port in range(preferred, preferred + attempts):
+            url = f"http://{host}:{port}"
+            try:
+                resp = client.get(f"{url}/api/status")
+                if resp.status_code == 200:
+                    return url
+            except Exception:
+                pass
+    return None
+
+
+def _read_lock_pid(lock_path: Path) -> int | None:
+    try:
+        raw = lock_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return int(raw) if raw.isdigit() else None
+
+
+def _ports_listening_for_pid(pid: int) -> list[int]:
+    try:
+        proc = subprocess.run(
+            ["lsof", "-nP", "-a", f"-p{pid}", "-iTCP", "-sTCP:LISTEN"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return []
+    if proc.returncode != 0:
+        return []
+    ports: list[int] = []
+    for line in proc.stdout.splitlines():
+        match = re.search(r":(\d+)\s+\(LISTEN\)$", line)
+        if match:
+            ports.append(int(match.group(1)))
+    return ports
+
+
+def _find_existing_instance_url(lock_path: Path, host: str, preferred: int) -> str | None:
+    pid = _read_lock_pid(lock_path)
+    if pid is not None:
+        with httpx.Client(timeout=0.4) as client:
+            for port in _ports_listening_for_pid(pid):
+                url = f"http://{host}:{port}"
+                try:
+                    resp = client.get(f"{url}/api/status")
+                    if resp.status_code == 200:
+                        return url
+                except Exception:
+                    pass
+    return _find_running_dashboard_url(host, preferred)
+
+
+def _activate_existing_app_window() -> bool:
+    """Bring an already-running app instance to the foreground."""
+    try:
+        proc = subprocess.run(
+            ["osascript", "-e", 'tell application "STTM Automate" to activate'],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return False
+    return proc.returncode == 0
+
+
+def _write_startup_error(exc: Exception) -> None:
+    """Persist startup errors so Finder launches do not fail silently."""
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    details = "".join(traceback.format_exception(exc))
+    with LOG_PATH.open("a", encoding="utf-8") as logf:
+        logf.write(f"\n--- STTM Automate startup error ---\n{details}\n")
+
+
+def _show_startup_error_dialog() -> None:
+    message = (
+        f'STTM Automate failed to start. '
+        f'Open log for details:\\n{LOG_PATH}'
+    )
+    script = (
+        f'display dialog "{message}" buttons {{"OK"}} '
+        f'default button "OK" with icon caution'
+    )
+    try:
+        subprocess.run(["osascript", "-e", script], check=False)
+    except OSError:
+        pass
 
 
 class DashboardServer:
@@ -93,10 +193,12 @@ class SingleInstanceLock:
 
     def acquire(self) -> bool:
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-        self._file = self.lock_path.open("w")
+        self._file = self.lock_path.open("a+")
         try:
             fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self._file.write(str(self.lock_path))
+            self._file.seek(0)
+            self._file.truncate()
+            self._file.write(str(os.getpid()))
             self._file.flush()
             return True
         except BlockingIOError:
@@ -125,14 +227,30 @@ def run_mac_app() -> None:
 
     lock = SingleInstanceLock()
     if not lock.acquire():
-        print("[MacApp] Another STTM Automate app instance is already running.")
+        activated = _activate_existing_app_window()
+        existing_url = _find_existing_instance_url(
+            lock.lock_path,
+            "127.0.0.1",
+            int(config.dashboard.port),
+        )
+        if existing_url:
+            print(
+                f"[MacApp] STTM Automate is already running. Reusing existing instance at {existing_url}"
+            )
+            if not activated:
+                try:
+                    webbrowser.open(existing_url)
+                except Exception:
+                    pass
+        else:
+            print("[MacApp] Another STTM Automate app instance is already running.")
         return
 
     server = DashboardServer()
-    server.start()
-    print(f"[MacApp] Dashboard ready at {server.url}")
-
     try:
+        server.start()
+        print(f"[MacApp] Dashboard ready at {server.url}")
+
         window = webview.create_window(
             title="STTM Automate",
             url=server.url,
@@ -145,6 +263,10 @@ def run_mac_app() -> None:
             window.events.closed += lambda: server.stop()
 
         webview.start(debug=False)
+    except Exception as exc:
+        print(f"[MacApp] Startup failed: {exc}")
+        _write_startup_error(exc)
+        _show_startup_error_dialog()
     finally:
         server.stop()
         lock.release()

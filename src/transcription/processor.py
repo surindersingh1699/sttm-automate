@@ -41,16 +41,15 @@ def _is_valid_text(text: str) -> bool:
         if pattern.search(text):
             return False
 
-    # Check that at least some characters are from valid scripts
-    valid_chars = 0
+    # Require at least some Gurmukhi or Devanagari characters —
+    # pure English/ASCII output is not useful for shabad matching.
+    punjabi_chars = 0
     for char in text:
         code = ord(char)
-        for start, end in _VALID_RANGES:
-            if start <= code <= end:
-                valid_chars += 1
-                break
+        if (0x0A00 <= code <= 0x0A7F) or (0x0900 <= code <= 0x097F):
+            punjabi_chars += 1
 
-    return valid_chars >= 2
+    return punjabi_chars >= 2
 
 
 class TranscriptionProcessor:

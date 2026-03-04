@@ -78,7 +78,7 @@ class PipelineOrchestrator:
 
     async def start(self):
         """Initialize components and start the processing loop."""
-        print("[Pipeline] Loading Whisper model...")
+        print("[Pipeline] Loading transcription engine...")
         await asyncio.to_thread(self.transcriber.load)
 
         print("[Pipeline] Connecting to STTM...")

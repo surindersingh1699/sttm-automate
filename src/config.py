@@ -23,8 +23,8 @@ class WhisperConfig(BaseModel):
     compute_type: str = "int8"  # int8 for CPU, float16 for GPU
     language: str = "pa"  # Punjabi
     beam_size: int = 5
-    vad_filter: bool = True
-    vad_threshold: float = 0.35  # lower = more sensitive to speech
+    vad_filter: bool = False  # disabled — pipeline has its own vocal detection; Silero VAD rejects kirtan singing
+    vad_threshold: float = 0.15  # (only used if vad_filter re-enabled)
     vad_min_silence_ms: int = 800  # kirtan has natural pauses between lines (~1s)
     vad_speech_pad_ms: int = 500  # pad more to catch singing onset/offset
 
