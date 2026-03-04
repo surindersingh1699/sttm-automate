@@ -46,6 +46,26 @@ Then open:
 http://localhost:8080
 ```
 
+Or run as a macOS desktop app window:
+
+```bash
+sttm-automate mac-app
+```
+
+## Build macOS .app bundle
+
+To generate a clickable app bundle locally:
+
+```bash
+./scripts/build_mac_app.sh
+```
+
+Output:
+
+```text
+dist/STTM Automate.app
+```
+
 ## Update
 
 Re-run the same install command:
