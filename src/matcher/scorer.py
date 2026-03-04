@@ -1,9 +1,13 @@
 """Confidence scoring for shabad candidates."""
 
 from difflib import SequenceMatcher
+import re
 
 from src.config import config
 from src.matcher.search import ShabadCandidate
+
+
+_TOKEN_SPLIT = re.compile(r"\s+")
 
 
 class ConfidenceScorer:
@@ -87,7 +91,45 @@ class ConfidenceScorer:
             return "suggest"
         return "ignore"
 
+    def word_overlap_count(self, transcript_text: str, candidate_text: str) -> int:
+        """Count overlapping normalized Punjabi words between transcript and candidate."""
+        if not transcript_text or not candidate_text:
+            return 0
+        transcript_words = set(self._normalize_words(transcript_text))
+        candidate_words = set(self._normalize_words(candidate_text))
+        if not transcript_words or not candidate_words:
+            return 0
+        return len(transcript_words & candidate_words)
+
     def _longest_consecutive_match(self, a: str, b: str) -> int:
         """Find the longest consecutive matching substring length."""
         match = SequenceMatcher(None, a, b).find_longest_match(0, len(a), 0, len(b))
         return match.size
+
+    def _normalize_words(self, text: str) -> list[str]:
+        """
+        Normalize Devanagari/Gurmukhi mixed text into Gurmukhi-ish tokens and split words.
+        Keeps only Punjabi script letters and spaces for robust overlap checks.
+        """
+        normalized_chars: list[str] = []
+        for char in text:
+            cp = ord(char)
+            # Convert Devanagari block to Gurmukhi via Unicode offset.
+            if 0x0900 <= cp <= 0x097F:
+                mapped = cp + 0x0100
+                if 0x0A00 <= mapped <= 0x0A7F:
+                    normalized_chars.append(chr(mapped))
+                else:
+                    normalized_chars.append(" ")
+                continue
+            # Keep Gurmukhi chars.
+            if 0x0A00 <= cp <= 0x0A7F:
+                normalized_chars.append(char)
+                continue
+            # Treat everything else as separator.
+            normalized_chars.append(" ")
+
+        cleaned = "".join(normalized_chars)
+        tokens = [token.strip() for token in _TOKEN_SPLIT.split(cleaned) if token.strip()]
+        # Ignore tiny single-character tokens to reduce accidental overlap.
+        return [token for token in tokens if len(token) >= 2]

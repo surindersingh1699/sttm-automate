@@ -73,6 +73,8 @@ class PipelineOrchestrator:
         self._window_index = 0
         self._confidence_mode = "balanced"
         self._prev_first_letters = ""
+        self._candidate_lock_misses = 0
+        self._speech_rate_lps = 0.0
 
     async def start(self):
         """Initialize components and start the processing loop."""
@@ -157,6 +159,10 @@ class PipelineOrchestrator:
             "conservative": {
                 "auto_threshold": 0.82,
                 "instant_lock_threshold": 0.92,
+                "min_raw_lock_score": 0.74,
+                "word_overlap_auto_min": 1,
+                "word_overlap_evidence_min": 2,
+                "word_overlap_instant_min": 1,
                 "suggest_threshold": 0.66,
                 "challenger_margin": 0.14,
                 "challenger_windows": 4,
@@ -165,10 +171,15 @@ class PipelineOrchestrator:
                 "recovery_challenger_score": 0.72,
                 "local_line_follow_threshold": 0.48,
                 "silence_autolock_min_score": 0.90,
+                "candidate_lock_miss_windows": 3,
             },
             "balanced": {
                 "auto_threshold": 0.75,
                 "instant_lock_threshold": 0.85,
+                "min_raw_lock_score": 0.70,
+                "word_overlap_auto_min": 1,
+                "word_overlap_evidence_min": 2,
+                "word_overlap_instant_min": 1,
                 "suggest_threshold": 0.60,
                 "challenger_margin": 0.10,
                 "challenger_windows": 3,
@@ -177,10 +188,15 @@ class PipelineOrchestrator:
                 "recovery_challenger_score": 0.65,
                 "local_line_follow_threshold": 0.42,
                 "silence_autolock_min_score": 0.82,
+                "candidate_lock_miss_windows": 4,
             },
             "fast": {
                 "auto_threshold": 0.68,
                 "instant_lock_threshold": 0.80,
+                "min_raw_lock_score": 0.66,
+                "word_overlap_auto_min": 1,
+                "word_overlap_evidence_min": 1,
+                "word_overlap_instant_min": 1,
                 "suggest_threshold": 0.55,
                 "challenger_margin": 0.08,
                 "challenger_windows": 2,
@@ -189,11 +205,16 @@ class PipelineOrchestrator:
                 "recovery_challenger_score": 0.58,
                 "local_line_follow_threshold": 0.38,
                 "silence_autolock_min_score": 0.75,
+                "candidate_lock_miss_windows": 5,
             },
         }
         selected = profiles.get(mode, profiles["balanced"])
         config.matcher.auto_threshold = selected["auto_threshold"]
         config.matcher.instant_lock_threshold = selected["instant_lock_threshold"]
+        config.matcher.min_raw_lock_score = selected["min_raw_lock_score"]
+        config.matcher.word_overlap_auto_min = selected["word_overlap_auto_min"]
+        config.matcher.word_overlap_evidence_min = selected["word_overlap_evidence_min"]
+        config.matcher.word_overlap_instant_min = selected["word_overlap_instant_min"]
         config.matcher.suggest_threshold = selected["suggest_threshold"]
         config.matcher.challenger_margin = selected["challenger_margin"]
         config.matcher.challenger_windows = selected["challenger_windows"]
@@ -202,6 +223,7 @@ class PipelineOrchestrator:
         config.matcher.recovery_challenger_score = selected["recovery_challenger_score"]
         config.matcher.local_line_follow_threshold = selected["local_line_follow_threshold"]
         config.matcher.silence_autolock_min_score = selected["silence_autolock_min_score"]
+        config.matcher.candidate_lock_miss_windows = selected["candidate_lock_miss_windows"]
         self.tracker.set_policy(
             challenger_windows=config.matcher.challenger_windows,
             challenger_margin=config.matcher.challenger_margin,
@@ -258,6 +280,7 @@ class PipelineOrchestrator:
                     "type": "audio_level",
                     "rms": round(chunk_rms, 4),
                     "has_vocals": has_vocals,
+                    "speech_rate_lps": round(self._speech_rate_lps, 2),
                     "listening_mode": listening_mode,
                     "window_seconds": round(window_seconds, 2),
                 })
@@ -270,6 +293,7 @@ class PipelineOrchestrator:
                 # Skip transcription if no vocal content (just music/silence)
                 if not has_vocals:
                     self._prev_first_letters = ""
+                    self._speech_rate_lps *= 0.9
                     await self._try_silence_autolock()
                     await self._broadcast({
                         "type": "transcription",
@@ -287,12 +311,19 @@ class PipelineOrchestrator:
 
                 # 3. Extract first letters
                 first_letters = extract_first_letters(text)
+                instantaneous_lps = len(first_letters) / max(window_seconds, 0.1)
+                alpha = max(0.01, min(0.99, config.matcher.speech_rate_ema_alpha))
+                self._speech_rate_lps = (
+                    (1.0 - alpha) * self._speech_rate_lps
+                    + alpha * instantaneous_lps
+                )
 
                 # 4. Broadcast transcription
                 await self._broadcast({
                     "type": "transcription",
                     "text": text,
                     "first_letters": first_letters,
+                    "speech_rate_lps": round(self._speech_rate_lps, 2),
                     "pipeline_state": self.tracker.state.value,
                     "listening_mode": listening_mode,
                     "window_seconds": round(window_seconds, 2),
@@ -305,11 +336,15 @@ class PipelineOrchestrator:
                 ):
                     if len(first_letters) < config.matcher.min_search_letters:
                         if self.tracker.state == PipelineState.CANDIDATE_LOCK:
-                            self.tracker.clear_candidate_lock()
+                            self._candidate_lock_misses += 1
+                            if self._candidate_lock_misses >= config.matcher.candidate_lock_miss_windows:
+                                self.tracker.clear_candidate_lock()
+                                self._candidate_lock_misses = 0
                         continue
                     await self._handle_searching(
                         first_letters,
                         start_mode=self._after_break_windows > 0,
+                        transcript_text=text,
                     )
                     if self._after_break_windows > 0:
                         self._after_break_windows -= 1
@@ -319,7 +354,11 @@ class PipelineOrchestrator:
                         self.tracker.mark_unstable()
                         self._prev_first_letters = first_letters
                         continue
-                    await self._handle_locked(first_letters, self._prev_first_letters)
+                    await self._handle_locked(
+                        first_letters,
+                        self._prev_first_letters,
+                        transcript_text=text,
+                    )
                     if self._after_break_windows > 0:
                         self._after_break_windows -= 1
 
@@ -351,6 +390,7 @@ class PipelineOrchestrator:
         self,
         first_letters: str,
         start_mode: bool = False,
+        transcript_text: str = "",
     ):
         """SEARCHING state: broad search, score candidates, try to lock."""
         # Broad BaniDB search
@@ -362,7 +402,7 @@ class PipelineOrchestrator:
         )
 
         # Score candidates
-        scored = self._score_candidates(first_letters, candidates)
+        scored = self._score_candidates(first_letters, candidates, transcript_text)
         top_candidates = scored[:config.dashboard.max_candidates]
         self.tracker.observe_candidates(top_candidates, self._window_index)
         best_hypothesis = self.tracker.best_hypothesis()
@@ -388,23 +428,51 @@ class PipelineOrchestrator:
             )
             if top:
                 top = dict(top)
-                top["score"] = round(max(top["score"], best_hypothesis["evidence_score"]), 3)
+                top["raw_score"] = top["score"]
+                top["evidence_score"] = round(best_hypothesis["evidence_score"], 3)
                 top["stability"] = best_hypothesis["stability"]
         if top is None and top_candidates:
             top = dict(top_candidates[0])
+            top["raw_score"] = top["score"]
+            top["evidence_score"] = top["score"]
             top["stability"] = 1
 
         # Try to lock on cumulative strong match.
-        if top and top["score"] >= config.matcher.auto_threshold:
+        if top:
+            raw_score = float(top.get("raw_score", top.get("score", 0.0)))
+            evidence_score = float(top.get("evidence_score", raw_score))
+            word_overlap = int(top.get("word_overlap", 0))
+            top["score"] = round(max(raw_score, evidence_score), 3)
+            meets_raw_auto = (
+                raw_score >= config.matcher.auto_threshold
+                and word_overlap >= config.matcher.word_overlap_auto_min
+            )
+            meets_evidence = (
+                evidence_score >= config.matcher.auto_threshold
+                and int(top.get("stability", 1)) >= config.matcher.candidate_lock_windows
+                and word_overlap >= config.matcher.word_overlap_evidence_min
+            )
+            lockable = (
+                raw_score >= config.matcher.min_raw_lock_score
+                and (meets_raw_auto or meets_evidence)
+            )
+        else:
+            raw_score = 0.0
+            evidence_score = 0.0
+            word_overlap = 0
+            lockable = False
+
+        if top and lockable:
             self._silence_autolock_candidate = top
             self._silence_autolock_ttl = config.matcher.silence_autolock_windows
             instant = (
-                top["score"] >= config.matcher.instant_lock_threshold
-                and int(top.get("stability", 1)) >= max(2, config.matcher.candidate_lock_windows)
+                raw_score >= config.matcher.instant_lock_threshold
+                and word_overlap >= config.matcher.word_overlap_instant_min
             )
-            result = self.tracker.try_lock(top["shabad_id"], top["score"], instant=instant)
+            result = self.tracker.try_lock(top["shabad_id"], raw_score, instant=instant)
 
             if result["action"] == "locked":
+                self._candidate_lock_misses = 0
                 await self._lock_shabad_from_top(top)
                 self._after_break_windows = 0
                 total = len(self.tracker.current.verses) if self.tracker.current else 0
@@ -414,6 +482,7 @@ class PipelineOrchestrator:
                 )
 
             elif result["action"] == "pending":
+                self._candidate_lock_misses = 0
                 await self._broadcast({
                     "type": "pending_lock",
                     "shabad": top,
@@ -426,9 +495,17 @@ class PipelineOrchestrator:
             self._silence_autolock_candidate = None
             self._silence_autolock_ttl = 0
             if self.tracker.state == PipelineState.CANDIDATE_LOCK:
-                self.tracker.clear_candidate_lock()
+                self._candidate_lock_misses += 1
+                if self._candidate_lock_misses >= config.matcher.candidate_lock_miss_windows:
+                    self.tracker.clear_candidate_lock()
+                    self._candidate_lock_misses = 0
 
-    async def _handle_locked(self, first_letters: str, prev_first_letters: str = ""):
+    async def _handle_locked(
+        self,
+        first_letters: str,
+        prev_first_letters: str = "",
+        transcript_text: str = "",
+    ):
         """LOCKED state: align line within shabad, check for challenger."""
         current = self.tracker.current
         if not current or not current.verses:
@@ -583,7 +660,7 @@ class PipelineOrchestrator:
         # Poor line match — do a broad search for potential challenger
         print(f"  [WEAK] line_score={best_line_score:.2f}, searching for challenger...")
         candidates = await asyncio.to_thread(self.searcher.search, first_letters)
-        scored = self._score_candidates(first_letters, candidates)
+        scored = self._score_candidates(first_letters, candidates, transcript_text)
         for candidate in scored:
             if candidate["shabad_id"] == current.shabad_id:
                 candidate["line_idx"] = best_line_idx
@@ -672,7 +749,10 @@ class PipelineOrchestrator:
             })
 
     def _score_candidates(
-        self, first_letters: str, candidates: list[ShabadCandidate]
+        self,
+        first_letters: str,
+        candidates: list[ShabadCandidate],
+        transcript_text: str = "",
     ) -> list[dict]:
         """Score and sort a list of candidates. Returns list of dicts."""
         current_id = self.tracker.current.shabad_id if self.tracker.current else None
@@ -684,6 +764,10 @@ class PipelineOrchestrator:
                 current_id,
             )
             action = self.scorer.classify(score)
+            overlap_source = candidate.unicode
+            if candidate.gurmukhi and candidate.gurmukhi not in overlap_source:
+                overlap_source = f"{overlap_source} {candidate.gurmukhi}"
+            word_overlap = self.scorer.word_overlap_count(transcript_text, overlap_source)
             scored.append({
                 "shabad_id": candidate.shabad_id,
                 "gurmukhi": candidate.gurmukhi,
@@ -691,6 +775,7 @@ class PipelineOrchestrator:
                 "english": candidate.english,
                 "line_idx": 0,
                 "score": round(score, 3),
+                "word_overlap": word_overlap,
                 "action": action,
             })
         scored.sort(key=lambda x: x["score"], reverse=True)
@@ -809,12 +894,26 @@ class PipelineOrchestrator:
         if self._after_break_windows > 0:
             seconds = config.audio.start_window_duration
             mode = "start_boost"
-        elif self.tracker.state == PipelineState.LOCKED:
-            seconds = config.audio.locked_window_duration
-            mode = "locked_follow"
+        elif self.tracker.state in (PipelineState.LOCKED, PipelineState.UNSTABLE_LOCK):
+            if self.tracker.state == PipelineState.UNSTABLE_LOCK or self._weak_line_windows > 0:
+                seconds = config.audio.locked_recovery_window_duration
+                mode = "locked_recover"
+            elif self._speech_rate_lps >= config.matcher.fast_speech_letters_per_second:
+                seconds = config.audio.locked_fast_window_duration
+                mode = "locked_fast"
+            elif self._speech_rate_lps <= config.matcher.slow_speech_letters_per_second:
+                seconds = config.audio.locked_recovery_window_duration
+                mode = "locked_slow"
+            else:
+                seconds = config.audio.locked_window_duration
+                mode = "locked_follow"
         else:
-            seconds = config.audio.window_duration
-            mode = "search"
+            if self._speech_rate_lps >= config.matcher.fast_speech_letters_per_second:
+                seconds = config.audio.search_fast_window_duration
+                mode = "search_fast"
+            else:
+                seconds = config.audio.window_duration
+                mode = "search"
 
         samples = int(seconds * samplerate)
         if samples <= 0 or samples >= len(window):

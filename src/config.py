@@ -11,6 +11,9 @@ class AudioConfig(BaseModel):
     window_duration: float = 10.0  # seconds of audio fed to Whisper (controls context)
     start_window_duration: float = 4.5  # shorter window right after a vocal break
     locked_window_duration: float = 7.0  # medium window while following a locked shabad
+    locked_fast_window_duration: float = 5.0  # short locked window for fast recitation
+    locked_recovery_window_duration: float = 9.0  # longer locked window when recovering from weak match
+    search_fast_window_duration: float = 8.0  # shorter search window for very fast speech
     device: int | None = None  # None = system default
 
 
@@ -30,6 +33,10 @@ class MatcherConfig(BaseModel):
     # Confidence thresholds
     auto_threshold: float = 0.75  # auto-select (2-cycle confirm at 75-84%, instant lock at 85%+)
     instant_lock_threshold: float = 0.85  # skip confirmation at this confidence
+    min_raw_lock_score: float = 0.70  # require a minimum raw per-window score before any lock
+    word_overlap_auto_min: int = 1  # min overlapping words for raw auto lock
+    word_overlap_evidence_min: int = 2  # stricter overlap when relying on evidence+stability
+    word_overlap_instant_min: int = 1  # min overlap for instant lock path
     suggest_threshold: float = 0.60
     # Scoring weights (must sum to 1.0)
     weight_letter_match: float = 0.4
@@ -45,7 +52,7 @@ class MatcherConfig(BaseModel):
     recovery_challenger_score: float = 0.65  # allow non-auto challenger in recovery mode
     local_line_follow_threshold: float = 0.42  # allow nearby line updates at lower confidence
     local_line_follow_window: int = 2  # consider +/- N lines around current line for fallback
-    vocal_break_min_windows: int = 2  # consecutive non-vocal windows to mark a vocal break
+    vocal_break_min_windows: int = 1  # consecutive non-vocal windows to mark a vocal break
     post_break_boost_windows: int = 3  # windows to stay in start-detection mode after break
     silence_autolock_min_score: float = 0.82  # minimum score to lock during no-lyrics gap
     silence_autolock_windows: int = 2  # how long a strong candidate stays eligible during silence
@@ -53,7 +60,11 @@ class MatcherConfig(BaseModel):
     hypothesis_ttl_seconds: float = 5.0  # keep hypotheses alive for this long
     hypothesis_decay: float = 0.85  # cumulative evidence decay each window
     candidate_lock_windows: int = 2  # confirmations required in CANDIDATE_LOCK state
+    candidate_lock_miss_windows: int = 4  # weak windows tolerated before dropping pending lock
     progression_high_confidence_bypass: float = 0.88  # skip proximity penalty above this
+    fast_speech_letters_per_second: float = 1.50  # above this, favor shorter windows
+    slow_speech_letters_per_second: float = 0.65  # below this, favor longer windows
+    speech_rate_ema_alpha: float = 0.35  # smoothing factor for speech-rate estimate
 
 
 class STTMConfig(BaseModel):
