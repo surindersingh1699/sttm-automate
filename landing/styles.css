@@ -1,0 +1,257 @@
+:root {
+  --bg: #f5f2ea;
+  --ink: #181613;
+  --accent: #b44f22;
+  --accent-2: #145f52;
+  --panel: rgba(255, 255, 255, 0.72);
+  --panel-border: rgba(24, 22, 19, 0.12);
+  --radius: 16px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: radial-gradient(circle at 8% 5%, #ffedd6 0, rgba(255, 237, 214, 0) 30%),
+              radial-gradient(circle at 92% 16%, #d6f7ea 0, rgba(214, 247, 234, 0) 32%),
+              var(--bg);
+  color: var(--ink);
+  font-family: "Space Grotesk", "Avenir Next", sans-serif;
+}
+
+.bg-orb {
+  position: fixed;
+  z-index: 0;
+  width: 240px;
+  height: 240px;
+  border-radius: 999px;
+  filter: blur(42px);
+  opacity: 0.35;
+  pointer-events: none;
+}
+
+.orb-a {
+  background: #ec7f3a;
+  top: 5vh;
+  right: -80px;
+}
+
+.orb-b {
+  background: #2b9a88;
+  bottom: 8vh;
+  left: -90px;
+}
+
+.topbar,
+main,
+footer {
+  position: relative;
+  z-index: 1;
+}
+
+.topbar {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 20px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.brand {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+}
+
+nav {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+}
+
+nav a {
+  text-decoration: none;
+  color: var(--ink);
+  font-weight: 500;
+}
+
+main {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 24px 20px 54px;
+}
+
+.hero {
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius);
+  backdrop-filter: blur(10px);
+  padding: 36px;
+  box-shadow: 0 20px 35px rgba(0, 0, 0, 0.08);
+  animation: rise 480ms ease-out;
+}
+
+.eyebrow {
+  margin: 0;
+  font-size: 13px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--accent-2);
+  font-weight: 700;
+}
+
+h1 {
+  margin: 8px 0 12px;
+  font-size: clamp(32px, 5vw, 58px);
+  line-height: 1.03;
+}
+
+.lead {
+  max-width: 780px;
+  margin: 0;
+  font-size: clamp(16px, 2.4vw, 21px);
+  line-height: 1.45;
+}
+
+.hero-actions {
+  margin-top: 24px;
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.gurmukhi {
+  margin-top: 22px;
+  font-family: "Noto Sans Gurmukhi", sans-serif;
+  font-size: clamp(20px, 3vw, 31px);
+  color: #7d3315;
+}
+
+.grid {
+  margin-top: 20px;
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.features article,
+.panel {
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius);
+  background: var(--panel);
+  backdrop-filter: blur(8px);
+}
+
+.features article {
+  padding: 20px;
+  animation: rise 520ms ease-out;
+}
+
+.features h2,
+.panel h2 {
+  margin: 0 0 8px;
+  font-size: 22px;
+}
+
+.features p,
+.panel p,
+.panel li,
+.panel h3 {
+  margin: 0;
+  line-height: 1.45;
+}
+
+.panel {
+  margin-top: 18px;
+  padding: 22px;
+}
+
+.panel h3 {
+  margin-top: 16px;
+  margin-bottom: 8px;
+}
+
+pre {
+  overflow-x: auto;
+  border-radius: 12px;
+  background: #17120e;
+  color: #f8efe6;
+  border: 1px solid #2a211b;
+  padding: 14px;
+}
+
+ul {
+  margin: 10px 0 0;
+  padding-left: 18px;
+}
+
+.btn,
+.btn-link {
+  display: inline-block;
+  border-radius: 999px;
+  padding: 10px 16px;
+  font-weight: 700;
+}
+
+.btn {
+  border: 1px solid transparent;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.btn-primary {
+  background: linear-gradient(130deg, var(--accent), #cf6b40);
+  color: #fff;
+}
+
+.btn-ghost,
+.btn-link {
+  border: 1px solid rgba(24, 22, 19, 0.2);
+  background: rgba(255, 255, 255, 0.65);
+  color: var(--ink);
+}
+
+footer {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 0 20px 28px;
+  color: #5d5248;
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (max-width: 900px) {
+  .grid {
+    grid-template-columns: 1fr;
+  }
+
+  .topbar {
+    flex-direction: column;
+    gap: 12px;
+    align-items: flex-start;
+  }
+
+  nav {
+    flex-wrap: wrap;
+  }
+}

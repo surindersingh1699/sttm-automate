@@ -8,6 +8,9 @@ Phase 1 is local-first installation from GitHub:
 - App runs on each laptop (audio + STTM control stay local).
 - GitHub is used for code delivery and updates.
 
+Landing page:
+- https://landing-mu-sandy.vercel.app
+
 ## Prerequisites
 
 - macOS (current setup targets STTM Desktop on macOS)

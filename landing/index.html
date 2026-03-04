@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>STTM Automate | Local-First Gurbani Projection</title>
+  <meta name="description" content="Local-first automation for SikhiToTheMax: detect live kirtan shabad and drive projection with minimal operator load.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Noto+Sans+Gurmukhi:wght@500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <div class="bg-orb orb-a"></div>
+  <div class="bg-orb orb-b"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot"></span>
+      <strong>STTM Automate</strong>
+    </div>
+    <nav>
+      <a href="#install">Install</a>
+      <a href="#release">Release</a>
+      <a href="#faq">FAQ</a>
+      <a class="btn-link" href="https://github.com/surindersingh1699/sttm-automate" target="_blank" rel="noreferrer">GitHub</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero">
+      <p class="eyebrow">Phase 1 Beta</p>
+      <h1>Run live kirtan projection automation on your own laptop.</h1>
+      <p class="lead">STTM Automate listens to local audio, matches shabad, and controls SikhiToTheMax with a local-first workflow built for practice and live programs.</p>
+      <div class="hero-actions">
+        <a class="btn btn-primary" href="#install">Install Now</a>
+        <a class="btn btn-ghost" href="https://github.com/surindersingh1699/sttm-automate" target="_blank" rel="noreferrer">View Source</a>
+      </div>
+      <div class="gurmukhi">ਸੁਣਿ ਮਨ ਮਿਤ੍ਰ ਪਿਆਰੇਆ</div>
+    </section>
+
+    <section class="grid features">
+      <article>
+        <h2>Local-first runtime</h2>
+        <p>Audio capture and STTM control run on the same machine for lower operational risk during programs.</p>
+      </article>
+      <article>
+        <h2>Whisper-based transcription</h2>
+        <p>Uses local faster-whisper runtime, tuned for Punjabi and kirtan pacing.</p>
+      </article>
+      <article>
+        <h2>Operator dashboard</h2>
+        <p>Built-in web dashboard for lock state, candidates, and line navigation.</p>
+      </article>
+    </section>
+
+    <section id="install" class="panel">
+      <h2>Install (Phase 1)</h2>
+      <p>For technical users on macOS with Python 3.11+ and STTM installed.</p>
+      <pre><code id="install-cmd">curl -fsSL https://raw.githubusercontent.com/surindersingh1699/sttm-automate/master/scripts/install.sh | bash</code></pre>
+      <button id="copy-btn" class="btn btn-primary" type="button">Copy Install Command</button>
+      <h3>Run</h3>
+      <pre><code>sttm-automate dashboard</code></pre>
+      <p>Open <code>http://localhost:8080</code>.</p>
+    </section>
+
+    <section id="release" class="panel">
+      <h2>Release Operations</h2>
+      <p>Phase 1 release docs are in-repo and versioned with code.</p>
+      <ul>
+        <li><a href="https://github.com/surindersingh1699/sttm-automate/blob/master/docs/phase-1-release-checklist.md" target="_blank" rel="noreferrer">Phase 1 Release Checklist</a></li>
+        <li><a href="https://github.com/surindersingh1699/sttm-automate/blob/master/docs/phase-1-release-notes-template.md" target="_blank" rel="noreferrer">Release Notes Template</a></li>
+      </ul>
+    </section>
+
+    <section id="faq" class="panel">
+      <h2>FAQ</h2>
+      <h3>Should this be cloud-hosted?</h3>
+      <p>Not for runtime control. STTM control and audio ingestion are local-machine concerns. Host distribution assets/docs only.</p>
+      <h3>Is internet required while running?</h3>
+      <p>Core transcription and matching are local. Some API lookups may still require network access.</p>
+    </section>
+  </main>
+
+  <footer>
+    <p>STTM Automate | Local-first Gurbani automation</p>
+  </footer>
+
+  <script>
+    const button = document.getElementById('copy-btn');
+    const installCmd = document.getElementById('install-cmd').textContent;
+    button.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(installCmd);
+        button.textContent = 'Copied';
+        setTimeout(() => button.textContent = 'Copy Install Command', 1500);
+      } catch {
+        button.textContent = 'Copy failed';
+      }
+    });
+  </script>
+</body>
+</html>
