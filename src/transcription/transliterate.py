@@ -12,10 +12,57 @@ _GURMUKHI_VOWELS = range(0x0A05, 0x0A15)        # ਅ-ਔ
 _GURMUKHI_EXTRA = {0x0A5C, 0x0A74}              # ੜ, ੴ
 _DEVANAGARI_OFFSET = 0x0100  # Devanagari → Gurmukhi offset
 
+# BaniDB first-letter indexing expects canonical vowel-carrier initials
+# for several independent vowels (e.g. ਆ -> ਅ).
+_FIRST_LETTER_NORMALIZE = {
+    "ਆ": "ਅ",
+    "ਇ": "ੲ",
+    "ਈ": "ੲ",
+    "ਏ": "ੲ",
+    "ਐ": "ੲ",
+    "ਉ": "ੳ",
+    "ਊ": "ੳ",
+    "ਔ": "ੳ",
+}
+
 
 def _is_gurmukhi_letter(cp: int) -> bool:
     """Check if a codepoint is a Gurmukhi consonant or independent vowel."""
     return cp in _GURMUKHI_CONSONANTS or cp in _GURMUKHI_VOWELS or cp in _GURMUKHI_EXTRA
+
+
+def normalize_first_letter(letter: str) -> str:
+    """Normalize initial letter to BaniDB-compatible first-letter forms."""
+    return _FIRST_LETTER_NORMALIZE.get(letter, letter)
+
+
+def normalize_for_fullword_search(text: str) -> str:
+    """
+    Normalize mixed-script transcript into a Gurmukhi phrase for BaniDB type=2 search.
+
+    - Devanagari is converted to Gurmukhi via Unicode offset.
+    - Gurmukhi is kept as-is.
+    - Non-Punjabi script chars become separators.
+    """
+    normalized_chars: list[str] = []
+    for char in text:
+        cp = ord(char)
+        if 0x0A00 <= cp <= 0x0A7F:
+            normalized_chars.append(char)
+            continue
+        if 0x0900 <= cp <= 0x097F:
+            mapped = cp + _DEVANAGARI_OFFSET
+            if 0x0A00 <= mapped <= 0x0A7F:
+                normalized_chars.append(chr(mapped))
+            else:
+                normalized_chars.append(" ")
+            continue
+        if char.isspace():
+            normalized_chars.append(" ")
+            continue
+        normalized_chars.append(" ")
+
+    return " ".join("".join(normalized_chars).split())
 
 
 def _devanagari_to_gurmukhi(char: str) -> str | None:
@@ -37,12 +84,12 @@ def _get_first_letter(word: str) -> str | None:
         cp = ord(char)
         # Direct Gurmukhi consonant or vowel
         if _is_gurmukhi_letter(cp):
-            return char
+            return normalize_first_letter(char)
         # Devanagari → convert to Gurmukhi
         if 0x0900 <= cp <= 0x097F:
             converted = _devanagari_to_gurmukhi(char)
             if converted:
-                return converted
+                return normalize_first_letter(converted)
     return None
 
 

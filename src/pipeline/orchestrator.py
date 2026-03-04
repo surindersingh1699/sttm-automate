@@ -163,6 +163,9 @@ class PipelineOrchestrator:
                 "word_overlap_auto_min": 1,
                 "word_overlap_evidence_min": 2,
                 "word_overlap_instant_min": 1,
+                "instant_challenger_switch_score": 0.94,
+                "instant_challenger_switch_margin": 0.12,
+                "word_overlap_instant_challenger_min": 2,
                 "suggest_threshold": 0.66,
                 "challenger_margin": 0.14,
                 "challenger_windows": 4,
@@ -180,6 +183,9 @@ class PipelineOrchestrator:
                 "word_overlap_auto_min": 1,
                 "word_overlap_evidence_min": 2,
                 "word_overlap_instant_min": 1,
+                "instant_challenger_switch_score": 0.90,
+                "instant_challenger_switch_margin": 0.08,
+                "word_overlap_instant_challenger_min": 1,
                 "suggest_threshold": 0.60,
                 "challenger_margin": 0.10,
                 "challenger_windows": 3,
@@ -197,6 +203,9 @@ class PipelineOrchestrator:
                 "word_overlap_auto_min": 1,
                 "word_overlap_evidence_min": 1,
                 "word_overlap_instant_min": 1,
+                "instant_challenger_switch_score": 0.86,
+                "instant_challenger_switch_margin": 0.05,
+                "word_overlap_instant_challenger_min": 1,
                 "suggest_threshold": 0.55,
                 "challenger_margin": 0.08,
                 "challenger_windows": 2,
@@ -215,6 +224,9 @@ class PipelineOrchestrator:
         config.matcher.word_overlap_auto_min = selected["word_overlap_auto_min"]
         config.matcher.word_overlap_evidence_min = selected["word_overlap_evidence_min"]
         config.matcher.word_overlap_instant_min = selected["word_overlap_instant_min"]
+        config.matcher.instant_challenger_switch_score = selected["instant_challenger_switch_score"]
+        config.matcher.instant_challenger_switch_margin = selected["instant_challenger_switch_margin"]
+        config.matcher.word_overlap_instant_challenger_min = selected["word_overlap_instant_challenger_min"]
         config.matcher.suggest_threshold = selected["suggest_threshold"]
         config.matcher.challenger_margin = selected["challenger_margin"]
         config.matcher.challenger_windows = selected["challenger_windows"]
@@ -399,6 +411,7 @@ class PipelineOrchestrator:
             first_letters,
             10,
             start_mode,
+            transcript_text,
         )
 
         # Score candidates
@@ -634,32 +647,58 @@ class PipelineOrchestrator:
                 f"  [LINE {target_idx}/{len(current.verses)}] "
                 f"score={target_score:.2f} — {target_verse.unicode[:50]}"
             )
-            return
-        self.tracker.mark_unstable()
-
-        if best_line_score < config.matcher.weak_line_recovery_score:
-            self._weak_line_windows += 1
         else:
-            self._weak_line_windows = max(0, self._weak_line_windows - 1)
+            self.tracker.mark_unstable()
 
-        if self._weak_line_windows >= config.matcher.weak_line_recovery_windows:
-            print(
-                f"  [RECOVERY] weak line for {self._weak_line_windows} windows "
-                f"(score={best_line_score:.2f}) — releasing lock from shabad {current.shabad_id}"
-            )
-            self.tracker.release_lock()
-            self._weak_line_windows = 0
-            await self._broadcast({
-                "type": "shabad_switched",
-                "old_shabad_id": current.shabad_id,
-                "new_shabad_id": None,
-                "reason": "weak_locked_recovery",
-            })
-            return
+            if best_line_score < config.matcher.weak_line_recovery_score:
+                self._weak_line_windows += 1
+            else:
+                self._weak_line_windows = max(0, self._weak_line_windows - 1)
 
-        # Poor line match — do a broad search for potential challenger
-        print(f"  [WEAK] line_score={best_line_score:.2f}, searching for challenger...")
-        candidates = await asyncio.to_thread(self.searcher.search, first_letters)
+            if self._weak_line_windows >= config.matcher.weak_line_recovery_windows:
+                print(
+                    f"  [RECOVERY] weak line for {self._weak_line_windows} windows "
+                    f"(score={best_line_score:.2f}) — releasing lock from shabad {current.shabad_id}"
+                )
+                self.tracker.release_lock()
+                self._weak_line_windows = 0
+                await self._broadcast({
+                    "type": "shabad_switched",
+                    "old_shabad_id": current.shabad_id,
+                    "new_shabad_id": None,
+                    "reason": "weak_locked_recovery",
+                })
+                return
+
+        # Run challenger scan every locked cycle (not only weak cycles) so wrong-lock
+        # recovery can happen quickly.
+        reason = "background_monitor" if should_update_line else "weak_line_match"
+        await self._scan_challenger(
+            first_letters=first_letters,
+            transcript_text=transcript_text,
+            current=current,
+            best_line_idx=best_line_idx,
+            best_line_score=best_line_score,
+            reason=reason,
+        )
+
+    async def _scan_challenger(
+        self,
+        first_letters: str,
+        transcript_text: str,
+        current,
+        best_line_idx: int,
+        best_line_score: float,
+        reason: str,
+    ):
+        """Search globally for challenger shabads while locked."""
+        candidates = await asyncio.to_thread(
+            self.searcher.search,
+            first_letters,
+            10,
+            False,
+            transcript_text,
+        )
         scored = self._score_candidates(first_letters, candidates, transcript_text)
         for candidate in scored:
             if candidate["shabad_id"] == current.shabad_id:
@@ -673,14 +712,15 @@ class PipelineOrchestrator:
             "type": "candidates",
             "matches": scored[:config.dashboard.max_candidates],
             "pipeline_state": "locked",
-            "reason": "weak_line_match",
+            "reason": reason,
             "hypotheses": self.tracker.get_hypotheses(),
         })
 
         if not scored:
             return
 
-        top = scored[0]
+        top = dict(scored[0])
+        top["raw_score"] = top["score"]
         if best_hypothesis and best_hypothesis["shabad_id"] != current.shabad_id:
             from_hypothesis = next(
                 (
@@ -692,6 +732,7 @@ class PipelineOrchestrator:
             )
             if from_hypothesis and best_hypothesis["stability"] >= 2:
                 top = dict(from_hypothesis)
+                top["raw_score"] = top["score"]
                 top["score"] = round(
                     max(top["score"], best_hypothesis["evidence_score"]), 3
                 )
@@ -703,8 +744,33 @@ class PipelineOrchestrator:
 
         # Only challenge if top result is a different shabad
         if top["shabad_id"] == current.shabad_id:
-            # Still matching current shabad (just a different line)
-            self.tracker.update_line(best_line_idx, best_line_score)
+            return
+
+        top_raw_score = float(top.get("raw_score", top["score"]))
+        top_word_overlap = int(top.get("word_overlap", 0))
+        instant_switch = (
+            top_raw_score >= config.matcher.instant_challenger_switch_score
+            and top_word_overlap >= config.matcher.word_overlap_instant_challenger_min
+            and (
+                top_raw_score - current_shabad_search_score
+                >= config.matcher.instant_challenger_switch_margin
+            )
+        )
+        if instant_switch:
+            old_shabad_id = current.shabad_id
+            print(
+                f"  [INSTANT SWITCH] {old_shabad_id} -> {top['shabad_id']} "
+                f"raw={top_raw_score:.2f} overlap={top_word_overlap}"
+            )
+            self.tracker.try_lock(top["shabad_id"], top_raw_score, instant=True)
+            self._weak_line_windows = 0
+            await self._broadcast({
+                "type": "shabad_switched",
+                "new_shabad_id": top["shabad_id"],
+                "old_shabad_id": old_shabad_id,
+                "reason": "instant_challenger",
+            })
+            await self._lock_shabad_from_top(top)
             return
 
         recovery_mode = (
@@ -736,11 +802,15 @@ class PipelineOrchestrator:
                 "new_shabad_id": new_id,
                 "old_shabad_id": current.shabad_id,
             })
-            # The tracker moved to SEARCHING with pending_id pre-seeded,
-            # so next cycle's try_lock will confirm and lock the new shabad
+            # The tracker moved to CANDIDATE_LOCK with pending_id pre-seeded,
+            # so next cycle's try_lock will confirm and lock the new shabad.
+            return
 
-        elif result["action"] == "challenging":
-            print(f"  [CHALLENGER] {top['shabad_id']} wins {result['wins']}/{result['needed']}")
+        if result["action"] == "challenging":
+            print(
+                f"  [CHALLENGER] {top['shabad_id']} "
+                f"wins {result['wins']}/{result['needed']}"
+            )
             await self._broadcast({
                 "type": "challenger_update",
                 "challenger": top,
@@ -763,11 +833,20 @@ class PipelineOrchestrator:
                 candidate,
                 current_id,
             )
-            action = self.scorer.classify(score)
             overlap_source = candidate.unicode
             if candidate.gurmukhi and candidate.gurmukhi not in overlap_source:
                 overlap_source = f"{overlap_source} {candidate.gurmukhi}"
             word_overlap = self.scorer.word_overlap_count(transcript_text, overlap_source)
+            retrieval_sources = sorted(candidate.retrieval_sources) if candidate.retrieval_sources else []
+            if "type2" in retrieval_sources:
+                # Type=2 phrase retrieval is high precision; add a modest bonus
+                # when transcript words also overlap the verse.
+                if word_overlap >= 2:
+                    score += 0.10
+                elif word_overlap >= 1:
+                    score += 0.05
+            score = min(1.0, max(0.0, score))
+            action = self.scorer.classify(score)
             scored.append({
                 "shabad_id": candidate.shabad_id,
                 "gurmukhi": candidate.gurmukhi,
@@ -776,6 +855,7 @@ class PipelineOrchestrator:
                 "line_idx": 0,
                 "score": round(score, 3),
                 "word_overlap": word_overlap,
+                "retrieval_sources": retrieval_sources,
                 "action": action,
             })
         scored.sort(key=lambda x: x["score"], reverse=True)

@@ -5,6 +5,7 @@ import re
 
 from src.config import config
 from src.matcher.search import ShabadCandidate
+from src.transcription.transliterate import normalize_first_letter
 
 
 _TOKEN_SPLIT = re.compile(r"\s+")
@@ -32,7 +33,7 @@ class ConfidenceScorer:
         """
         # Extract first Gurmukhi letter of each word from the unicode field
         candidate_letters = "".join(
-            w[0] for w in candidate.unicode.split()
+            normalize_first_letter(w[0]) for w in candidate.unicode.split()
             if w and "\u0A00" <= w[0] <= "\u0A7F"
         )
 

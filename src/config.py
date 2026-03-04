@@ -37,6 +37,9 @@ class MatcherConfig(BaseModel):
     word_overlap_auto_min: int = 1  # min overlapping words for raw auto lock
     word_overlap_evidence_min: int = 2  # stricter overlap when relying on evidence+stability
     word_overlap_instant_min: int = 1  # min overlap for instant lock path
+    instant_challenger_switch_score: float = 0.90  # immediate switch when challenger reaches this raw score
+    instant_challenger_switch_margin: float = 0.08  # minimum lead over current shabad score for instant switch
+    word_overlap_instant_challenger_min: int = 1  # min overlap words for instant challenger switch
     suggest_threshold: float = 0.60
     # Scoring weights (must sum to 1.0)
     weight_letter_match: float = 0.4
