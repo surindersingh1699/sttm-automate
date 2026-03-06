@@ -17,6 +17,11 @@ class AudioConfig(BaseModel):
     device: int | None = None  # None = system default
 
 
+class TranscriptionConfig(BaseModel):
+    engine: str = "whisper"  # "whisper" (offline) or "google" (online)
+    google_credentials_path: str | None = None  # path to Google Cloud service account JSON
+
+
 class WhisperConfig(BaseModel):
     model_size: str = "small"  # tiny, base, small, medium, large-v3 (small = best accuracy/speed for Punjabi)
     device: str = "cpu"
@@ -85,6 +90,7 @@ class DashboardConfig(BaseModel):
 
 class AppConfig(BaseModel):
     audio: AudioConfig = AudioConfig()
+    transcription: TranscriptionConfig = TranscriptionConfig()
     whisper: WhisperConfig = WhisperConfig()
     matcher: MatcherConfig = MatcherConfig()
     sttm: STTMConfig = STTMConfig()

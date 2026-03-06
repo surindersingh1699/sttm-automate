@@ -1,12 +1,14 @@
 """Main pipeline: audio → transcription → matching → STTM control → dashboard."""
 
 import asyncio
+import numpy as np
 from typing import Callable, Awaitable
 
 from src.config import config
 from src.audio.capture import AudioCapture
 from src.audio.buffer import AudioRingBuffer
 from src.transcription.engine import TranscriptionEngine
+from src.transcription.google_engine import GoogleTranscriptionEngine
 from src.transcription.processor import TranscriptionProcessor
 from src.transcription.transliterate import extract_first_letters
 from src.matcher.search import ShabadSearcher, ShabadCandidate
@@ -39,7 +41,7 @@ class PipelineOrchestrator:
             audio_device = AudioCapture.find_best_device()
         self.audio = AudioCapture(device=audio_device)
         self.buffer = AudioRingBuffer()
-        self.transcriber = TranscriptionEngine()
+        self.transcriber = self._create_transcription_engine()
         self.processor = TranscriptionProcessor()
         self.searcher = ShabadSearcher()
         self.scorer = ConfidenceScorer()
@@ -64,6 +66,8 @@ class PipelineOrchestrator:
         self._broadcast = broadcast or self._noop_broadcast
         self.running = False
         self.paused = False
+        self._audio_source = "local"  # "local" or "remote"
+        self._remote_audio_queue: asyncio.Queue[np.ndarray] = asyncio.Queue()
         self._weak_line_windows = 0
         self._silence_windows = 0
         self._after_break_windows = 0
@@ -107,6 +111,83 @@ class PipelineOrchestrator:
     def resume(self):
         """Resume automatic processing."""
         self.paused = False
+
+    @staticmethod
+    def _create_transcription_engine():
+        """Create the appropriate transcription engine based on config."""
+        engine_type = config.transcription.engine
+        if engine_type == "google":
+            return GoogleTranscriptionEngine(
+                credentials_path=config.transcription.google_credentials_path,
+            )
+        return TranscriptionEngine()
+
+    async def switch_engine(self, engine_type: str):
+        """Switch transcription engine at runtime (whisper/google)."""
+        if engine_type not in ("whisper", "google"):
+            return
+        config.transcription.engine = engine_type
+        was_paused = self.paused
+        self.paused = True
+        self.transcriber = self._create_transcription_engine()
+        await asyncio.to_thread(self.transcriber.load)
+        self.paused = was_paused
+        print(f"[Pipeline] Switched to {engine_type} engine.")
+
+    @property
+    def current_engine(self) -> str:
+        return config.transcription.engine
+
+    def set_audio_source(self, source: str):
+        """Switch between 'local' (server mic) and 'remote' (browser mic)."""
+        if source not in ("local", "remote"):
+            return
+        if source == self._audio_source:
+            return
+        self._audio_source = source
+        if source == "remote":
+            self.audio.stop()
+            # Clear any stale remote audio
+            while not self._remote_audio_queue.empty():
+                try:
+                    self._remote_audio_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+        elif source == "local":
+            self.audio.start()
+        self.buffer.reset()
+        print(f"[Pipeline] Audio source switched to: {source}")
+
+    def push_remote_audio(self, audio_data: np.ndarray):
+        """Push audio from browser mic into the pipeline."""
+        try:
+            self._remote_audio_queue.put_nowait(audio_data)
+        except asyncio.QueueFull:
+            pass
+
+    async def _get_audio_chunk(self) -> np.ndarray | None:
+        """Get next audio chunk from either local mic or remote browser mic."""
+        if self._audio_source == "remote":
+            samples_needed = int(config.audio.step_duration * config.audio.samplerate)
+            collected: list[np.ndarray] = []
+            collected_samples = 0
+            while collected_samples < samples_needed:
+                if not self.running:
+                    return None
+                try:
+                    block = await asyncio.wait_for(
+                        self._remote_audio_queue.get(), timeout=10.0
+                    )
+                    collected.append(block)
+                    collected_samples += len(block)
+                except asyncio.TimeoutError:
+                    if not self.running:
+                        return None
+                    continue
+            audio = np.concatenate(collected)[:samples_needed]
+            return audio
+        else:
+            return await asyncio.to_thread(self.audio.get_chunk)
 
     async def manual_select(self, shabad_id: int):
         """Manually select a shabad (override from dashboard)."""
@@ -271,8 +352,8 @@ class PipelineOrchestrator:
         while self.running:
             try:
                 self._window_index += 1
-                # 1. Get audio chunk
-                chunk = await asyncio.to_thread(self.audio.get_chunk)
+                # 1. Get audio chunk (from local mic or remote browser)
+                chunk = await self._get_audio_chunk()
                 if chunk is None:
                     break
 

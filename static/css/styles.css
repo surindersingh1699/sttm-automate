@@ -52,6 +52,12 @@ header h1 {
     min-width: 110px;
 }
 
+.mic-status {
+    font-size: 0.8rem;
+    color: #4ecca3;
+    font-weight: 500;
+}
+
 .status-dot {
     width: 10px;
     height: 10px;

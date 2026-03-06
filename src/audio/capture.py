@@ -1,11 +1,16 @@
 """Audio capture from microphone or line-in using sounddevice."""
 
 import numpy as np
-import sounddevice as sd
 from queue import Queue, Empty
 from threading import Event
 
 from src.config import config
+
+
+def _get_sd():
+    """Lazy import sounddevice (requires PortAudio)."""
+    import sounddevice as sd
+    return sd
 
 
 class AudioCapture:
@@ -25,6 +30,11 @@ class AudioCapture:
 
     def start(self):
         """Start capturing audio."""
+        try:
+            sd = _get_sd()
+        except OSError:
+            print("[AudioCapture] PortAudio not available. Local mic disabled — use remote mic.")
+            return
         self._stop_event.clear()
         self._stream = sd.InputStream(
             samplerate=self.samplerate,
@@ -71,6 +81,10 @@ class AudioCapture:
     @staticmethod
     def list_devices() -> list[dict]:
         """List available audio input devices."""
+        try:
+            sd = _get_sd()
+        except OSError:
+            return []
         devices = sd.query_devices()
         inputs = []
         for i, dev in enumerate(devices):
@@ -86,6 +100,10 @@ class AudioCapture:
     @staticmethod
     def find_blackhole_device() -> int | None:
         """Find BlackHole virtual audio device index, if installed."""
+        try:
+            sd = _get_sd()
+        except OSError:
+            return None
         devices = sd.query_devices()
         for i, dev in enumerate(devices):
             if dev["max_input_channels"] > 0 and "blackhole" in dev["name"].lower():
@@ -98,6 +116,11 @@ class AudioCapture:
         Auto-select the best audio input device.
         Priority: BlackHole > Multi-Output > system default.
         """
+        try:
+            sd = _get_sd()
+        except OSError:
+            print("[AudioCapture] PortAudio not available. Use remote mic mode.")
+            return None
         devices = sd.query_devices()
         for i, dev in enumerate(devices):
             if dev["max_input_channels"] > 0:

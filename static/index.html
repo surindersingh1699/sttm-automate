@@ -12,6 +12,15 @@
         <div class="controls">
             <button id="btn-pause" class="btn btn-warning" onclick="togglePause()">Pause</button>
             <button class="btn btn-danger" onclick="forceUnlock()">Force Unlock</button>
+            <select id="audio-source" class="control-input" onchange="setAudioSource(this.value)" title="Local = server mic, Remote = your device mic">
+                <option value="local" selected>Local Mic (Server)</option>
+                <option value="remote">Remote Mic (This Device)</option>
+            </select>
+            <span id="mic-status" class="mic-status"></span>
+            <select id="transcription-engine" class="control-input" onchange="setTranscriptionEngine(this.value)" title="Whisper = offline, Google = online (requires API key)">
+                <option value="whisper" selected>Whisper (Offline)</option>
+                <option value="google">Google STT (Online)</option>
+            </select>
             <select id="confidence-mode" class="control-input" onchange="setConfidenceMode(this.value)">
                 <option value="conservative">Conservative</option>
                 <option value="balanced" selected>Balanced</option>

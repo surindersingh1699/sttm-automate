@@ -12,6 +12,12 @@ let currentShabadId = null;
 let currentShabadState = null;
 let historyState = [];
 let confidenceMode = "balanced";
+let transcriptionEngine = "whisper";
+let audioSource = "local";
+let audioWs = null;
+let audioContext = null;
+let audioStream = null;
+let audioProcessor = null;
 const DASHBOARD_STATE_KEY = "sttm_automate_dashboard_state_v1";
 
 // --- Safe DOM Helpers ---
@@ -75,6 +81,7 @@ function persistDashboardState() {
                 currentShabadState: currentShabadState,
                 historyState: historyState,
                 confidenceMode: confidenceMode,
+                transcriptionEngine: transcriptionEngine,
             })
         );
     } catch (err) {
@@ -95,6 +102,8 @@ function restoreDashboardState() {
         historyState = Array.isArray(data.historyState) ? data.historyState : [];
         confidenceMode = data.confidenceMode || "balanced";
         updateConfidenceMode(confidenceMode);
+        transcriptionEngine = data.transcriptionEngine || "whisper";
+        updateTranscriptionEngine(transcriptionEngine);
 
         updateCurrentShabad(currentShabadState);
         updateHistory(historyState);
@@ -156,6 +165,12 @@ function handleMessage(data) {
             if (Object.prototype.hasOwnProperty.call(data, "confidence_mode")) {
                 updateConfidenceMode(data.confidence_mode);
             }
+            if (Object.prototype.hasOwnProperty.call(data, "transcription_engine")) {
+                updateTranscriptionEngine(data.transcription_engine);
+            }
+            if (Object.prototype.hasOwnProperty.call(data, "audio_source")) {
+                updateAudioSource(data.audio_source);
+            }
             if (data.pipeline_state === "searching" || data.pipeline_state === "candidate_lock") {
                 if (currentVerses.length > 0) {
                     clearPangati();
@@ -189,6 +204,16 @@ function handleMessage(data) {
         case "confidence_mode_updated":
             updateConfidenceMode(data.mode);
             persistDashboardState();
+            break;
+        case "transcription_engine_updated":
+            updateTranscriptionEngine(data.engine);
+            persistDashboardState();
+            break;
+        case "audio_source_updated":
+            updateAudioSource(data.source);
+            break;
+        case "engine_switching":
+            setStatus("connecting", "Switching to " + data.engine + " engine...");
             break;
         case "audio_level":
             updateAudioLevel(data.rms, data.has_vocals);
@@ -467,6 +492,130 @@ function updateConfidenceMode(mode) {
     if (select && select.value !== mode) {
         select.value = mode;
     }
+}
+
+function setTranscriptionEngine(engine) {
+    updateTranscriptionEngine(engine);
+    send({ type: "set_transcription_engine", engine: engine });
+    persistDashboardState();
+}
+
+function updateTranscriptionEngine(engine) {
+    if (engine !== "whisper" && engine !== "google") {
+        engine = "whisper";
+    }
+    transcriptionEngine = engine;
+    var select = document.getElementById("transcription-engine");
+    if (select && select.value !== engine) {
+        select.value = engine;
+    }
+}
+
+// --- Audio Source (Local / Remote Mic) ---
+
+function setAudioSource(source) {
+    if (source === "remote") {
+        startRemoteMic();
+    } else {
+        stopRemoteMic();
+    }
+    send({ type: "set_audio_source", source: source });
+    updateAudioSource(source);
+}
+
+function updateAudioSource(source) {
+    if (source !== "local" && source !== "remote") {
+        source = "local";
+    }
+    audioSource = source;
+    var select = document.getElementById("audio-source");
+    if (select && select.value !== source) {
+        select.value = source;
+    }
+    var micStatus = document.getElementById("mic-status");
+    if (micStatus) {
+        micStatus.textContent = source === "remote" ? "Streaming from device mic" : "";
+    }
+}
+
+function startRemoteMic() {
+    if (audioWs) return; // already streaming
+
+    // Open dedicated audio WebSocket
+    var protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    audioWs = new WebSocket(protocol + "//" + location.host + "/ws/audio");
+    audioWs.binaryType = "arraybuffer";
+
+    audioWs.onopen = function() {
+        console.log("[RemoteMic] Audio WebSocket connected");
+        // Now request mic access
+        navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true } })
+            .then(function(stream) {
+                audioStream = stream;
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                var source = audioContext.createMediaStreamSource(stream);
+
+                // ScriptProcessorNode: 4096 samples buffer, 1 input, 1 output
+                audioProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+                audioProcessor.onaudioprocess = function(e) {
+                    if (!audioWs || audioWs.readyState !== WebSocket.OPEN) return;
+                    var inputData = e.inputBuffer.getChannelData(0);
+                    // Convert float32 [-1,1] to int16 PCM
+                    var pcm16 = new Int16Array(inputData.length);
+                    for (var i = 0; i < inputData.length; i++) {
+                        var s = Math.max(-1, Math.min(1, inputData[i]));
+                        pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                    }
+                    audioWs.send(pcm16.buffer);
+                };
+
+                source.connect(audioProcessor);
+                audioProcessor.connect(audioContext.destination);
+
+                var micStatus = document.getElementById("mic-status");
+                if (micStatus) micStatus.textContent = "Streaming from device mic";
+                console.log("[RemoteMic] Mic capture started at " + audioContext.sampleRate + "Hz");
+            })
+            .catch(function(err) {
+                console.error("[RemoteMic] Mic access denied:", err);
+                var micStatus = document.getElementById("mic-status");
+                if (micStatus) micStatus.textContent = "Mic access denied!";
+                stopRemoteMic();
+                // Revert to local
+                send({ type: "set_audio_source", source: "local" });
+                updateAudioSource("local");
+            });
+    };
+
+    audioWs.onclose = function() {
+        console.log("[RemoteMic] Audio WebSocket closed");
+        audioWs = null;
+    };
+
+    audioWs.onerror = function() {
+        console.error("[RemoteMic] Audio WebSocket error");
+    };
+}
+
+function stopRemoteMic() {
+    if (audioProcessor) {
+        audioProcessor.disconnect();
+        audioProcessor = null;
+    }
+    if (audioContext) {
+        audioContext.close();
+        audioContext = null;
+    }
+    if (audioStream) {
+        audioStream.getTracks().forEach(function(t) { t.stop(); });
+        audioStream = null;
+    }
+    if (audioWs) {
+        audioWs.close();
+        audioWs = null;
+    }
+    var micStatus = document.getElementById("mic-status");
+    if (micStatus) micStatus.textContent = "";
 }
 
 function updatePauseButton() {

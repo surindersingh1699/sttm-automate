@@ -34,6 +34,10 @@ def load_runtime_settings():
             config.sttm.controller_pin = int(value) if value not in (None, "") else None
         mode = data.get("confidence_mode", "balanced")
         confidence_mode = mode if mode in ("conservative", "balanced", "fast") else "balanced"
+        engine = data.get("transcription_engine", "whisper")
+        config.transcription.engine = engine if engine in ("whisper", "google") else "whisper"
+        if "google_credentials_path" in data and data["google_credentials_path"]:
+            config.transcription.google_credentials_path = data["google_credentials_path"]
     except Exception as e:
         print(f"[Server] Could not load runtime settings: {e}")
 
@@ -43,6 +47,8 @@ def save_runtime_settings():
     payload = {
         "controller_pin": config.sttm.controller_pin,
         "confidence_mode": confidence_mode,
+        "transcription_engine": config.transcription.engine,
+        "google_credentials_path": config.transcription.google_credentials_path,
     }
     try:
         runtime_settings_path.write_text(
@@ -128,6 +134,8 @@ async def websocket_endpoint(websocket: WebSocket):
             "history": pipeline.tracker.get_history_list(),
             "controller_pin": config.sttm.controller_pin,
             "confidence_mode": pipeline.confidence_mode,
+            "transcription_engine": pipeline.current_engine,
+            "audio_source": pipeline._audio_source,
             "hypotheses": pipeline.tracker.get_hypotheses(),
         }
         if current and current.verses:
@@ -200,9 +208,50 @@ async def websocket_endpoint(websocket: WebSocket):
                     "mode": confidence_mode,
                 })
 
+            elif msg_type == "set_audio_source":
+                source = msg.get("source", "local")
+                if source in ("local", "remote"):
+                    pipeline.set_audio_source(source)
+                    await broadcast({
+                        "type": "audio_source_updated",
+                        "source": source,
+                    })
+
+            elif msg_type == "set_transcription_engine":
+                engine = msg.get("engine", "whisper")
+                if engine in ("whisper", "google"):
+                    await broadcast({
+                        "type": "engine_switching",
+                        "engine": engine,
+                    })
+                    await pipeline.switch_engine(engine)
+                    save_runtime_settings()
+                    await broadcast({
+                        "type": "transcription_engine_updated",
+                        "engine": engine,
+                    })
+
     finally:
         if websocket in clients:
             clients.remove(websocket)
+
+
+@app.websocket("/ws/audio")
+async def audio_websocket_endpoint(websocket: WebSocket):
+    """Dedicated WebSocket for receiving raw audio from browser mic."""
+    await websocket.accept()
+    print("[Server] Remote audio client connected")
+
+    try:
+        import numpy as np
+        while True:
+            data = await websocket.receive_bytes()
+            if pipeline and pipeline._audio_source == "remote":
+                # Browser sends 16-bit PCM at 16kHz mono
+                samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+                pipeline.push_remote_audio(samples)
+    except (WebSocketDisconnect, RuntimeError):
+        print("[Server] Remote audio client disconnected")
 
 
 @app.get("/api/status")

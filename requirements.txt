@@ -1,4 +1,5 @@
 faster-whisper>=1.0.0
+google-cloud-speech>=2.21.0  # optional: only needed for online/Google STT mode
 sounddevice>=0.4.6
 numpy>=1.24.0
 banidb>=0.4.1
