@@ -18,8 +18,9 @@ class TranscriptionSegment:
 class TranscriptionEngine:
     """Transcribes audio using Google Web Speech API (free, no key needed)."""
 
-    def __init__(self):
-        self._recognizer: sr.Recognizer | None = None
+    def __init__(self, language_override: str | None = None):
+        self._model: WhisperModel | None = None
+        self._language: str | None = language_override or config.whisper.language or None
 
     def load(self):
         """Initialize the recognizer."""

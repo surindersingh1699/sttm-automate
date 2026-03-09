@@ -1,11 +1,16 @@
 """Audio capture from microphone or line-in using sounddevice."""
 
 import numpy as np
-import sounddevice as sd
 from queue import Queue, Empty
 from threading import Event
 
 from src.config import config
+
+
+def _get_sd():
+    """Lazy import sounddevice (requires PortAudio)."""
+    import sounddevice as sd
+    return sd
 
 
 class AudioCapture:
@@ -15,8 +20,9 @@ class AudioCapture:
         self.samplerate = config.audio.samplerate
         self.device = device or config.audio.device
         self._queue: Queue[np.ndarray] = Queue()
-        self._stream: sd.InputStream | None = None
+        self._stream = None
         self._stop_event = Event()
+        self.available = False  # True if local audio hardware works
 
     def _callback(self, indata: np.ndarray, frames: int, time_info, status):
         if status:
@@ -24,17 +30,31 @@ class AudioCapture:
         self._queue.put(indata[:, 0].copy())  # mono: take first channel
 
     def start(self):
-        """Start capturing audio."""
+        """Start capturing audio. Returns True if started, False if no audio hardware."""
+        try:
+            sd = _get_sd()
+        except OSError:
+            print("[AudioCapture] PortAudio not available. Local mic disabled — use remote mic.")
+            self.available = False
+            return False
         self._stop_event.clear()
-        self._stream = sd.InputStream(
-            samplerate=self.samplerate,
-            channels=config.audio.channels,
-            dtype=config.audio.dtype,
-            callback=self._callback,
-            blocksize=int(self.samplerate * 0.5),  # 500ms blocks
-            device=self.device,
-        )
-        self._stream.start()
+        try:
+            self._stream = sd.InputStream(
+                samplerate=self.samplerate,
+                channels=config.audio.channels,
+                dtype=config.audio.dtype,
+                callback=self._callback,
+                blocksize=int(self.samplerate * 0.5),  # 500ms blocks
+                device=self.device,
+            )
+            self._stream.start()
+            self.available = True
+            return True
+        except Exception as e:
+            print(f"[AudioCapture] Could not start audio stream: {e}")
+            self._stream = None
+            self.available = False
+            return False
 
     def get_chunk(self, timeout: float = 10.0) -> np.ndarray | None:
         """
@@ -64,13 +84,21 @@ class AudioCapture:
         """Stop capturing audio."""
         self._stop_event.set()
         if self._stream:
-            self._stream.stop()
-            self._stream.close()
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
             self._stream = None
+        self.available = False
 
     @staticmethod
     def list_devices() -> list[dict]:
         """List available audio input devices."""
+        try:
+            sd = _get_sd()
+        except OSError:
+            return []
         devices = sd.query_devices()
         inputs = []
         for i, dev in enumerate(devices):
@@ -86,6 +114,10 @@ class AudioCapture:
     @staticmethod
     def find_blackhole_device() -> int | None:
         """Find BlackHole virtual audio device index, if installed."""
+        try:
+            sd = _get_sd()
+        except OSError:
+            return None
         devices = sd.query_devices()
         for i, dev in enumerate(devices):
             if dev["max_input_channels"] > 0 and "blackhole" in dev["name"].lower():
@@ -98,6 +130,11 @@ class AudioCapture:
         Auto-select the best audio input device.
         Priority: BlackHole > Multi-Output > system default.
         """
+        try:
+            sd = _get_sd()
+        except OSError:
+            print("[AudioCapture] PortAudio not available. Use remote mic mode.")
+            return None
         devices = sd.query_devices()
         for i, dev in enumerate(devices):
             if dev["max_input_channels"] > 0:
