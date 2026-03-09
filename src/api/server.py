@@ -35,7 +35,7 @@ def load_runtime_settings():
         mode = data.get("confidence_mode", "balanced")
         confidence_mode = mode if mode in ("conservative", "balanced", "fast") else "balanced"
         engine = data.get("transcription_engine", "whisper")
-        config.transcription.engine = engine if engine in ("whisper", "google") else "whisper"
+        config.transcription.engine = engine if engine in ("whisper", "whisper_hindi", "google") else "whisper"
         if "google_credentials_path" in data and data["google_credentials_path"]:
             config.transcription.google_credentials_path = data["google_credentials_path"]
     except Exception as e:
@@ -219,7 +219,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
             elif msg_type == "set_transcription_engine":
                 engine = msg.get("engine", "whisper")
-                if engine in ("whisper", "google"):
+                if engine in ("whisper", "whisper_hindi", "google"):
                     await broadcast({
                         "type": "engine_switching",
                         "engine": engine,

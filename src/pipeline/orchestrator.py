@@ -10,7 +10,7 @@ from src.audio.buffer import AudioRingBuffer
 from src.transcription.engine import TranscriptionEngine
 from src.transcription.google_engine import GoogleTranscriptionEngine
 from src.transcription.processor import TranscriptionProcessor
-from src.transcription.transliterate import extract_first_letters
+from src.transcription.transliterate import extract_first_letters, devanagari_to_gurmukhi
 from src.matcher.search import ShabadSearcher, ShabadCandidate
 from src.matcher.scorer import ConfidenceScorer
 from src.matcher.tracker import ShabadTracker, PipelineState
@@ -91,7 +91,12 @@ class PipelineOrchestrator:
             print("[Pipeline] WARNING: STTM not connected. Running in monitor-only mode.")
 
         print("[Pipeline] Starting audio capture...")
-        self.audio.start()
+        audio_ok = self.audio.start()
+        if not audio_ok:
+            print("[Pipeline] No local audio available. Defaulting to remote mic mode.")
+            self._audio_source = "remote"
+            if self.broadcast:
+                await self.broadcast({"type": "audio_source_updated", "source": "remote"})
         self.running = True
 
         print("[Pipeline] Pipeline running. Listening for kirtan...")
@@ -120,11 +125,13 @@ class PipelineOrchestrator:
             return GoogleTranscriptionEngine(
                 credentials_path=config.transcription.google_credentials_path,
             )
+        if engine_type == "whisper_hindi":
+            return TranscriptionEngine(language_override="hi")
         return TranscriptionEngine()
 
     async def switch_engine(self, engine_type: str):
-        """Switch transcription engine at runtime (whisper/google)."""
-        if engine_type not in ("whisper", "google"):
+        """Switch transcription engine at runtime (whisper/whisper_hindi/google)."""
+        if engine_type not in ("whisper", "whisper_hindi", "google"):
             return
         config.transcription.engine = engine_type
         was_paused = self.paused
@@ -154,7 +161,10 @@ class PipelineOrchestrator:
                 except asyncio.QueueEmpty:
                     break
         elif source == "local":
-            self.audio.start()
+            if not self.audio.start():
+                print("[Pipeline] No local audio hardware. Staying on remote mic.")
+                self._audio_source = "remote"
+                return
         self.buffer.reset()
         print(f"[Pipeline] Audio source switched to: {source}")
 
@@ -401,6 +411,10 @@ class PipelineOrchestrator:
                     self.transcriber.transcribe, audio_for_stt
                 )
                 text = self.processor.process(segments)
+
+                # 2b. Hindi→Gurmukhi transliteration for whisper_hindi engine
+                if config.transcription.engine == "whisper_hindi" and text:
+                    text = devanagari_to_gurmukhi(text)
 
                 # 3. Extract first letters
                 first_letters = extract_first_letters(text)

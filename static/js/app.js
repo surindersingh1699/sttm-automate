@@ -501,7 +501,7 @@ function setTranscriptionEngine(engine) {
 }
 
 function updateTranscriptionEngine(engine) {
-    if (engine !== "whisper" && engine !== "google") {
+    if (engine !== "whisper" && engine !== "whisper_hindi" && engine !== "google") {
         engine = "whisper";
     }
     transcriptionEngine = engine;
@@ -527,14 +527,21 @@ function updateAudioSource(source) {
     if (source !== "local" && source !== "remote") {
         source = "local";
     }
+    var previousSource = audioSource;
     audioSource = source;
     var select = document.getElementById("audio-source");
     if (select && select.value !== source) {
         select.value = source;
     }
+    // Auto-start remote mic capture if server says we're in remote mode
+    if (source === "remote" && !audioWs) {
+        startRemoteMic();
+    } else if (source === "local" && previousSource === "remote") {
+        stopRemoteMic();
+    }
     var micStatus = document.getElementById("mic-status");
-    if (micStatus) {
-        micStatus.textContent = source === "remote" ? "Streaming from device mic" : "";
+    if (micStatus && source !== "remote") {
+        micStatus.textContent = "";
     }
 }
 

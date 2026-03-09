@@ -125,3 +125,24 @@ def is_devanagari(text: str) -> bool:
         if "\u0900" <= char <= "\u097F":
             return True
     return False
+
+
+def devanagari_to_gurmukhi(text: str) -> str:
+    """
+    Convert Devanagari text to Gurmukhi script.
+
+    Uses Unicode offset mapping (Devanagari U+0900-097F → Gurmukhi U+0A00-0A7F).
+    Characters without a Gurmukhi equivalent are kept as-is (spaces, punctuation, digits).
+    """
+    result: list[str] = []
+    for char in text:
+        cp = ord(char)
+        if 0x0900 <= cp <= 0x097F:
+            gurmukhi_cp = cp + _DEVANAGARI_OFFSET
+            if 0x0A00 <= gurmukhi_cp <= 0x0A7F:
+                result.append(chr(gurmukhi_cp))
+            else:
+                result.append(char)
+        else:
+            result.append(char)
+    return "".join(result)

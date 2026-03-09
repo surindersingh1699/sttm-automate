@@ -18,9 +18,9 @@ class TranscriptionSegment:
 class TranscriptionEngine:
     """Transcribes audio using local faster-whisper models."""
 
-    def __init__(self):
+    def __init__(self, language_override: str | None = None):
         self._model: WhisperModel | None = None
-        self._language: str | None = config.whisper.language or None
+        self._language: str | None = language_override or config.whisper.language or None
 
     def load(self):
         """Load whisper model once at startup."""

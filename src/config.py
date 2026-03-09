@@ -18,7 +18,7 @@ class AudioConfig(BaseModel):
 
 
 class TranscriptionConfig(BaseModel):
-    engine: str = "whisper"  # "whisper" (offline) or "google" (online)
+    engine: str = "whisper"  # "whisper" (offline), "whisper_hindi" (offline, Hindi→Gurmukhi), or "google" (online)
     google_credentials_path: str | None = None  # path to Google Cloud service account JSON
 
 
