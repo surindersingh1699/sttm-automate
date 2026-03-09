@@ -1,4 +1,7 @@
 {
-  "controller_pin": 8945,
-  "confidence_mode": "balanced"
+  "controller_pin": null,
+  "confidence_mode": "balanced",
+  "transcription_engine": "whisper_hindi",
+  "google_credentials_path": null,
+  "whisper_model_size": "tiny"
 }

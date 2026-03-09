@@ -38,6 +38,8 @@ def load_runtime_settings():
         config.transcription.engine = engine if engine in ("whisper", "whisper_hindi", "google") else "whisper"
         if "google_credentials_path" in data and data["google_credentials_path"]:
             config.transcription.google_credentials_path = data["google_credentials_path"]
+        model_size = data.get("whisper_model_size", "small")
+        config.whisper.model_size = model_size if model_size in ("tiny", "base", "small") else "small"
     except Exception as e:
         print(f"[Server] Could not load runtime settings: {e}")
 
@@ -49,6 +51,7 @@ def save_runtime_settings():
         "confidence_mode": confidence_mode,
         "transcription_engine": config.transcription.engine,
         "google_credentials_path": config.transcription.google_credentials_path,
+        "whisper_model_size": config.whisper.model_size,
     }
     try:
         runtime_settings_path.write_text(
@@ -135,6 +138,7 @@ async def websocket_endpoint(websocket: WebSocket):
             "controller_pin": config.sttm.controller_pin,
             "confidence_mode": pipeline.confidence_mode,
             "transcription_engine": pipeline.current_engine,
+            "whisper_model_size": config.whisper.model_size,
             "audio_source": pipeline._audio_source,
             "hypotheses": pipeline.tracker.get_hypotheses(),
         }
@@ -229,6 +233,20 @@ async def websocket_endpoint(websocket: WebSocket):
                     await broadcast({
                         "type": "transcription_engine_updated",
                         "engine": engine,
+                    })
+
+            elif msg_type == "set_whisper_model_size":
+                size = msg.get("size", "small")
+                if size in ("tiny", "base", "small"):
+                    await broadcast({
+                        "type": "engine_switching",
+                        "engine": config.transcription.engine,
+                    })
+                    await pipeline.switch_model_size(size)
+                    save_runtime_settings()
+                    await broadcast({
+                        "type": "whisper_model_size_updated",
+                        "size": size,
                     })
 
     finally:

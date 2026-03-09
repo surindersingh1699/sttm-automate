@@ -23,7 +23,7 @@ class TranscriptionConfig(BaseModel):
 
 
 class WhisperConfig(BaseModel):
-    model_size: str = "small"  # tiny, base, small, medium, large-v3 (small = best accuracy/speed for Punjabi)
+    model_size: str = "small"  # tiny, base, small (small = best accuracy/speed for Punjabi)
     device: str = "cpu"
     compute_type: str = "int8"  # int8 for CPU, float16 for GPU
     language: str = "pa"  # Punjabi

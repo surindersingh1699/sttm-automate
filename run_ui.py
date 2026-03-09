@@ -15,8 +15,10 @@ sd_stub.query_devices = lambda *a, **kw: []
 sd_stub.default = types.SimpleNamespace(device=[None, None])
 sys.modules["sounddevice"] = sd_stub
 
-# Also stub faster_whisper in case the model isn't downloaded
-if "faster_whisper" not in sys.modules:
+# Only stub faster_whisper if it's not installed
+try:
+    import faster_whisper  # noqa: F401
+except ImportError:
     fw_stub = types.ModuleType("faster_whisper")
     fw_stub.WhisperModel = type("WhisperModel", (), {
         "__init__": lambda *a, **kw: None,
