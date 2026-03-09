@@ -13,6 +13,7 @@ let currentShabadState = null;
 let historyState = [];
 let confidenceMode = "balanced";
 let transcriptionEngine = "whisper";
+let whisperModelSize = "small";
 let audioSource = "local";
 let audioWs = null;
 let audioContext = null;
@@ -82,6 +83,7 @@ function persistDashboardState() {
                 historyState: historyState,
                 confidenceMode: confidenceMode,
                 transcriptionEngine: transcriptionEngine,
+                whisperModelSize: whisperModelSize,
             })
         );
     } catch (err) {
@@ -104,6 +106,8 @@ function restoreDashboardState() {
         updateConfidenceMode(confidenceMode);
         transcriptionEngine = data.transcriptionEngine || "whisper";
         updateTranscriptionEngine(transcriptionEngine);
+        whisperModelSize = data.whisperModelSize || "small";
+        updateWhisperModelSize(whisperModelSize);
 
         updateCurrentShabad(currentShabadState);
         updateHistory(historyState);
@@ -168,6 +172,9 @@ function handleMessage(data) {
             if (Object.prototype.hasOwnProperty.call(data, "transcription_engine")) {
                 updateTranscriptionEngine(data.transcription_engine);
             }
+            if (Object.prototype.hasOwnProperty.call(data, "whisper_model_size")) {
+                updateWhisperModelSize(data.whisper_model_size);
+            }
             if (Object.prototype.hasOwnProperty.call(data, "audio_source")) {
                 updateAudioSource(data.audio_source);
             }
@@ -207,6 +214,10 @@ function handleMessage(data) {
             break;
         case "transcription_engine_updated":
             updateTranscriptionEngine(data.engine);
+            persistDashboardState();
+            break;
+        case "whisper_model_size_updated":
+            updateWhisperModelSize(data.size);
             persistDashboardState();
             break;
         case "audio_source_updated":
@@ -508,6 +519,23 @@ function updateTranscriptionEngine(engine) {
     var select = document.getElementById("transcription-engine");
     if (select && select.value !== engine) {
         select.value = engine;
+    }
+}
+
+function setWhisperModelSize(size) {
+    updateWhisperModelSize(size);
+    send({ type: "set_whisper_model_size", size: size });
+    persistDashboardState();
+}
+
+function updateWhisperModelSize(size) {
+    if (size !== "tiny" && size !== "base" && size !== "small") {
+        size = "small";
+    }
+    whisperModelSize = size;
+    var select = document.getElementById("whisper-model-size");
+    if (select && select.value !== size) {
+        select.value = size;
     }
 }
 

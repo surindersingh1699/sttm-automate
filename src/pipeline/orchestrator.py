@@ -95,8 +95,7 @@ class PipelineOrchestrator:
         if not audio_ok:
             print("[Pipeline] No local audio available. Defaulting to remote mic mode.")
             self._audio_source = "remote"
-            if self.broadcast:
-                await self.broadcast({"type": "audio_source_updated", "source": "remote"})
+            await self._broadcast({"type": "audio_source_updated", "source": "remote"})
         self.running = True
 
         print("[Pipeline] Pipeline running. Listening for kirtan...")
@@ -140,6 +139,22 @@ class PipelineOrchestrator:
         await asyncio.to_thread(self.transcriber.load)
         self.paused = was_paused
         print(f"[Pipeline] Switched to {engine_type} engine.")
+
+    async def switch_model_size(self, size: str):
+        """Switch Whisper model size at runtime (tiny/base/small)."""
+        if size not in ("tiny", "base", "small"):
+            return
+        if size == config.whisper.model_size and config.transcription.engine != "google":
+            return  # already using this size
+        config.whisper.model_size = size
+        # Only reload if currently using a Whisper engine
+        if config.transcription.engine in ("whisper", "whisper_hindi"):
+            was_paused = self.paused
+            self.paused = True
+            self.transcriber = self._create_transcription_engine()
+            await asyncio.to_thread(self.transcriber.load)
+            self.paused = was_paused
+        print(f"[Pipeline] Switched to Whisper '{size}' model.")
 
     @property
     def current_engine(self) -> str:
@@ -367,6 +382,8 @@ class PipelineOrchestrator:
                 if chunk is None:
                     break
 
+                print(f"  [DEBUG] Got audio chunk: {len(chunk)} samples, max={float(np.max(np.abs(chunk))):.4f}")
+
                 # Apply overlap buffer
                 window = self.buffer.process(chunk)
 
@@ -374,6 +391,7 @@ class PipelineOrchestrator:
                 # so real breaks are detected quickly.
                 chunk_rms = float(np.sqrt(np.mean(chunk**2)))
                 has_vocals = bool(self.transcriber.has_vocal_content(chunk))
+                print(f"  [DEBUG] RMS={chunk_rms:.4f}, has_vocals={has_vocals}")
                 self._update_vocal_break_state(has_vocals)
 
                 # Adaptive listening window: after a vocal break use short start window,
@@ -407,10 +425,15 @@ class PipelineOrchestrator:
                     continue
 
                 # 2. Transcribe
+                import time as _time
+                _t0 = _time.monotonic()
+                print(f"  [DEBUG] Starting Whisper transcription ({window_seconds:.1f}s audio)...")
                 segments = await asyncio.to_thread(
                     self.transcriber.transcribe, audio_for_stt
                 )
+                _elapsed = _time.monotonic() - _t0
                 text = self.processor.process(segments)
+                print(f"  [DEBUG] Whisper done in {_elapsed:.1f}s → '{text[:80]}'" if text else f"  [DEBUG] Whisper done in {_elapsed:.1f}s → (empty)")
 
                 # 2b. Hindi→Gurmukhi transliteration for whisper_hindi engine
                 if config.transcription.engine == "whisper_hindi" and text:
