@@ -12,8 +12,7 @@ let currentShabadId = null;
 let currentShabadState = null;
 let historyState = [];
 let confidenceMode = "balanced";
-let transcriptionEngine = "whisper";
-let whisperModelSize = "small";
+let transcriptionEngine = "vosk";
 let audioSource = "local";
 let audioDevice = null; // null = auto-detect
 let audioWs = null;
@@ -84,7 +83,6 @@ function persistDashboardState() {
                 historyState: historyState,
                 confidenceMode: confidenceMode,
                 transcriptionEngine: transcriptionEngine,
-                whisperModelSize: whisperModelSize,
             })
         );
     } catch (err) {
@@ -105,10 +103,8 @@ function restoreDashboardState() {
         historyState = Array.isArray(data.historyState) ? data.historyState : [];
         confidenceMode = data.confidenceMode || "balanced";
         updateConfidenceMode(confidenceMode);
-        transcriptionEngine = data.transcriptionEngine || "whisper";
+        transcriptionEngine = data.transcriptionEngine || "vosk";
         updateTranscriptionEngine(transcriptionEngine);
-        whisperModelSize = data.whisperModelSize || "small";
-        updateWhisperModelSize(whisperModelSize);
 
         updateCurrentShabad(currentShabadState);
         updateHistory(historyState);
@@ -173,9 +169,6 @@ function handleMessage(data) {
             if (Object.prototype.hasOwnProperty.call(data, "transcription_engine")) {
                 updateTranscriptionEngine(data.transcription_engine);
             }
-            if (Object.prototype.hasOwnProperty.call(data, "whisper_model_size")) {
-                updateWhisperModelSize(data.whisper_model_size);
-            }
             if (Object.prototype.hasOwnProperty.call(data, "audio_source")) {
                 updateAudioSource(data.audio_source);
             }
@@ -218,10 +211,6 @@ function handleMessage(data) {
             break;
         case "transcription_engine_updated":
             updateTranscriptionEngine(data.engine);
-            persistDashboardState();
-            break;
-        case "whisper_model_size_updated":
-            updateWhisperModelSize(data.size);
             persistDashboardState();
             break;
         case "audio_source_updated":
@@ -527,35 +516,13 @@ function setTranscriptionEngine(engine) {
 }
 
 function updateTranscriptionEngine(engine) {
-    if (engine !== "whisper" && engine !== "whisper_hindi" && engine !== "vosk" && engine !== "google") {
-        engine = "whisper";
+    if (engine !== "vosk" && engine !== "google") {
+        engine = "vosk";
     }
     transcriptionEngine = engine;
     var select = document.getElementById("transcription-engine");
     if (select && select.value !== engine) {
         select.value = engine;
-    }
-    // Hide Whisper model size selector for non-Whisper engines
-    var modelSelect = document.getElementById("whisper-model-size");
-    if (modelSelect) {
-        modelSelect.style.display = (engine === "whisper" || engine === "whisper_hindi") ? "" : "none";
-    }
-}
-
-function setWhisperModelSize(size) {
-    updateWhisperModelSize(size);
-    send({ type: "set_whisper_model_size", size: size });
-    persistDashboardState();
-}
-
-function updateWhisperModelSize(size) {
-    if (size !== "tiny" && size !== "base" && size !== "small") {
-        size = "small";
-    }
-    whisperModelSize = size;
-    var select = document.getElementById("whisper-model-size");
-    if (select && select.value !== size) {
-        select.value = size;
     }
 }
 

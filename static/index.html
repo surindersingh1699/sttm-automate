@@ -20,10 +20,8 @@
                 <option value="remote">Remote Mic (This Device)</option>
             </select>
             <span id="mic-status" class="mic-status"></span>
-            <select id="transcription-engine" class="control-input" onchange="setTranscriptionEngine(this.value)" title="Vosk = fastest offline (42MB), Whisper = offline, Google = online">
-                <option value="vosk">Vosk Hindi (Fastest)</option>
-                <option value="whisper" selected>Whisper Punjabi (Offline)</option>
-                <option value="whisper_hindi">Whisper Hindi→Gurmukhi (Offline)</option>
+            <select id="transcription-engine" class="control-input" onchange="setTranscriptionEngine(this.value)" title="Vosk = fastest offline (42MB), Google = online">
+                <option value="vosk" selected>Vosk Hindi (Fastest)</option>
                 <option value="google">Google STT (Online)</option>
             </select>
             <select id="confidence-mode" class="control-input" onchange="setConfidenceMode(this.value)">
