@@ -26,11 +26,6 @@
                 <option value="whisper_hindi">Whisper Hindi→Gurmukhi (Offline)</option>
                 <option value="google">Google STT (Online)</option>
             </select>
-            <select id="whisper-model-size" class="control-input" onchange="setWhisperModelSize(this.value)" title="Model size: tiny=fastest, base=balanced, small=most accurate (slow on CPU)">
-                <option value="tiny">Whisper Tiny (Fastest)</option>
-                <option value="base">Whisper Base (Balanced)</option>
-                <option value="small" selected>Whisper Small (Accurate)</option>
-            </select>
             <select id="confidence-mode" class="control-input" onchange="setConfidenceMode(this.value)">
                 <option value="conservative">Conservative</option>
                 <option value="balanced" selected>Balanced</option>
