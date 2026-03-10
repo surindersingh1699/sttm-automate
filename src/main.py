@@ -14,17 +14,13 @@ def main():
     if mode == "pipeline":
         # Run pipeline only (no dashboard, console output)
         asyncio.run(run_pipeline_only())
-    elif mode == "mac-app":
-        # Run as a native macOS window (embeds dashboard web UI)
-        run_mac_app()
     elif mode == "dashboard":
         # Run with web dashboard (default)
         run_with_dashboard()
     else:
-        print(f"Usage: python -m src.main [pipeline|dashboard|mac-app]")
+        print(f"Usage: python -m src.main [pipeline|dashboard]")
         print(f"  pipeline  - Run pipeline with console output (no web UI)")
         print(f"  dashboard - Run with web dashboard at http://localhost:8080")
-        print(f"  mac-app   - Run native macOS app window")
         sys.exit(1)
 
 
@@ -61,13 +57,6 @@ def run_with_dashboard():
         port=config.dashboard.port,
         reload=False,
     )
-
-
-def run_mac_app():
-    """Run the pipeline/dashboard in a native macOS window."""
-    from src.mac_app import run_mac_app as run_native
-
-    run_native()
 
 
 if __name__ == "__main__":
