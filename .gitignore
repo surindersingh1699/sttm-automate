@@ -9,5 +9,6 @@ build/
 .env
 cache.dat
 *.log
+data/vosk-model-*/
 .DS_Store
 *.spec

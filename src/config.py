@@ -14,11 +14,11 @@ class AudioConfig(BaseModel):
     locked_fast_window_duration: float = 5.0  # short locked window for fast recitation
     locked_recovery_window_duration: float = 9.0  # longer locked window when recovering from weak match
     search_fast_window_duration: float = 8.0  # shorter search window for very fast speech
-    device: int | None = None  # None = system default
+    device: int | None = None  # None = auto-detect: BlackHole > aggregate > default
 
 
 class TranscriptionConfig(BaseModel):
-    engine: str = "whisper"  # "whisper" (offline), "whisper_hindi" (offline, Hindi→Gurmukhi), or "google" (online)
+    engine: str = "whisper"  # "whisper", "whisper_hindi", "vosk" (all offline), or "google" (online)
     google_credentials_path: str | None = None  # path to Google Cloud service account JSON
 
 

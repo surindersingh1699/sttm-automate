@@ -1,4 +1,5 @@
 faster-whisper>=1.0.0
+vosk>=0.3.44  # offline Hindi ASR — small model (42MB), fast (RTF ~0.07)
 google-cloud-speech>=2.21.0  # optional: only needed for online/Google STT mode
 sounddevice>=0.4.6
 numpy>=1.24.0

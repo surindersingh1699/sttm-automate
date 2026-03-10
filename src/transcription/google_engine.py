@@ -101,4 +101,4 @@ class GoogleTranscriptionEngine:
         if audio.size == 0:
             return False
         rms = float(np.sqrt(np.mean(audio**2)))
-        return rms > 0.001
+        return rms > 0.005

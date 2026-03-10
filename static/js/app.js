@@ -15,6 +15,7 @@ let confidenceMode = "balanced";
 let transcriptionEngine = "whisper";
 let whisperModelSize = "small";
 let audioSource = "local";
+let audioDevice = null; // null = auto-detect
 let audioWs = null;
 let audioContext = null;
 let audioStream = null;
@@ -178,6 +179,9 @@ function handleMessage(data) {
             if (Object.prototype.hasOwnProperty.call(data, "audio_source")) {
                 updateAudioSource(data.audio_source);
             }
+            if (Object.prototype.hasOwnProperty.call(data, "audio_device")) {
+                updateAudioDevice(data.audio_device);
+            }
             if (data.pipeline_state === "searching" || data.pipeline_state === "candidate_lock") {
                 if (currentVerses.length > 0) {
                     clearPangati();
@@ -223,8 +227,19 @@ function handleMessage(data) {
         case "audio_source_updated":
             updateAudioSource(data.source);
             break;
+        case "audio_device_updated":
+            updateAudioDevice(data.device);
+            break;
         case "engine_switching":
             setStatus("connecting", "Switching to " + data.engine + " engine...");
+            break;
+        case "engine_switch_error":
+            setStatus("error", "Engine switch failed: " + data.error);
+            // Revert dropdown to the engine that's actually running
+            if (transcriptionEngine) {
+                updateTranscriptionEngine(transcriptionEngine);
+            }
+            alert("Failed to switch to " + data.engine + " engine:\n\n" + data.error);
             break;
         case "audio_level":
             updateAudioLevel(data.rms, data.has_vocals);
@@ -512,13 +527,18 @@ function setTranscriptionEngine(engine) {
 }
 
 function updateTranscriptionEngine(engine) {
-    if (engine !== "whisper" && engine !== "whisper_hindi" && engine !== "google") {
+    if (engine !== "whisper" && engine !== "whisper_hindi" && engine !== "vosk" && engine !== "google") {
         engine = "whisper";
     }
     transcriptionEngine = engine;
     var select = document.getElementById("transcription-engine");
     if (select && select.value !== engine) {
         select.value = engine;
+    }
+    // Hide Whisper model size selector for non-Whisper engines
+    var modelSelect = document.getElementById("whisper-model-size");
+    if (modelSelect) {
+        modelSelect.style.display = (engine === "whisper" || engine === "whisper_hindi") ? "" : "none";
     }
 }
 
@@ -666,6 +686,60 @@ function updatePauseButton() {
     }
 }
 
+// --- Audio Device Selection ---
+
+function loadAudioDevices() {
+    fetch("/api/devices")
+        .then(function(resp) { return resp.json(); })
+        .then(function(data) {
+            var select = document.getElementById("audio-device");
+            if (!select || !data.devices) return;
+            clearChildren(select);
+
+            // Auto option
+            var autoOpt = document.createElement("option");
+            autoOpt.value = "auto";
+            autoOpt.textContent = "Auto (BlackHole > Default)";
+            select.appendChild(autoOpt);
+
+            data.devices.forEach(function(dev) {
+                var opt = document.createElement("option");
+                opt.value = dev.index;
+                opt.textContent = dev.name;
+                if (dev.default) opt.textContent += " (Default)";
+                select.appendChild(opt);
+            });
+
+            // Set current selection
+            if (audioDevice !== null) {
+                select.value = String(audioDevice);
+            } else {
+                select.value = "auto";
+            }
+        })
+        .catch(function(err) {
+            console.error("[loadAudioDevices] Error:", err);
+        });
+}
+
+function setAudioDevice(value) {
+    var device = value === "auto" ? null : parseInt(value, 10);
+    audioDevice = device;
+    send({ type: "set_audio_device", device: device });
+}
+
+function updateAudioDevice(device) {
+    audioDevice = device;
+    var select = document.getElementById("audio-device");
+    if (!select) return;
+    if (device !== null) {
+        select.value = String(device);
+    } else {
+        select.value = "auto";
+    }
+}
+
 // --- Initialize ---
 restoreDashboardState();
+loadAudioDevices();
 connect();

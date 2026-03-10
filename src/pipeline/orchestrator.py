@@ -9,9 +9,11 @@ from src.audio.capture import AudioCapture
 from src.audio.buffer import AudioRingBuffer
 from src.transcription.engine import TranscriptionEngine
 from src.transcription.google_engine import GoogleTranscriptionEngine
+from src.transcription.vosk_engine import VoskTranscriptionEngine
 from src.transcription.processor import TranscriptionProcessor
 from src.transcription.transliterate import extract_first_letters, devanagari_to_gurmukhi
-from src.matcher.search import ShabadSearcher, ShabadCandidate
+from src.matcher.search import ShabadCandidate
+from src.matcher.offline_search import OfflineShabadSearcher
 from src.matcher.scorer import ConfidenceScorer
 from src.matcher.tracker import ShabadTracker, PipelineState
 from src.controller.base import STTMController
@@ -36,14 +38,16 @@ class PipelineOrchestrator:
         broadcast: BroadcastFn | None = None,
         audio_device: int | None = None,
     ):
-        # Auto-detect best audio device (BlackHole > aggregate > default)
+        # Use config device if set, otherwise auto-detect (BlackHole > aggregate > default)
+        if audio_device is None:
+            audio_device = config.audio.device
         if audio_device is None:
             audio_device = AudioCapture.find_best_device()
         self.audio = AudioCapture(device=audio_device)
         self.buffer = AudioRingBuffer()
         self.transcriber = self._create_transcription_engine()
         self.processor = TranscriptionProcessor()
-        self.searcher = ShabadSearcher()
+        self.searcher = OfflineShabadSearcher()
         self.scorer = ConfidenceScorer()
         ttl_windows = max(
             1,
@@ -124,21 +128,38 @@ class PipelineOrchestrator:
             return GoogleTranscriptionEngine(
                 credentials_path=config.transcription.google_credentials_path,
             )
+        if engine_type == "vosk":
+            return VoskTranscriptionEngine()
         if engine_type == "whisper_hindi":
             return TranscriptionEngine(language_override="hi")
         return TranscriptionEngine()
 
     async def switch_engine(self, engine_type: str):
-        """Switch transcription engine at runtime (whisper/whisper_hindi/google)."""
-        if engine_type not in ("whisper", "whisper_hindi", "google"):
+        """Switch transcription engine at runtime (whisper/whisper_hindi/vosk/google)."""
+        if engine_type not in ("whisper", "whisper_hindi", "vosk", "google"):
             return
+        old_engine = config.transcription.engine
+        old_transcriber = self.transcriber
         config.transcription.engine = engine_type
         was_paused = self.paused
         self.paused = True
-        self.transcriber = self._create_transcription_engine()
-        await asyncio.to_thread(self.transcriber.load)
-        self.paused = was_paused
-        print(f"[Pipeline] Switched to {engine_type} engine.")
+        try:
+            self.transcriber = self._create_transcription_engine()
+            await asyncio.to_thread(self.transcriber.load)
+            print(f"[Pipeline] Switched to {engine_type} engine.")
+        except Exception as e:
+            print(f"[Pipeline] Failed to switch to {engine_type}: {e}")
+            # Rollback to previous engine
+            config.transcription.engine = old_engine
+            self.transcriber = old_transcriber
+            await self._broadcast({
+                "type": "engine_switch_error",
+                "engine": engine_type,
+                "error": str(e),
+            })
+            raise
+        finally:
+            self.paused = was_paused
 
     async def switch_model_size(self, size: str):
         """Switch Whisper model size at runtime (tiny/base/small)."""
@@ -182,6 +203,32 @@ class PipelineOrchestrator:
                 return
         self.buffer.reset()
         print(f"[Pipeline] Audio source switched to: {source}")
+
+    def switch_audio_device(self, device_index: int | None):
+        """Switch local audio input device (e.g. BlackHole vs MacBook Mic)."""
+        self.audio.stop()
+        self.audio = AudioCapture(device=device_index)
+        config.audio.device = device_index
+        if self._audio_source == "local":
+            if not self.audio.start():
+                print(f"[Pipeline] Could not start audio device {device_index}.")
+                return False
+        self.buffer.reset()
+        device_name = self._get_device_name(device_index)
+        print(f"[Pipeline] Audio device switched to: {device_name} (index={device_index})")
+        return True
+
+    @staticmethod
+    def _get_device_name(device_index: int | None) -> str:
+        """Get human-readable name for an audio device index."""
+        if device_index is None:
+            return "System Default"
+        try:
+            import sounddevice as sd
+            info = sd.query_devices(device_index)
+            return info["name"]
+        except Exception:
+            return f"Device {device_index}"
 
     def push_remote_audio(self, audio_data: np.ndarray):
         """Push audio from browser mic into the pipeline."""
@@ -426,17 +473,18 @@ class PipelineOrchestrator:
 
                 # 2. Transcribe
                 import time as _time
+                _engine_label = config.transcription.engine.replace("_", " ").title()
                 _t0 = _time.monotonic()
-                print(f"  [DEBUG] Starting Whisper transcription ({window_seconds:.1f}s audio)...")
+                print(f"  [DEBUG] Starting {_engine_label} transcription ({window_seconds:.1f}s audio)...")
                 segments = await asyncio.to_thread(
                     self.transcriber.transcribe, audio_for_stt
                 )
                 _elapsed = _time.monotonic() - _t0
                 text = self.processor.process(segments)
-                print(f"  [DEBUG] Whisper done in {_elapsed:.1f}s → '{text[:80]}'" if text else f"  [DEBUG] Whisper done in {_elapsed:.1f}s → (empty)")
+                print(f"  [DEBUG] {_engine_label} done in {_elapsed:.1f}s → '{text[:80]}'" if text else f"  [DEBUG] {_engine_label} done in {_elapsed:.1f}s → (empty)")
 
-                # 2b. Hindi→Gurmukhi transliteration for whisper_hindi engine
-                if config.transcription.engine == "whisper_hindi" and text:
+                # 2b. Hindi→Gurmukhi transliteration for Hindi-output engines
+                if config.transcription.engine in ("whisper_hindi", "vosk") and text:
                     text = devanagari_to_gurmukhi(text)
 
                 # 3. Extract first letters

@@ -111,6 +111,26 @@ def extract_first_letters(text: str) -> str:
     return "".join(letters)
 
 
+# Gurmukhi Unicode → ShabadOS ASCII first-letter mapping
+_GURMUKHI_TO_ASCII = {
+    "ੳ": "a", "ਅ": "A", "ੲ": "e",  # vowel carriers
+    "ਸ": "s", "ਹ": "h", "ਕ": "k", "ਖ": "K", "ਗ": "g", "ਘ": "G",
+    "ਙ": "|", "ਚ": "c", "ਛ": "C", "ਜ": "j", "ਝ": "J", "ਞ": "\\",
+    "ਟ": "t", "ਠ": "T", "ਡ": "f", "ਢ": "F", "ਣ": "x",
+    "ਤ": "q", "ਥ": "Q", "ਦ": "d", "ਧ": "D", "ਨ": "n",
+    "ਪ": "p", "ਫ": "P", "ਬ": "b", "ਭ": "B", "ਮ": "m",
+    "ਯ": "X", "ਰ": "r", "ਲ": "l", "ਵ": "v", "ੜ": "V",
+}
+
+
+def gurmukhi_to_ascii(first_letters: str) -> str:
+    """Convert Gurmukhi Unicode first-letter string to ShabadOS ASCII format.
+
+    Example: "ਸਸਨਹਜਸਲਵ" → "ssnhjslv"
+    """
+    return "".join(_GURMUKHI_TO_ASCII.get(ch, ch) for ch in first_letters)
+
+
 def is_gurmukhi(text: str) -> bool:
     """Check if text contains Gurmukhi characters."""
     for char in text:
