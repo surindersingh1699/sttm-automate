@@ -193,12 +193,24 @@ def build(dump_path: Path, db_path: Path) -> None:
                     match = filtered[0]
             per_line_match.append(match)
 
-        # --- Resolve shabad ShabadID: first line with a Realm hit wins. ---
+        # --- Resolve shabad ShabadID ---
+        # Shabads with a real sqlite `sttm_id` already carry STTM's Realm
+        # ShabadID verbatim (that's what `sttm_id` *is* — the upstream
+        # ShabadOS DB and STTM's Realm share the namespace). Using the
+        # fuzzy-line-match to re-derive it is actively harmful: SGGS has
+        # hundreds of shabads that share a rubric first line ("mhlw 5 ]"
+        # etc.) and the matcher picks the wrong one, silently routing
+        # STTM to a different shabad. Only fall back to the Realm link
+        # when sqlite has no sttm_id (Dasam Granth, Ardaas, Uggardanti).
+        sttm_id_real = first["sttm_id"]
         realm_shabad_id: int | None = None
-        for match in per_line_match:
-            if match and match.get("s"):
-                realm_shabad_id = int(match["s"][0])
-                break
+        if sttm_id_real is not None:
+            realm_shabad_id = int(sttm_id_real)
+        else:
+            for match in per_line_match:
+                if match and match.get("s"):
+                    realm_shabad_id = int(match["s"][0])
+                    break
         if realm_shabad_id is not None:
             shabad_map[str(synthetic)] = realm_shabad_id
         else:
