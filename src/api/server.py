@@ -22,6 +22,18 @@ runtime_settings_path = Path(__file__).parent.parent.parent / ".runtime_settings
 confidence_mode = "balanced"
 
 
+DECODER_TOGGLE_KEYS = (
+    "greedy_decode",
+    "single_temperature",
+    "allow_repetition",
+    "independent_windows",
+)
+
+
+def get_decoder_toggles() -> dict:
+    return {k: getattr(config.whisper, k) for k in DECODER_TOGGLE_KEYS}
+
+
 def load_runtime_settings():
     """Load persisted runtime settings (if present)."""
     global confidence_mode
@@ -34,15 +46,13 @@ def load_runtime_settings():
             config.sttm.controller_pin = int(value) if value not in (None, "") else None
         mode = data.get("confidence_mode", "balanced")
         confidence_mode = mode if mode in ("conservative", "balanced", "fast") else "balanced"
-        engine = data.get("transcription_engine", "whisper")
-        config.transcription.engine = engine if engine in ("whisper", "whisper_hindi", "vosk", "google") else "whisper"
-        if "google_credentials_path" in data and data["google_credentials_path"]:
-            config.transcription.google_credentials_path = data["google_credentials_path"]
-        model_size = data.get("whisper_model_size", "small")
-        config.whisper.model_size = model_size if model_size in ("tiny", "base", "small") else "small"
         if "audio_device" in data:
             dev = data["audio_device"]
             config.audio.device = int(dev) if dev is not None else None
+        toggles = data.get("decoder_toggles") or {}
+        for key in DECODER_TOGGLE_KEYS:
+            if key in toggles:
+                setattr(config.whisper, key, bool(toggles[key]))
     except Exception as e:
         print(f"[Server] Could not load runtime settings: {e}")
 
@@ -52,10 +62,8 @@ def save_runtime_settings():
     payload = {
         "controller_pin": config.sttm.controller_pin,
         "confidence_mode": confidence_mode,
-        "transcription_engine": config.transcription.engine,
-        "google_credentials_path": config.transcription.google_credentials_path,
-        "whisper_model_size": config.whisper.model_size,
         "audio_device": config.audio.device,
+        "decoder_toggles": get_decoder_toggles(),
     }
     try:
         runtime_settings_path.write_text(
@@ -141,11 +149,10 @@ async def websocket_endpoint(websocket: WebSocket):
             "history": pipeline.tracker.get_history_list(),
             "controller_pin": config.sttm.controller_pin,
             "confidence_mode": pipeline.confidence_mode,
-            "transcription_engine": pipeline.current_engine,
-            "whisper_model_size": config.whisper.model_size,
             "audio_source": pipeline._audio_source,
             "audio_device": config.audio.device,
             "hypotheses": pipeline.tracker.get_hypotheses(),
+            "decoder_toggles": get_decoder_toggles(),
         }
         if current and current.verses:
             init_state["verses"] = [
@@ -226,41 +233,6 @@ async def websocket_endpoint(websocket: WebSocket):
                         "source": source,
                     })
 
-            elif msg_type == "set_transcription_engine":
-                engine = msg.get("engine", "whisper")
-                if engine in ("whisper", "whisper_hindi", "vosk", "google"):
-                    await broadcast({
-                        "type": "engine_switching",
-                        "engine": engine,
-                    })
-                    try:
-                        await pipeline.switch_engine(engine)
-                        save_runtime_settings()
-                        await broadcast({
-                            "type": "transcription_engine_updated",
-                            "engine": engine,
-                        })
-                    except Exception as e:
-                        await broadcast({
-                            "type": "engine_switch_error",
-                            "engine": engine,
-                            "error": str(e),
-                        })
-
-            elif msg_type == "set_whisper_model_size":
-                size = msg.get("size", "small")
-                if size in ("tiny", "base", "small"):
-                    await broadcast({
-                        "type": "engine_switching",
-                        "engine": config.transcription.engine,
-                    })
-                    await pipeline.switch_model_size(size)
-                    save_runtime_settings()
-                    await broadcast({
-                        "type": "whisper_model_size_updated",
-                        "size": size,
-                    })
-
             elif msg_type == "set_audio_device":
                 dev = msg.get("device")
                 device_index = int(dev) if dev is not None else None
@@ -271,6 +243,17 @@ async def websocket_endpoint(websocket: WebSocket):
                         "type": "audio_device_updated",
                         "device": device_index,
                     })
+
+            elif msg_type == "set_decoder_toggles":
+                toggles = msg.get("toggles") or {}
+                for key in DECODER_TOGGLE_KEYS:
+                    if key in toggles:
+                        setattr(config.whisper, key, bool(toggles[key]))
+                save_runtime_settings()
+                await broadcast({
+                    "type": "decoder_toggles_updated",
+                    "toggles": get_decoder_toggles(),
+                })
 
     finally:
         if websocket in clients:

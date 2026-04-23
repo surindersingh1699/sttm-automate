@@ -12,13 +12,18 @@ let currentShabadId = null;
 let currentShabadState = null;
 let historyState = [];
 let confidenceMode = "balanced";
-let transcriptionEngine = "vosk";
 let audioSource = "local";
 let audioDevice = null; // null = auto-detect
 let audioWs = null;
 let audioContext = null;
 let audioStream = null;
 let audioProcessor = null;
+let decoderToggles = {
+    greedy_decode: false,
+    single_temperature: true,
+    allow_repetition: true,
+    independent_windows: false,
+};
 const DASHBOARD_STATE_KEY = "sttm_automate_dashboard_state_v1";
 
 // --- Safe DOM Helpers ---
@@ -82,7 +87,6 @@ function persistDashboardState() {
                 currentShabadState: currentShabadState,
                 historyState: historyState,
                 confidenceMode: confidenceMode,
-                transcriptionEngine: transcriptionEngine,
             })
         );
     } catch (err) {
@@ -103,8 +107,6 @@ function restoreDashboardState() {
         historyState = Array.isArray(data.historyState) ? data.historyState : [];
         confidenceMode = data.confidenceMode || "balanced";
         updateConfidenceMode(confidenceMode);
-        transcriptionEngine = data.transcriptionEngine || "vosk";
-        updateTranscriptionEngine(transcriptionEngine);
 
         updateCurrentShabad(currentShabadState);
         updateHistory(historyState);
@@ -166,14 +168,14 @@ function handleMessage(data) {
             if (Object.prototype.hasOwnProperty.call(data, "confidence_mode")) {
                 updateConfidenceMode(data.confidence_mode);
             }
-            if (Object.prototype.hasOwnProperty.call(data, "transcription_engine")) {
-                updateTranscriptionEngine(data.transcription_engine);
-            }
             if (Object.prototype.hasOwnProperty.call(data, "audio_source")) {
                 updateAudioSource(data.audio_source);
             }
             if (Object.prototype.hasOwnProperty.call(data, "audio_device")) {
                 updateAudioDevice(data.audio_device);
+            }
+            if (data.decoder_toggles) {
+                updateDecoderToggles(data.decoder_toggles);
             }
             if (data.pipeline_state === "searching" || data.pipeline_state === "candidate_lock") {
                 if (currentVerses.length > 0) {
@@ -201,6 +203,12 @@ function handleMessage(data) {
         case "status":
             isPaused = data.paused;
             updatePauseButton();
+            if (isPaused) markModelIdle("paused");
+            break;
+        case "paused":
+            isPaused = true;
+            updatePauseButton();
+            markModelIdle("paused");
             break;
         case "controller_pin_updated":
             updatePinStatus(data.controller_pin);
@@ -209,26 +217,14 @@ function handleMessage(data) {
             updateConfidenceMode(data.mode);
             persistDashboardState();
             break;
-        case "transcription_engine_updated":
-            updateTranscriptionEngine(data.engine);
-            persistDashboardState();
-            break;
         case "audio_source_updated":
             updateAudioSource(data.source);
             break;
         case "audio_device_updated":
             updateAudioDevice(data.device);
             break;
-        case "engine_switching":
-            setStatus("connecting", "Switching to " + data.engine + " engine...");
-            break;
-        case "engine_switch_error":
-            setStatus("error", "Engine switch failed: " + data.error);
-            // Revert dropdown to the engine that's actually running
-            if (transcriptionEngine) {
-                updateTranscriptionEngine(transcriptionEngine);
-            }
-            alert("Failed to switch to " + data.engine + " engine:\n\n" + data.error);
+        case "decoder_toggles_updated":
+            updateDecoderToggles(data.toggles);
             break;
         case "audio_level":
             updateAudioLevel(data.rms, data.has_vocals);
@@ -241,9 +237,17 @@ function handleMessage(data) {
 
 // --- UI Updates ---
 
+function markModelIdle(label) {
+    var speedEl = document.getElementById("model-speed");
+    if (!speedEl) return;
+    speedEl.className = "model-speed idle";
+    speedEl.textContent = label || "idle";
+}
+
 function updateTranscription(data) {
     var el = document.getElementById("transcription-text");
     var lettersEl = document.getElementById("first-letters");
+    var speedEl = document.getElementById("model-speed");
 
     if (data.text) {
         el.textContent = data.text;
@@ -260,6 +264,27 @@ function updateTranscription(data) {
         lettersEl.textContent = "First letters: " + data.first_letters;
     } else {
         lettersEl.textContent = "";
+    }
+
+    if (speedEl) {
+        if (isPaused) {
+            markModelIdle("paused");
+        } else if (data.status === "music_only") {
+            markModelIdle("silence");
+        } else if (Number.isFinite(data.transcribe_ms)) {
+            var ms = data.transcribe_ms;
+            var rtf = Number.isFinite(data.rtf) ? data.rtf : null;
+            var cls = "model-speed";
+            if (rtf !== null) {
+                if (rtf <= 0.5) cls += " fast";
+                else if (rtf <= 1.0) cls += " ok";
+                else cls += " slow";
+            }
+            speedEl.className = cls;
+            speedEl.textContent = rtf !== null
+                ? ms + " ms · " + rtf.toFixed(2) + "× RTF"
+                : ms + " ms";
+        }
     }
 }
 
@@ -509,23 +534,6 @@ function updateConfidenceMode(mode) {
     }
 }
 
-function setTranscriptionEngine(engine) {
-    updateTranscriptionEngine(engine);
-    send({ type: "set_transcription_engine", engine: engine });
-    persistDashboardState();
-}
-
-function updateTranscriptionEngine(engine) {
-    if (engine !== "vosk" && engine !== "google") {
-        engine = "vosk";
-    }
-    transcriptionEngine = engine;
-    var select = document.getElementById("transcription-engine");
-    if (select && select.value !== engine) {
-        select.value = engine;
-    }
-}
-
 // --- Audio Source (Local / Remote Mic) ---
 
 function setAudioSource(source) {
@@ -666,7 +674,7 @@ function loadAudioDevices() {
             // Auto option
             var autoOpt = document.createElement("option");
             autoOpt.value = "auto";
-            autoOpt.textContent = "Auto (BlackHole > Default)";
+            autoOpt.textContent = "Auto (Default Mic)";
             select.appendChild(autoOpt);
 
             data.devices.forEach(function(dev) {
@@ -705,6 +713,56 @@ function updateAudioDevice(device) {
         select.value = "auto";
     }
 }
+
+// --- Decoder Toggles ---
+
+var DECODER_TOGGLE_IDS = {
+    greedy_decode: "dec-greedy",
+    single_temperature: "dec-single-temp",
+    allow_repetition: "dec-allow-rep",
+    independent_windows: "dec-indep-win",
+};
+
+function updateDecoderToggles(toggles) {
+    if (!toggles) return;
+    Object.keys(DECODER_TOGGLE_IDS).forEach(function(key) {
+        if (Object.prototype.hasOwnProperty.call(toggles, key)) {
+            decoderToggles[key] = !!toggles[key];
+            var el = document.getElementById(DECODER_TOGGLE_IDS[key]);
+            if (el) el.checked = decoderToggles[key];
+        }
+    });
+}
+
+function setDecoderToggle(key, checked) {
+    decoderToggles[key] = !!checked;
+    var payload = {};
+    payload[key] = !!checked;
+    send({ type: "set_decoder_toggles", toggles: payload });
+}
+
+function toggleDecoderInfo(force) {
+    var popover = document.getElementById("decoder-info-popover");
+    var btn = document.getElementById("decoder-info-btn");
+    if (!popover) return;
+    var show = typeof force === "boolean" ? force : popover.hasAttribute("hidden");
+    if (show) {
+        popover.removeAttribute("hidden");
+        if (btn) btn.classList.add("active");
+    } else {
+        popover.setAttribute("hidden", "");
+        if (btn) btn.classList.remove("active");
+    }
+}
+
+document.addEventListener("click", function(e) {
+    var popover = document.getElementById("decoder-info-popover");
+    var btn = document.getElementById("decoder-info-btn");
+    if (!popover || popover.hasAttribute("hidden")) return;
+    if (popover.contains(e.target)) return;
+    if (btn && btn.contains(e.target)) return;
+    toggleDecoderInfo(false);
+});
 
 // --- Initialize ---
 restoreDashboardState();

@@ -17,13 +17,9 @@ class AudioConfig(BaseModel):
     device: int | None = None  # None = auto-detect: BlackHole > aggregate > default
 
 
-class TranscriptionConfig(BaseModel):
-    engine: str = "whisper"  # "whisper", "whisper_hindi", "vosk" (all offline), or "google" (online)
-    google_credentials_path: str | None = None  # path to Google Cloud service account JSON
-
-
 class WhisperConfig(BaseModel):
-    model_size: str = "small"  # tiny, base, small (small = best accuracy/speed for Punjabi)
+    hf_model_id: str = "surindersinghssj/surt-small-v3"  # HuggingFace repo (auto-converted to CT2 int8 on first load)
+    local_model_dir: str = "data/surt-small-v3-ct2"  # where the converted CT2 model lives
     device: str = "cpu"
     compute_type: str = "int8"  # int8 for CPU, float16 for GPU
     language: str = "pa"  # Punjabi
@@ -32,6 +28,11 @@ class WhisperConfig(BaseModel):
     vad_threshold: float = 0.15  # (only used if vad_filter re-enabled)
     vad_min_silence_ms: int = 800  # kirtan has natural pauses between lines (~1s)
     vad_speech_pad_ms: int = 500  # pad more to catch singing onset/offset
+    # Decoder toggles — exposed as UI checkboxes, read per transcribe() call (no reload).
+    greedy_decode: bool = False         # True → beam_size=1 (3–5× faster, minor accuracy loss)
+    single_temperature: bool = True     # True → temperature=[0.0] (no 6× fallback-retry loop)
+    allow_repetition: bool = True       # True → compression_ratio_threshold=10.0 (kirtan is really repetitive)
+    independent_windows: bool = False   # True → condition_on_previous_text=False (no carryover across windows)
 
 
 class MatcherConfig(BaseModel):
@@ -90,7 +91,6 @@ class DashboardConfig(BaseModel):
 
 class AppConfig(BaseModel):
     audio: AudioConfig = AudioConfig()
-    transcription: TranscriptionConfig = TranscriptionConfig()
     whisper: WhisperConfig = WhisperConfig()
     matcher: MatcherConfig = MatcherConfig()
     sttm: STTMConfig = STTMConfig()

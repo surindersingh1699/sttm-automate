@@ -13,22 +13,46 @@
             <button id="btn-pause" class="btn btn-warning" onclick="togglePause()">Pause</button>
             <button class="btn btn-danger" onclick="forceUnlock()">Force Unlock</button>
             <select id="audio-device" class="control-input" onchange="setAudioDevice(this.value)" title="Audio input device">
-                <option value="auto">Auto (BlackHole)</option>
+                <option value="auto">Auto (Default Mic)</option>
             </select>
             <select id="audio-source" class="control-input" onchange="setAudioSource(this.value)" title="Local = server mic, Remote = your device mic">
                 <option value="local" selected>Local Mic (Server)</option>
                 <option value="remote">Remote Mic (This Device)</option>
             </select>
             <span id="mic-status" class="mic-status"></span>
-            <select id="transcription-engine" class="control-input" onchange="setTranscriptionEngine(this.value)" title="Vosk = fastest offline (42MB), Google = online">
-                <option value="vosk" selected>Vosk Hindi (Fastest)</option>
-                <option value="google">Google STT (Online)</option>
-            </select>
             <select id="confidence-mode" class="control-input" onchange="setConfidenceMode(this.value)">
                 <option value="conservative">Conservative</option>
                 <option value="balanced" selected>Balanced</option>
                 <option value="fast">Fast</option>
             </select>
+            <div class="decoder-toggles" title="Decoder toggles — applied live, no model reload needed">
+                <span class="decoder-label">Decoder</span>
+                <button type="button" class="info-btn" id="decoder-info-btn" onclick="toggleDecoderInfo()" aria-label="What do these do?">?</button>
+                <label class="decoder-toggle"><input type="checkbox" id="dec-greedy" onchange="setDecoderToggle('greedy_decode', this.checked)"> Greedy</label>
+                <label class="decoder-toggle"><input type="checkbox" id="dec-single-temp" onchange="setDecoderToggle('single_temperature', this.checked)"> Single-pass</label>
+                <label class="decoder-toggle"><input type="checkbox" id="dec-allow-rep" onchange="setDecoderToggle('allow_repetition', this.checked)"> Allow repetition</label>
+                <label class="decoder-toggle"><input type="checkbox" id="dec-indep-win" onchange="setDecoderToggle('independent_windows', this.checked)"> Independent windows</label>
+            </div>
+            <div id="decoder-info-popover" class="info-popover" hidden>
+                <div class="info-popover-head">
+                    <strong>Decoder toggles</strong>
+                    <button type="button" class="info-close" onclick="toggleDecoderInfo(false)" aria-label="Close">&times;</button>
+                </div>
+                <p class="info-note">All four flip the model live — no reload needed. Changes persist across restarts.</p>
+                <dl class="info-list">
+                    <dt>Greedy</dt>
+                    <dd><em>beam_size: 5 → 1.</em> 3–5× faster per window; minor accuracy hit. Try if RTF is consistently slow.</dd>
+
+                    <dt>Single-pass</dt>
+                    <dd><em>temperature: [0.0].</em> Skips Whisper's 6-step fallback loop (0.0 → 0.2 → … → 1.0) that fires when compression-ratio / logprob gates fail. Removes worst-case latency spikes. <strong>On by default.</strong></dd>
+
+                    <dt>Allow repetition</dt>
+                    <dd><em>compression_ratio_threshold: 2.4 → 10.0.</em> Kirtan repeats lines on purpose; the default trigger treats that as a hallucination and retries. Off = retries, on = trusts the output. <strong>On by default.</strong></dd>
+
+                    <dt>Independent windows</dt>
+                    <dd><em>condition_on_previous_text: false.</em> Stops Whisper from carrying the last window's text as context. Helps when a bad transcription poisons subsequent windows; slight quality loss on clean audio.</dd>
+                </dl>
+            </div>
             <input id="controller-pin" class="control-input" type="number" inputmode="numeric" placeholder="Controller PIN">
             <button class="btn btn-small" onclick="setControllerPin()">Set PIN</button>
             <button class="btn btn-small" onclick="clearControllerPin()">Clear</button>
@@ -41,7 +65,7 @@
     <main>
         <!-- Live Transcription -->
         <section class="panel" id="panel-transcription">
-            <h2>Live Transcription</h2>
+            <h2>Live Transcription <span id="model-speed" class="model-speed" title="Model inference latency / real-time factor"></span></h2>
             <div class="panel-content">
                 <div class="audio-bar"><div id="audio-level" class="audio-fill"></div></div>
                 <div id="transcription-text" class="scrollable">Waiting for audio...</div>
