@@ -78,6 +78,9 @@ class MatcherConfig(BaseModel):
     fast_speech_letters_per_second: float = 1.50  # above this, favor shorter windows
     slow_speech_letters_per_second: float = 0.65  # below this, favor longer windows
     speech_rate_ema_alpha: float = 0.35  # smoothing factor for speech-rate estimate
+    multi_line_search: bool = True  # True → also try 2-line split search for dense/fast text (nitnem)
+    multi_line_min_query_length: int = 12  # query must be ≥ this many first-letters to trigger multi-line
+    multi_line_score_bonus: float = 0.12  # score boost when both halves hit consecutive DB lines
 
 
 class STTMConfig(BaseModel):
@@ -98,6 +101,9 @@ class DatabaseConfig(BaseModel):
     local_filename: str = "database.sqlite"  # resolved relative to project root
     hf_dataset_id: str = "surindersinghssj/sttm-gurbani-db"
     hf_filename: str = "database.sqlite"
+    # Search scope — False = all sources (SGGS + Dasam Granth + Vaaran Bhai Gurdas +
+    # Bhai Nand Lal + Sarabloh + Rehitname + …). True = SGGS only.
+    sggs_only: bool = False
 
 
 class AppConfig(BaseModel):

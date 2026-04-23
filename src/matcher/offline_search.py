@@ -5,7 +5,8 @@ The upstream `database.sqlite` stores:
   - `lines.first_letters` in ASCII (matches `transliterate.gurmukhi_to_ascii` output)
   - `translations.translation` keyed by `translation_source_id` (1 = Dr. Sant Singh Khalsa English)
 
-All queries are scoped to `shabads.source_id = 1` (Sri Guru Granth Sahib).
+Queries span all sources in the DB — Sri Guru Granth Sahib, Sri Dasam Granth,
+Vaaran Bhai Gurdas, Bhai Nand Lal's banis, Sarabloh Granth, Rehitname, etc.
 """
 
 import sqlite3
@@ -19,8 +20,13 @@ from src.matcher.search import ShabadCandidate, ShabadVerse
 from src.transcription.transliterate import gurmukhi_to_ascii, normalize_first_letter
 
 _PROJECT_ROOT = Path(__file__).parent.parent.parent
-_SOURCE_SGGS = 1
 _ENGLISH_TRANSLATION_SOURCE = 1  # Dr. Sant Singh Khalsa
+_SOURCE_SGGS = 1  # shabads.source_id for Sri Guru Granth Sahib (used by sggs_only toggle)
+
+
+def _scope_clause() -> str:
+    """Return an ``AND`` clause restricting rows to SGGS when the toggle is on."""
+    return f" AND s.source_id = {_SOURCE_SGGS}" if config.database.sggs_only else ""
 
 
 def _resolve_db_path() -> Path:
@@ -44,6 +50,7 @@ def _resolve_db_path() -> Path:
     return Path(cached)
 
 # Template for the common line+shabad+english projection.
+# No source filter — matches across SGGS, Dasam Granth, Bhai Gurdas, Bhai Nand Lal, etc.
 _LINE_SELECT = f"""
     SELECT
         l.gurmukhi       AS gurmukhi_ascii,
@@ -51,6 +58,7 @@ _LINE_SELECT = f"""
         l.order_id       AS order_id,
         l.source_page    AS source_page,
         s.sttm_id        AS sttm_id,
+        s.source_id      AS source_id,
         (
             SELECT t.translation FROM translations t
             WHERE t.line_id = l.id AND t.translation_source_id = {_ENGLISH_TRANSLATION_SOURCE}
@@ -58,7 +66,7 @@ _LINE_SELECT = f"""
         ) AS english
     FROM lines l
     JOIN shabads s ON l.shabad_id = s.id
-    WHERE s.source_id = {_SOURCE_SGGS}
+    WHERE 1=1
 """
 
 
@@ -126,6 +134,19 @@ class OfflineShabadSearcher:
         if transcript_text.strip():
             self._add_unique(self._fullword_search(transcript_text, max_results, "type2"), candidates, seen_ids)
 
+        # Strategy 5: multi-line search — the window spans 2+ DB lines (nitnem / dense text).
+        # Split the query in half and require consecutive line hits for both halves.
+        if (
+            config.matcher.multi_line_search
+            and len(first_letters) >= config.matcher.multi_line_min_query_length
+        ):
+            ascii_fl_full = gurmukhi_to_ascii(first_letters)
+            self._add_unique(
+                self._multiline_search(ascii_fl_full, max_results, "multiline"),
+                candidates,
+                seen_ids,
+            )
+
         return candidates
 
     def search_by_id(self, shabad_id: int) -> ShabadCandidate | None:
@@ -139,7 +160,12 @@ class OfflineShabadSearcher:
         return self._row_to_candidate(row, signal="id")
 
     def fetch_all_verses(self, shabad_id: int) -> list[ShabadVerse]:
-        """Fetch all verses of a shabad for line-level tracking."""
+        """Fetch all verses of a shabad for line-level tracking.
+
+        Skips the sggs_only scope — we always honor an explicit shabad_id lookup,
+        so the user can still navigate a Dasam/Bhai Gurdas shabad that was manually
+        selected even while SGGS-only is on for search.
+        """
         rows = self._conn.execute(
             _LINE_SELECT + " AND s.sttm_id = ? ORDER BY l.order_id",
             (shabad_id,),
@@ -163,6 +189,7 @@ class OfflineShabadSearcher:
         """ASCII first-letter prefix match."""
         rows = self._conn.execute(
             _LINE_SELECT
+            + _scope_clause()
             + """
             AND l.first_letters LIKE ? || '%'
             GROUP BY s.sttm_id
@@ -177,6 +204,7 @@ class OfflineShabadSearcher:
         """ASCII first-letter contains match (broader)."""
         rows = self._conn.execute(
             _LINE_SELECT
+            + _scope_clause()
             + """
             AND l.first_letters LIKE '%' || ? || '%'
             GROUP BY s.sttm_id
@@ -186,6 +214,76 @@ class OfflineShabadSearcher:
             (ascii_query, limit),
         ).fetchall()
         return [self._row_to_candidate(r, signal) for r in rows]
+
+    def _multiline_search(
+        self, ascii_query: str, limit: int, signal: str
+    ) -> list[ShabadCandidate]:
+        """
+        Split a long first-letter query in half and require BOTH halves to hit
+        consecutive lines within the same shabad. Handles windows that span
+        multiple DB lines (dense nitnem text, fast kirtan).
+        """
+        if len(ascii_query) < 8:
+            return []
+
+        # Try a few split positions since we don't know exact word boundaries
+        # in the first-letter string.
+        mid = len(ascii_query) // 2
+        split_positions = {mid}
+        if mid > 3:
+            split_positions.add(mid - 1)
+            split_positions.add(mid + 1)
+
+        results: dict[int, sqlite3.Row] = {}
+        for split_at in sorted(split_positions):
+            head = ascii_query[:split_at]
+            tail = ascii_query[split_at:]
+            if len(head) < 3 or len(tail) < 3:
+                continue
+
+            # Self-join lines so each row pairs with its next-order sibling in
+            # the same shabad. Match head against line-N, tail against line-N+1.
+            scope = (
+                f"AND s.source_id = {_SOURCE_SGGS}"
+                if config.database.sggs_only
+                else ""
+            )
+            rows = self._conn.execute(
+                f"""
+                SELECT
+                    l1.gurmukhi       AS gurmukhi_ascii,
+                    l1.first_letters  AS first_letters,
+                    l1.order_id       AS order_id,
+                    l1.source_page    AS source_page,
+                    s.sttm_id         AS sttm_id,
+                    s.source_id       AS source_id,
+                    (
+                        SELECT t.translation FROM translations t
+                        WHERE t.line_id = l1.id AND t.translation_source_id = {_ENGLISH_TRANSLATION_SOURCE}
+                        LIMIT 1
+                    ) AS english
+                FROM lines l1
+                JOIN shabads s ON l1.shabad_id = s.id
+                JOIN lines l2
+                    ON l2.shabad_id = l1.shabad_id
+                    AND l2.order_id = l1.order_id + 1
+                WHERE l1.first_letters LIKE ? || '%'
+                  AND l2.first_letters LIKE ? || '%'
+                  {scope}
+                GROUP BY s.sttm_id
+                ORDER BY l1.order_id
+                LIMIT ?
+                """,
+                (head, tail, limit),
+            ).fetchall()
+
+            for row in rows:
+                # Keep the first hit per shabad (from the earliest split_at tried).
+                results.setdefault(row["sttm_id"], row)
+            if len(results) >= limit:
+                break
+
+        return [self._row_to_candidate(r, signal) for r in list(results.values())[:limit]]
 
     def _fullword_search(self, transcript_text: str, limit: int, signal: str) -> list[ShabadCandidate]:
         """Phrase search: match transcript words against Unicode Gurmukhi lines.
@@ -213,6 +311,7 @@ class OfflineShabadSearcher:
 
         rows = self._conn.execute(
             _LINE_SELECT
+            + _scope_clause()
             + """
             AND l.first_letters LIKE '%' || ? || '%'
             GROUP BY s.sttm_id
@@ -227,12 +326,19 @@ class OfflineShabadSearcher:
     def _row_to_candidate(row: sqlite3.Row, signal: str) -> ShabadCandidate:
         """Convert a SQLite row to a ShabadCandidate (ASCII → Unicode Gurmukhi)."""
         ascii_g = row["gurmukhi_ascii"] or ""
+        # Map DB source_id (1..12) → scorer code: SGGS="G", everything else="D" (treated
+        # as secondary by the scorer). Older rows without source_id default to "G".
+        try:
+            db_source = row["source_id"]
+        except (IndexError, KeyError):
+            db_source = _SOURCE_SGGS
+        source_code = "G" if db_source == _SOURCE_SGGS else "D"
         return ShabadCandidate(
             shabad_id=row["sttm_id"],
             gurmukhi=ascii_g,
             unicode=_to_unicode(ascii_g),
             english=row["english"] or "",
-            source_id="G",
+            source_id=source_code,
             page_no=row["source_page"],
             retrieval_sources={signal} if signal else set(),
         )

@@ -974,6 +974,10 @@ class PipelineOrchestrator:
                     score += 0.10
                 elif word_overlap >= 1:
                     score += 0.05
+            if "multiline" in retrieval_sources:
+                # Both halves of a long query hit consecutive lines — strong signal
+                # for dense text (nitnem, fast kirtan) where one window = 2+ DB lines.
+                score += config.matcher.multi_line_score_bonus
             score = min(1.0, max(0.0, score))
             action = self.scorer.classify(score)
             scored.append({

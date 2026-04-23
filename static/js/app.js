@@ -25,6 +25,7 @@ let decoderToggles = {
     independent_windows: false,
     cap_decode_length: true,
     skip_slow_windows: true,
+    multi_line_search: true,
 };
 const DASHBOARD_STATE_KEY = "sttm_automate_dashboard_state_v1";
 
@@ -179,6 +180,9 @@ function handleMessage(data) {
             if (data.decoder_toggles) {
                 updateDecoderToggles(data.decoder_toggles);
             }
+            if (Object.prototype.hasOwnProperty.call(data, "sggs_only")) {
+                updateSggsOnly(data.sggs_only);
+            }
             if (data.pipeline_state === "searching" || data.pipeline_state === "candidate_lock") {
                 if (currentVerses.length > 0) {
                     clearPangati();
@@ -227,6 +231,9 @@ function handleMessage(data) {
             break;
         case "decoder_toggles_updated":
             updateDecoderToggles(data.toggles);
+            break;
+        case "sggs_only_updated":
+            updateSggsOnly(data.sggs_only);
             break;
         case "audio_level":
             updateAudioLevel(data.rms, data.has_vocals);
@@ -725,6 +732,7 @@ var DECODER_TOGGLE_IDS = {
     independent_windows: "dec-indep-win",
     cap_decode_length: "dec-cap-tokens",
     skip_slow_windows: "dec-skip-slow",
+    multi_line_search: "dec-multiline",
 };
 
 function updateDecoderToggles(toggles) {
@@ -743,6 +751,15 @@ function setDecoderToggle(key, checked) {
     var payload = {};
     payload[key] = !!checked;
     send({ type: "set_decoder_toggles", toggles: payload });
+}
+
+function updateSggsOnly(enabled) {
+    var el = document.getElementById("sggs-only");
+    if (el) el.checked = !!enabled;
+}
+
+function setSggsOnly(enabled) {
+    send({ type: "set_sggs_only", enabled: !!enabled });
 }
 
 function toggleDecoderInfo(force) {

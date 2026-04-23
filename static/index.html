@@ -25,6 +25,9 @@
                 <option value="balanced" selected>Balanced</option>
                 <option value="fast">Fast</option>
             </select>
+            <label class="decoder-toggle" title="When on, search is restricted to Sri Guru Granth Sahib Ji only. Off = also matches Dasam Granth, Vaaran Bhai Gurdas, Bhai Nand Lal, Sarabloh, Rehitname, etc.">
+                <input type="checkbox" id="sggs-only" onchange="setSggsOnly(this.checked)"> SGGS only
+            </label>
             <div class="decoder-toggles" title="Decoder toggles — applied live, no model reload needed">
                 <span class="decoder-label">Decoder</span>
                 <button type="button" class="info-btn" id="decoder-info-btn" onclick="toggleDecoderInfo()" aria-label="What do these do?">?</button>
@@ -34,6 +37,7 @@
                 <label class="decoder-toggle"><input type="checkbox" id="dec-indep-win" onchange="setDecoderToggle('independent_windows', this.checked)"> Independent windows</label>
                 <label class="decoder-toggle"><input type="checkbox" id="dec-cap-tokens" onchange="setDecoderToggle('cap_decode_length', this.checked)"> Cap decode length</label>
                 <label class="decoder-toggle"><input type="checkbox" id="dec-skip-slow" onchange="setDecoderToggle('skip_slow_windows', this.checked)"> Skip slow windows</label>
+                <label class="decoder-toggle"><input type="checkbox" id="dec-multiline" onchange="setDecoderToggle('multi_line_search', this.checked)"> Multi-line search</label>
             </div>
             <div id="decoder-info-popover" class="info-popover" hidden>
                 <div class="info-popover-head">
@@ -59,6 +63,9 @@
 
                     <dt>Skip slow windows</dt>
                     <dd><em>Drop any window whose RTF > 2.0.</em> Slow decodes are usually garbled/repetitive. When tripped, the window is thrown away (no match update, no line-align, no challenger). Keeps the current lock stable instead of letting junk poison it. <strong>On by default.</strong></dd>
+
+                    <dt>Multi-line search</dt>
+                    <dd><em>Split long queries, require consecutive line hits.</em> When one audio window holds 2+ DB lines of text (nitnem, fast kirtan), single-line prefix match fails. This splits the first-letter query in half and looks for shabads where both halves hit consecutive lines — then adds a score bonus. Fixes dense-text matching. <strong>On by default.</strong></dd>
                 </dl>
             </div>
             <input id="controller-pin" class="control-input" type="number" inputmode="numeric" placeholder="Controller PIN">

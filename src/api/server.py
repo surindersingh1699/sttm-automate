@@ -22,18 +22,32 @@ runtime_settings_path = Path(__file__).parent.parent.parent / ".runtime_settings
 confidence_mode = "balanced"
 
 
-DECODER_TOGGLE_KEYS = (
-    "greedy_decode",
-    "single_temperature",
-    "allow_repetition",
-    "independent_windows",
-    "cap_decode_length",
-    "skip_slow_windows",
-)
+# Maps each wire toggle key to the config section that owns it. Keeps the
+# dashboard payload flat while fields can live in whatever config class fits.
+TOGGLE_SECTIONS: dict[str, str] = {
+    "greedy_decode": "whisper",
+    "single_temperature": "whisper",
+    "allow_repetition": "whisper",
+    "independent_windows": "whisper",
+    "cap_decode_length": "whisper",
+    "skip_slow_windows": "whisper",
+    "multi_line_search": "matcher",
+}
+DECODER_TOGGLE_KEYS = tuple(TOGGLE_SECTIONS.keys())
 
 
 def get_decoder_toggles() -> dict:
-    return {k: getattr(config.whisper, k) for k in DECODER_TOGGLE_KEYS}
+    return {
+        key: bool(getattr(getattr(config, TOGGLE_SECTIONS[key]), key))
+        for key in DECODER_TOGGLE_KEYS
+    }
+
+
+def _apply_decoder_toggle(key: str, value: bool) -> None:
+    section = TOGGLE_SECTIONS.get(key)
+    if section is None:
+        return
+    setattr(getattr(config, section), key, bool(value))
 
 
 def load_runtime_settings():
@@ -54,7 +68,9 @@ def load_runtime_settings():
         toggles = data.get("decoder_toggles") or {}
         for key in DECODER_TOGGLE_KEYS:
             if key in toggles:
-                setattr(config.whisper, key, bool(toggles[key]))
+                _apply_decoder_toggle(key, toggles[key])
+        if "sggs_only" in data:
+            config.database.sggs_only = bool(data["sggs_only"])
     except Exception as e:
         print(f"[Server] Could not load runtime settings: {e}")
 
@@ -66,6 +82,7 @@ def save_runtime_settings():
         "confidence_mode": confidence_mode,
         "audio_device": config.audio.device,
         "decoder_toggles": get_decoder_toggles(),
+        "sggs_only": config.database.sggs_only,
     }
     try:
         runtime_settings_path.write_text(
@@ -155,6 +172,7 @@ async def websocket_endpoint(websocket: WebSocket):
             "audio_device": config.audio.device,
             "hypotheses": pipeline.tracker.get_hypotheses(),
             "decoder_toggles": get_decoder_toggles(),
+            "sggs_only": config.database.sggs_only,
         }
         if current and current.verses:
             init_state["verses"] = [
@@ -250,11 +268,19 @@ async def websocket_endpoint(websocket: WebSocket):
                 toggles = msg.get("toggles") or {}
                 for key in DECODER_TOGGLE_KEYS:
                     if key in toggles:
-                        setattr(config.whisper, key, bool(toggles[key]))
+                        _apply_decoder_toggle(key, toggles[key])
                 save_runtime_settings()
                 await broadcast({
                     "type": "decoder_toggles_updated",
                     "toggles": get_decoder_toggles(),
+                })
+
+            elif msg_type == "set_sggs_only":
+                config.database.sggs_only = bool(msg.get("enabled", False))
+                save_runtime_settings()
+                await broadcast({
+                    "type": "sggs_only_updated",
+                    "sggs_only": config.database.sggs_only,
                 })
 
     finally:
