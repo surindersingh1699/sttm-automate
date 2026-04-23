@@ -38,6 +38,7 @@
                 <label class="decoder-toggle"><input type="checkbox" id="dec-cap-tokens" onchange="setDecoderToggle('cap_decode_length', this.checked)"> Cap decode length</label>
                 <label class="decoder-toggle"><input type="checkbox" id="dec-skip-slow" onchange="setDecoderToggle('skip_slow_windows', this.checked)"> Skip slow windows</label>
                 <label class="decoder-toggle"><input type="checkbox" id="dec-multiline" onchange="setDecoderToggle('multi_line_search', this.checked)"> Multi-line search</label>
+                <label class="decoder-toggle"><input type="checkbox" id="dec-multiline-locked" onchange="setDecoderToggle('multi_line_locked_align', this.checked)"> Multi-line locked align</label>
             </div>
             <div id="decoder-info-popover" class="info-popover" hidden>
                 <div class="info-popover-head">
@@ -66,6 +67,9 @@
 
                     <dt>Multi-line search</dt>
                     <dd><em>Split long queries, require consecutive line hits, score against both lines.</em> When one audio window holds 2+ DB lines of text (nitnem, fast kirtan), single-line prefix match fails. This splits the first-letter query in half and looks for shabads where both halves hit consecutive lines. Candidates carry both lines' text so the letter-ratio and word-overlap scoring see the full query's worth of content — otherwise a perfect 2-line match gets penalized for letters that "aren't" in line N. Plus a score bonus. <strong>On by default.</strong></dd>
+
+                    <dt>Multi-line locked align</dt>
+                    <dd><em>While locked, also score the query against pairs of consecutive verses.</em> The twin of Multi-line search, applied to line-alignment after lock. Without it, a 12-letter nitnem window scored against a 6-letter single verse gets ~0.5 even on a perfect 2-verse match — 3 such windows trigger weak-line recovery and unlock. With it, we take max(single-line, pair-at-i, pair-at-i-1) so multi-verse windows score correctly and the lock stays. <strong>On by default.</strong></dd>
                 </dl>
             </div>
             <input id="controller-pin" class="control-input" type="number" inputmode="numeric" placeholder="Controller PIN">

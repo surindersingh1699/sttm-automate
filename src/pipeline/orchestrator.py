@@ -26,7 +26,7 @@ class PipelineOrchestrator:
     Wires all components into a continuous processing loop.
 
     Uses a SEARCHING/LOCKED state machine:
-    - SEARCHING: broad BaniDB search, confirm strong match before locking
+    - SEARCHING: broad local-DB search, confirm strong match before locking
     - LOCKED: track line position within shabad, only switch on sustained challenger
     """
 
@@ -534,7 +534,7 @@ class PipelineOrchestrator:
         transcript_text: str = "",
     ):
         """SEARCHING state: broad search, score candidates, try to lock."""
-        # Broad BaniDB search
+        # Broad local-DB search (offline SQLite).
         candidates = await asyncio.to_thread(
             self.searcher.search,
             first_letters,
@@ -672,6 +672,17 @@ class PipelineOrchestrator:
                     combined_variants.append((label, letters))
                     seen_combined.add(letters)
 
+        # Pair-scoring mirrors Strategy 5's multi-line search on the verse side:
+        # when one audio window holds 2+ verses' worth of letters (dense nitnem),
+        # scoring against a single verse's first-letters ratios to ~0.5 and
+        # triggers weak-line recovery. So at each verse i we also try the stitched
+        # first-letters of (verse[i], verse[i+1]) and pick the best of all variants.
+        # Gated independently so it can be disabled without affecting search.
+        pair_align_enabled = (
+            config.matcher.multi_line_locked_align
+            and len(first_letters) >= config.matcher.multi_line_locked_min_query_length
+        )
+
         # Score against each line using current-only baseline and stitched alternatives.
         current_scores: list[float] = []
         combined_scores: list[float] = []
@@ -697,6 +708,25 @@ class PipelineOrchestrator:
                 if candidate_score > line_best_combined:
                     line_best_combined = candidate_score
                     line_best_label = label
+
+            if pair_align_enabled and i + 1 < len(current.verses):
+                # Pair starting at i: [verse[i] + verse[i+1]]. Target line = i
+                # (the start of the multi-verse window).
+                paired_letters = f"{verse.first_letters}{current.verses[i + 1].first_letters}"
+                raw_pair = self.scorer.score_line(first_letters, paired_letters)
+                pair_score = self._apply_progression_bias(i, current.current_line, raw_pair)
+                if pair_score > line_best_combined:
+                    line_best_combined = pair_score
+                    line_best_label = "pair_i"
+                # Also try stitched query against the same pair — catches a window
+                # that captures end-of-i-1 + all-of-i + start-of-i+1 territory.
+                for label, query_letters in combined_variants:
+                    raw_stitch = self.scorer.score_line(query_letters, paired_letters)
+                    stitch_score = self._apply_progression_bias(i, current.current_line, raw_stitch)
+                    if stitch_score > line_best_combined:
+                        line_best_combined = stitch_score
+                        line_best_label = f"pair_i+{label}"
+
             combined_scores.append(line_best_combined)
             combined_labels.append(line_best_label)
             if line_best_combined > best_combined_score:

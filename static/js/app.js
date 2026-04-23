@@ -26,6 +26,7 @@ let decoderToggles = {
     cap_decode_length: true,
     skip_slow_windows: true,
     multi_line_search: true,
+    multi_line_locked_align: true,
 };
 const DASHBOARD_STATE_KEY = "sttm_automate_dashboard_state_v1";
 
@@ -733,6 +734,7 @@ var DECODER_TOGGLE_IDS = {
     cap_decode_length: "dec-cap-tokens",
     skip_slow_windows: "dec-skip-slow",
     multi_line_search: "dec-multiline",
+    multi_line_locked_align: "dec-multiline-locked",
 };
 
 function updateDecoderToggles(toggles) {

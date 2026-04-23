@@ -81,6 +81,8 @@ class MatcherConfig(BaseModel):
     multi_line_search: bool = True  # True → also try 2-line split search for dense/fast text (nitnem)
     multi_line_min_query_length: int = 12  # query must be ≥ this many first-letters to trigger multi-line
     multi_line_score_bonus: float = 0.12  # score boost when both halves hit consecutive DB lines
+    multi_line_locked_align: bool = True  # True → in LOCKED state, also score against pairs of consecutive verses
+    multi_line_locked_min_query_length: int = 10  # query must be ≥ this many letters to try pair alignment
 
 
 class STTMConfig(BaseModel):

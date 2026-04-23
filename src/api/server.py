@@ -32,6 +32,7 @@ TOGGLE_SECTIONS: dict[str, str] = {
     "cap_decode_length": "whisper",
     "skip_slow_windows": "whisper",
     "multi_line_search": "matcher",
+    "multi_line_locked_align": "matcher",
 }
 DECODER_TOGGLE_KEYS = tuple(TOGGLE_SECTIONS.keys())
 
@@ -339,7 +340,7 @@ async def get_verses(shabad_id: int):
             ],
         }
 
-    # Otherwise fetch from BaniDB
+    # Otherwise fetch from the local DB (no external APIs).
     import asyncio
     verses = await asyncio.to_thread(pipeline.searcher.fetch_all_verses, shabad_id)
     return {
