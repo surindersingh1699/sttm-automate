@@ -18,6 +18,39 @@ from src.controller.base import STTMController
 
 _PROJECT_ROOT = Path(__file__).parent.parent.parent
 
+# shabados/database `banis.id` → STTM Desktop Realm `Banis.ID`.
+# Built by matching Gurmukhi/Token across both DBs (scripts/dump_realm_banis.js).
+# Entries missing from STTM's Realm (e.g. Asa Ki Var, Alahnia, Mundavnni) are
+# intentionally absent — those banis can't be displayed via bani-mode.
+_SQLITE_TO_REALM_BANI: dict[int, int] = {
+    1: 2,     # Jap Ji Sahib → japji
+    2: 4,     # Jaap Sahib → jaap
+    3: 6,     # Tav Prasad Savaiye (Sravag Sudh) → svaiye
+    4: 9,     # Benti Chaupai Sahib → chaupai
+    5: 10,    # Anand Sahib → anand
+    6: 1000,  # Anand Sahib (6 Pauris) → anand6
+    7: 21,    # Rehras Sahib (S.) → rehras
+    8: 21,    # Rehras Sahib (T.) → rehras
+    9: 22,    # Aarti → aarti
+    10: 22,   # Aarti (Longer) → aarti
+    11: 23,   # Sohila Sahib → sohila
+    12: 31,   # Sukhmani Sahib → sukhmani
+    14: 24,   # Ardaas → ardas
+    15: 30,   # Salok Mehla 9 → salokm9
+    16: 3,    # Shabad Hazare → shabadhazare
+    17: 5,    # Shabad Hazare Patshahi 10 → shabadhazare10
+    18: 7,    # Tav Prasad Savaiye (Deenan Ki) → svaiyedeenan
+    19: 29,   # Akal Ustat → akalustat
+    20: 33,   # Bavan Akhri → bavanakhree
+    21: 34,   # Sidh Gosht → sidhgosht
+    22: 35,   # Oankaar → dhakhnioankar
+    23: 27,   # Barah Maha → baarehmaha (Maajh)
+    24: 13,   # Chandi Di Var → chandidivar
+    25: 11,   # Lavan (Anand Karaj) → lavaa
+    27: 38,   # GGS Paath Bhog (Ragmala) → raagmala
+    28: 46,   # Raamkali Sad → sadd
+}
+
 
 class STTMHttpController(STTMController):
     """
@@ -194,24 +227,34 @@ class STTMHttpController(STTMController):
         return [int(r[0]) for r in rows]
 
     async def _get_bani_id(self, shabad_id: int) -> int | None:
-        """Return the Nitnem bani id this shabad belongs to, or None.
+        """Return STTM Realm's ``Banis.ID`` this shabad belongs to, or None.
 
         Only synthesized shabad ids (Dasam Granth, Ardaas — no upstream
         ``sttm_id``) are resolved. SGGS shabads display via shabad-mode even
         when they're part of a bani — we don't want Japji / Sukhmani kirtan
         to silently switch STTM into Sundar Gutka mode.
+
+        STTM Desktop's Realm DB uses different ``Banis.ID`` values than
+        shabados/database, so we translate via ``_SQLITE_TO_REALM_BANI``.
+        Banis absent from STTM's Realm (Asa Ki Var, Alahnia, Mundavnni)
+        return None — caller will fall through to shabad-mode.
         """
         from src.matcher.offline_search import SYNTHETIC_ID_OFFSET
         if shabad_id < SYNTHETIC_ID_OFFSET:
             return None
         if shabad_id in self._bani_id_cache:
             return self._bani_id_cache[shabad_id]
-        bani_id = await asyncio.to_thread(self._query_bani_id, shabad_id)
-        self._bani_id_cache[shabad_id] = bani_id
-        return bani_id
+        sqlite_bani_id = await asyncio.to_thread(self._query_bani_id, shabad_id)
+        realm_bani_id = (
+            _SQLITE_TO_REALM_BANI.get(sqlite_bani_id)
+            if sqlite_bani_id is not None
+            else None
+        )
+        self._bani_id_cache[shabad_id] = realm_bani_id
+        return realm_bani_id
 
     def _query_bani_id(self, shabad_id: int) -> int | None:
-        """Pick the Nitnem bani that covers the most lines of this shabad."""
+        """Pick the Nitnem bani (shabados/database id) covering the most lines of this shabad."""
         self._ensure_db()
         from src.matcher.offline_search import SYNTHETIC_ID_OFFSET
 
