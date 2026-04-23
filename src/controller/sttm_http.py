@@ -1,11 +1,22 @@
-"""Control STTM Desktop via HTTP POST to its Express server."""
+"""Control STTM Desktop via HTTP POST to its Express server.
+
+**No external APIs.** Verse IDs needed for the STTM controller payload are
+resolved from the local ShabadOS SQLite DB (`database.sqlite`) — the same
+schema STTM Desktop itself uses, so ``lines.order_id`` doubles as the
+``verseId`` STTM expects. Previously this module called BaniDB over HTTP;
+that path is removed.
+"""
+
+import asyncio
+import sqlite3
+from pathlib import Path
 
 import httpx
 
 from src.config import config
 from src.controller.base import STTMController
 
-_BANIDB_API_BASE = "https://api.banidb.com/v2"
+_PROJECT_ROOT = Path(__file__).parent.parent.parent
 
 
 class STTMHttpController(STTMController):
@@ -14,16 +25,20 @@ class STTMHttpController(STTMController):
 
     STTM Desktop runs Express.js on one of several known ports.
     It exposes POST /api/bani-control which sends data to the Electron main window.
+
+    Verse lookups hit the local SQLite DB — no external API calls.
     """
 
     def __init__(self):
         self.base_url: str | None = None
         self._client = httpx.AsyncClient(timeout=config.sttm.connect_timeout)
-        self._banidb = httpx.AsyncClient(base_url=_BANIDB_API_BASE, timeout=8.0)
         self._active_shabad_id: int | None = None
+        self._active_bani_id: int | None = None
         self._active_line_idx: int = 0
         self._first_verse_cache: dict[int, int] = {}
         self._verse_ids_cache: dict[int, list[int]] = {}
+        self._bani_id_cache: dict[int, int | None] = {}
+        self._db: sqlite3.Connection | None = None
 
     async def connect(self) -> bool:
         """Discover STTM's port and verify connectivity."""
@@ -49,9 +64,30 @@ class STTMHttpController(STTMController):
         return False
 
     async def display_shabad(self, shabad_id: int) -> bool:
-        """Display a shabad by its ID."""
+        """Display a shabad by its ID.
+
+        For shabads that have no upstream ``sttm_id`` (Dasam Granth, Ardaas —
+        our ``shabad_id`` is synthesized above ``SYNTHETIC_ID_OFFSET``), STTM
+        Desktop's shabad-mode Realm DB can't resolve them. If any of the
+        shabad's lines belongs to a Nitnem bani (``bani_lines``), switch STTM
+        to Sundar Gutka bani-mode instead.
+        """
         verse_ids = await self._get_verse_ids(shabad_id)
         first_verse_id = verse_ids[0] if verse_ids else await self._get_first_verse_id(shabad_id)
+        bani_id = await self._get_bani_id(shabad_id)
+
+        if bani_id is not None:
+            ok = await self._send_control({
+                "type": "bani",
+                "baniId": bani_id,
+                "verseId": first_verse_id,
+            })
+            if ok:
+                self._active_shabad_id = shabad_id
+                self._active_bani_id = bani_id
+                self._active_line_idx = 0
+            return ok
+
         ok = await self._send_control({
             "type": "shabad",
             "shabadId": shabad_id,
@@ -64,11 +100,12 @@ class STTMHttpController(STTMController):
         })
         if ok:
             self._active_shabad_id = shabad_id
+            self._active_bani_id = None
             self._active_line_idx = 0
         return ok
 
     async def navigate_line(self, direction: str = "next") -> bool:
-        """Move line by re-sending shabad payload with the target verseId."""
+        """Move line by re-sending the active payload with the target verseId."""
         if self._active_shabad_id is None:
             return False
 
@@ -82,64 +119,123 @@ class STTMHttpController(STTMController):
             next_idx = min(len(verse_ids) - 1, self._active_line_idx + 1)
 
         verse_id = verse_ids[next_idx]
-        ok = await self._send_control({
-            "type": "shabad",
-            "shabadId": self._active_shabad_id,
-            "id": self._active_shabad_id,
-            "verseId": verse_id,
-            "lineCount": next_idx + 1,
-            "highlight": verse_id,
-            "homeId": verse_ids[0],
-        })
+
+        if self._active_bani_id is not None:
+            payload = {
+                "type": "bani",
+                "baniId": self._active_bani_id,
+                "verseId": verse_id,
+            }
+        else:
+            payload = {
+                "type": "shabad",
+                "shabadId": self._active_shabad_id,
+                "id": self._active_shabad_id,
+                "verseId": verse_id,
+                "lineCount": next_idx + 1,
+                "highlight": verse_id,
+                "homeId": verse_ids[0],
+            }
+
+        ok = await self._send_control(payload)
         if ok:
             self._active_line_idx = next_idx
         return ok
 
     async def disconnect(self):
-        """Close the HTTP client."""
+        """Close the HTTP client + local DB connection."""
         await self._client.aclose()
-        await self._banidb.aclose()
+        if self._db is not None:
+            self._db.close()
+            self._db = None
 
     async def _get_first_verse_id(self, shabad_id: int) -> int:
-        """Resolve and cache the first verseId for a shabad (needed by STTM controller payload)."""
+        """Return the first line's `order_id` for a shabad (STTM controller verseId)."""
         cached = self._first_verse_cache.get(shabad_id)
         if cached is not None:
             return cached
-        try:
-            resp = await self._banidb.get(f"/shabads/{shabad_id}")
-            resp.raise_for_status()
-            data = resp.json()
-            verses = data.get("verses", [])
-            if verses:
-                verse_id = int(verses[0].get("verseId", 1))
-                self._first_verse_cache[shabad_id] = verse_id
-                return verse_id
-        except Exception as e:
-            print(f"[STTM HTTP] Could not resolve verseId for shabad {shabad_id}: {e}")
-        return 1
+        verse_ids = await self._get_verse_ids(shabad_id)
+        return verse_ids[0] if verse_ids else 1
 
     async def _get_verse_ids(self, shabad_id: int) -> list[int]:
-        """Resolve and cache verseId list for line navigation."""
+        """Return all line `order_id`s for a shabad in display order.
+
+        `lines.order_id` is unique across the whole DB and is what STTM Desktop
+        uses as `verseId` in its controller payload (same ShabadOS schema).
+        For Dasam/other non-SGGS shabads, our `shabad_id` is synthesized as
+        `shabads.order_id + SYNTHETIC_ID_OFFSET`; a single `COALESCE` in the
+        query handles both real and synthetic ids.
+        """
         cached = self._verse_ids_cache.get(shabad_id)
         if cached is not None:
             return cached
-        try:
-            resp = await self._banidb.get(f"/shabads/{shabad_id}")
-            resp.raise_for_status()
-            data = resp.json()
-            verse_ids = [
-                int(v.get("verseId", 0))
-                for v in data.get("verses", [])
-                if int(v.get("verseId", 0)) > 0
-            ]
-            if verse_ids:
-                self._verse_ids_cache[shabad_id] = verse_ids
-                self._first_verse_cache[shabad_id] = verse_ids[0]
-                return verse_ids
-        except Exception as e:
-            print(f"[STTM HTTP] Could not resolve verse list for shabad {shabad_id}: {e}")
-        fallback = self._first_verse_cache.get(shabad_id)
-        return [fallback] if fallback else []
+
+        verse_ids = await asyncio.to_thread(self._query_verse_ids, shabad_id)
+        if verse_ids:
+            self._verse_ids_cache[shabad_id] = verse_ids
+            self._first_verse_cache[shabad_id] = verse_ids[0]
+        return verse_ids
+
+    def _query_verse_ids(self, shabad_id: int) -> list[int]:
+        """Sync SQLite query — run via asyncio.to_thread from async callers."""
+        self._ensure_db()
+        from src.matcher.offline_search import SYNTHETIC_ID_OFFSET
+
+        rows = self._db.execute(
+            f"""
+            SELECT l.order_id
+            FROM lines l
+            JOIN shabads s ON l.shabad_id = s.id
+            WHERE COALESCE(s.sttm_id, s.order_id + {SYNTHETIC_ID_OFFSET}) = ?
+            ORDER BY l.order_id
+            """,
+            (shabad_id,),
+        ).fetchall()
+        return [int(r[0]) for r in rows]
+
+    async def _get_bani_id(self, shabad_id: int) -> int | None:
+        """Return the Nitnem bani id this shabad belongs to, or None.
+
+        Only synthesized shabad ids (Dasam Granth, Ardaas — no upstream
+        ``sttm_id``) are resolved. SGGS shabads display via shabad-mode even
+        when they're part of a bani — we don't want Japji / Sukhmani kirtan
+        to silently switch STTM into Sundar Gutka mode.
+        """
+        from src.matcher.offline_search import SYNTHETIC_ID_OFFSET
+        if shabad_id < SYNTHETIC_ID_OFFSET:
+            return None
+        if shabad_id in self._bani_id_cache:
+            return self._bani_id_cache[shabad_id]
+        bani_id = await asyncio.to_thread(self._query_bani_id, shabad_id)
+        self._bani_id_cache[shabad_id] = bani_id
+        return bani_id
+
+    def _query_bani_id(self, shabad_id: int) -> int | None:
+        """Pick the Nitnem bani that covers the most lines of this shabad."""
+        self._ensure_db()
+        from src.matcher.offline_search import SYNTHETIC_ID_OFFSET
+
+        row = self._db.execute(
+            f"""
+            SELECT bl.bani_id
+            FROM lines l
+            JOIN shabads s ON l.shabad_id = s.id
+            JOIN bani_lines bl ON bl.line_id = l.id
+            WHERE COALESCE(s.sttm_id, s.order_id + {SYNTHETIC_ID_OFFSET}) = ?
+            GROUP BY bl.bani_id
+            ORDER BY COUNT(*) DESC, bl.bani_id
+            LIMIT 1
+            """,
+            (shabad_id,),
+        ).fetchone()
+        return int(row[0]) if row else None
+
+    def _ensure_db(self) -> None:
+        """Open the shared SQLite connection lazily, once per controller."""
+        from src.matcher.offline_search import _resolve_db_path
+        if self._db is None:
+            self._db = sqlite3.connect(str(_resolve_db_path()), check_same_thread=False)
+            self._db.execute("PRAGMA journal_mode=WAL")
 
     async def _send_control(self, data: dict) -> bool:
         """
