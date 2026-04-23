@@ -27,6 +27,8 @@ DECODER_TOGGLE_KEYS = (
     "single_temperature",
     "allow_repetition",
     "independent_windows",
+    "cap_decode_length",
+    "skip_slow_windows",
 )
 
 

@@ -10,5 +10,12 @@ build/
 cache.dat
 *.log
 data/vosk-model-*/
+data/surt-small-v3-ct2/
 .DS_Store
 *.spec
+
+# Auto-downloaded from HF dataset on first run
+database.sqlite
+database.sqlite-shm
+database.sqlite-wal
+dataset-metadata.json

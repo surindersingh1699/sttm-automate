@@ -8,10 +8,8 @@ from src.config import config
 from src.audio.capture import AudioCapture
 from src.audio.buffer import AudioRingBuffer
 from src.transcription.engine import TranscriptionEngine
-from src.transcription.google_engine import GoogleTranscriptionEngine
-from src.transcription.vosk_engine import VoskTranscriptionEngine
 from src.transcription.processor import TranscriptionProcessor
-from src.transcription.transliterate import extract_first_letters, devanagari_to_gurmukhi
+from src.transcription.transliterate import extract_first_letters
 from src.matcher.search import ShabadCandidate
 from src.matcher.offline_search import OfflineShabadSearcher
 from src.matcher.scorer import ConfidenceScorer
@@ -45,7 +43,7 @@ class PipelineOrchestrator:
             audio_device = AudioCapture.find_best_device()
         self.audio = AudioCapture(device=audio_device)
         self.buffer = AudioRingBuffer()
-        self.transcriber = self._create_transcription_engine()
+        self.transcriber = TranscriptionEngine()
         self.processor = TranscriptionProcessor()
         self.searcher = OfflineShabadSearcher()
         self.scorer = ConfidenceScorer()
@@ -119,67 +117,6 @@ class PipelineOrchestrator:
     def resume(self):
         """Resume automatic processing."""
         self.paused = False
-
-    @staticmethod
-    def _create_transcription_engine():
-        """Create the appropriate transcription engine based on config."""
-        engine_type = config.transcription.engine
-        if engine_type == "google":
-            return GoogleTranscriptionEngine(
-                credentials_path=config.transcription.google_credentials_path,
-            )
-        if engine_type == "vosk":
-            return VoskTranscriptionEngine()
-        if engine_type == "whisper_hindi":
-            return TranscriptionEngine(language_override="hi")
-        return TranscriptionEngine()
-
-    async def switch_engine(self, engine_type: str):
-        """Switch transcription engine at runtime (whisper/whisper_hindi/vosk/google)."""
-        if engine_type not in ("whisper", "whisper_hindi", "vosk", "google"):
-            return
-        old_engine = config.transcription.engine
-        old_transcriber = self.transcriber
-        config.transcription.engine = engine_type
-        was_paused = self.paused
-        self.paused = True
-        try:
-            self.transcriber = self._create_transcription_engine()
-            await asyncio.to_thread(self.transcriber.load)
-            print(f"[Pipeline] Switched to {engine_type} engine.")
-        except Exception as e:
-            print(f"[Pipeline] Failed to switch to {engine_type}: {e}")
-            # Rollback to previous engine
-            config.transcription.engine = old_engine
-            self.transcriber = old_transcriber
-            await self._broadcast({
-                "type": "engine_switch_error",
-                "engine": engine_type,
-                "error": str(e),
-            })
-            raise
-        finally:
-            self.paused = was_paused
-
-    async def switch_model_size(self, size: str):
-        """Switch Whisper model size at runtime (tiny/base/small)."""
-        if size not in ("tiny", "base", "small"):
-            return
-        if size == config.whisper.model_size and config.transcription.engine != "google":
-            return  # already using this size
-        config.whisper.model_size = size
-        # Only reload if currently using a Whisper engine
-        if config.transcription.engine in ("whisper", "whisper_hindi"):
-            was_paused = self.paused
-            self.paused = True
-            self.transcriber = self._create_transcription_engine()
-            await asyncio.to_thread(self.transcriber.load)
-            self.paused = was_paused
-        print(f"[Pipeline] Switched to Whisper '{size}' model.")
-
-    @property
-    def current_engine(self) -> str:
-        return config.transcription.engine
 
     def set_audio_source(self, source: str):
         """Switch between 'local' (server mic) and 'remote' (browser mic)."""
@@ -473,19 +410,39 @@ class PipelineOrchestrator:
 
                 # 2. Transcribe
                 import time as _time
-                _engine_label = config.transcription.engine.replace("_", " ").title()
                 _t0 = _time.monotonic()
-                print(f"  [DEBUG] Starting {_engine_label} transcription ({window_seconds:.1f}s audio)...")
+                print(f"  [DEBUG] Starting Whisper transcription ({window_seconds:.1f}s audio)...")
                 segments = await asyncio.to_thread(
                     self.transcriber.transcribe, audio_for_stt
                 )
                 _elapsed = _time.monotonic() - _t0
                 text = self.processor.process(segments)
-                print(f"  [DEBUG] {_engine_label} done in {_elapsed:.1f}s → '{text[:80]}'" if text else f"  [DEBUG] {_engine_label} done in {_elapsed:.1f}s → (empty)")
+                print(f"  [DEBUG] Whisper done in {_elapsed:.1f}s → '{text[:80]}'" if text else f"  [DEBUG] Whisper done in {_elapsed:.1f}s → (empty)")
 
-                # 2b. Hindi→Gurmukhi transliteration for Hindi-output engines
-                if config.transcription.engine in ("whisper_hindi", "vosk") and text:
-                    text = devanagari_to_gurmukhi(text)
+                # Drop windows where decode took too long (protects lock state from
+                # junk output of runaway decodes). Transparent to UI via status flag.
+                _rtf_value = _elapsed / max(window_seconds, 0.001)
+                if (
+                    config.whisper.skip_slow_windows
+                    and _rtf_value > config.whisper.skip_slow_rtf_threshold
+                ):
+                    self._prev_first_letters = ""
+                    print(
+                        f"  [SLOW-DROP] RTF={_rtf_value:.2f} > "
+                        f"{config.whisper.skip_slow_rtf_threshold:.1f} — "
+                        f"dropping window to preserve lock"
+                    )
+                    await self._broadcast({
+                        "type": "transcription",
+                        "text": "",
+                        "first_letters": "",
+                        "status": "slow_window_dropped",
+                        "transcribe_ms": int(_elapsed * 1000),
+                        "rtf": round(_rtf_value, 3),
+                        "window_seconds": round(window_seconds, 2),
+                        "pipeline_state": self.tracker.state.value,
+                    })
+                    continue
 
                 # 3. Extract first letters
                 first_letters = extract_first_letters(text)
@@ -496,8 +453,10 @@ class PipelineOrchestrator:
                     + alpha * instantaneous_lps
                 )
 
-                # 4. Broadcast transcription
-                await self._broadcast({
+                # 4. Broadcast transcription (with realtime model speed).
+                # Skip speed fields when inference short-circuited (<20ms = no real work),
+                # otherwise the UI pill reads 0 ms / 0× on silence-suppressed windows.
+                msg = {
                     "type": "transcription",
                     "text": text,
                     "first_letters": first_letters,
@@ -505,7 +464,11 @@ class PipelineOrchestrator:
                     "pipeline_state": self.tracker.state.value,
                     "listening_mode": listening_mode,
                     "window_seconds": round(window_seconds, 2),
-                })
+                }
+                if _elapsed >= 0.02:
+                    msg["transcribe_ms"] = int(_elapsed * 1000)
+                    msg["rtf"] = round(_elapsed / max(window_seconds, 0.001), 3)
+                await self._broadcast(msg)
 
                 # 6. Dispatch to state handler
                 if self.tracker.state in (

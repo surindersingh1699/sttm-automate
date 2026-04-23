@@ -23,6 +23,8 @@ let decoderToggles = {
     single_temperature: true,
     allow_repetition: true,
     independent_windows: false,
+    cap_decode_length: true,
+    skip_slow_windows: true,
 };
 const DASHBOARD_STATE_KEY = "sttm_automate_dashboard_state_v1";
 
@@ -721,6 +723,8 @@ var DECODER_TOGGLE_IDS = {
     single_temperature: "dec-single-temp",
     allow_repetition: "dec-allow-rep",
     independent_windows: "dec-indep-win",
+    cap_decode_length: "dec-cap-tokens",
+    skip_slow_windows: "dec-skip-slow",
 };
 
 function updateDecoderToggles(toggles) {

@@ -32,6 +32,8 @@
                 <label class="decoder-toggle"><input type="checkbox" id="dec-single-temp" onchange="setDecoderToggle('single_temperature', this.checked)"> Single-pass</label>
                 <label class="decoder-toggle"><input type="checkbox" id="dec-allow-rep" onchange="setDecoderToggle('allow_repetition', this.checked)"> Allow repetition</label>
                 <label class="decoder-toggle"><input type="checkbox" id="dec-indep-win" onchange="setDecoderToggle('independent_windows', this.checked)"> Independent windows</label>
+                <label class="decoder-toggle"><input type="checkbox" id="dec-cap-tokens" onchange="setDecoderToggle('cap_decode_length', this.checked)"> Cap decode length</label>
+                <label class="decoder-toggle"><input type="checkbox" id="dec-skip-slow" onchange="setDecoderToggle('skip_slow_windows', this.checked)"> Skip slow windows</label>
             </div>
             <div id="decoder-info-popover" class="info-popover" hidden>
                 <div class="info-popover-head">
@@ -51,6 +53,12 @@
 
                     <dt>Independent windows</dt>
                     <dd><em>condition_on_previous_text: false.</em> Stops Whisper from carrying the last window's text as context. Helps when a bad transcription poisons subsequent windows; slight quality loss on clean audio.</dd>
+
+                    <dt>Cap decode length</dt>
+                    <dd><em>max_new_tokens: 128.</em> Hard upper bound on tokens generated per window. Prevents the decoder from running off into long hallucination loops when "Allow repetition" is on. Safety net — keep on. <strong>On by default.</strong></dd>
+
+                    <dt>Skip slow windows</dt>
+                    <dd><em>Drop any window whose RTF > 2.0.</em> Slow decodes are usually garbled/repetitive. When tripped, the window is thrown away (no match update, no line-align, no challenger). Keeps the current lock stable instead of letting junk poison it. <strong>On by default.</strong></dd>
                 </dl>
             </div>
             <input id="controller-pin" class="control-input" type="number" inputmode="numeric" placeholder="Controller PIN">

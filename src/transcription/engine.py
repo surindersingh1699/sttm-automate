@@ -129,6 +129,9 @@ class TranscriptionEngine:
             kwargs["compression_ratio_threshold"] = 10.0
         if config.whisper.independent_windows:
             kwargs["condition_on_previous_text"] = False
+        if config.whisper.cap_decode_length:
+            # Hard cap prevents runaway decodes when repetition-rejection is relaxed.
+            kwargs["max_new_tokens"] = max(16, int(config.whisper.max_new_tokens_cap))
         if self._language:
             kwargs["language"] = self._language
 

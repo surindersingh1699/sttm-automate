@@ -33,6 +33,10 @@ class WhisperConfig(BaseModel):
     single_temperature: bool = True     # True → temperature=[0.0] (no 6× fallback-retry loop)
     allow_repetition: bool = True       # True → compression_ratio_threshold=10.0 (kirtan is really repetitive)
     independent_windows: bool = False   # True → condition_on_previous_text=False (no carryover across windows)
+    cap_decode_length: bool = True      # True → max_new_tokens=128 (safety cap; prevents runaway repetition loops)
+    max_new_tokens_cap: int = 128       # tokens cap applied when cap_decode_length=True
+    skip_slow_windows: bool = True      # True → drop transcription if RTF exceeds skip_slow_rtf_threshold
+    skip_slow_rtf_threshold: float = 2.0  # windows slower than realtime × this are discarded before matching
 
 
 class MatcherConfig(BaseModel):
@@ -89,12 +93,20 @@ class DashboardConfig(BaseModel):
     max_candidates: int = 5  # top N candidates to show
 
 
+class DatabaseConfig(BaseModel):
+    # ShabadOS SQLite DB — auto-downloaded from HF on first run if not present locally.
+    local_filename: str = "database.sqlite"  # resolved relative to project root
+    hf_dataset_id: str = "surindersinghssj/sttm-gurbani-db"
+    hf_filename: str = "database.sqlite"
+
+
 class AppConfig(BaseModel):
     audio: AudioConfig = AudioConfig()
     whisper: WhisperConfig = WhisperConfig()
     matcher: MatcherConfig = MatcherConfig()
     sttm: STTMConfig = STTMConfig()
     dashboard: DashboardConfig = DashboardConfig()
+    database: DatabaseConfig = DatabaseConfig()
 
 
 # Global config instance
