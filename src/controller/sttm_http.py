@@ -8,6 +8,7 @@ that path is removed.
 """
 
 import asyncio
+import json
 import sqlite3
 from pathlib import Path
 
@@ -17,6 +18,37 @@ from src.config import config
 from src.controller.base import STTMController
 
 _PROJECT_ROOT = Path(__file__).parent.parent.parent
+
+# Optional runtime mappings that translate our sqlite ids into the ids STTM
+# Desktop's Realm DB actually uses. Produced by
+# ``scripts/dump_realm_verses.js`` + ``scripts/build_sttm_mapping.py``.
+#
+# When these files are absent we fall back to sending raw sqlite ids, which
+# works for SGGS + other sources with matching sttm_id but drifts for Dasam.
+# When present we get exact line-highlight sync and can display Dasam shabads
+# outside nitnem banis (Gyan Prabodh, Charitropakhyan, etc.) via type:"shabad".
+_VERSE_MAP_PATH = _PROJECT_ROOT / "data" / "order_id_to_verse_id.json"
+_SHABAD_MAP_PATH = _PROJECT_ROOT / "data" / "shabad_to_realm_shabad_id.json"
+
+
+def _load_int_map(path: Path) -> dict[int, int]:
+    """Load a JSON object whose keys+values are integer-strings/ints."""
+    try:
+        raw = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[STTM HTTP] Failed to load mapping {path}: {e}")
+        return {}
+    return {int(k): int(v) for k, v in raw.items()}
+
+
+_VERSE_MAP: dict[int, int] = _load_int_map(_VERSE_MAP_PATH)
+_SHABAD_MAP: dict[int, int] = _load_int_map(_SHABAD_MAP_PATH)
+if _VERSE_MAP:
+    print(f"[STTM HTTP] Loaded verse map: {len(_VERSE_MAP)} entries")
+if _SHABAD_MAP:
+    print(f"[STTM HTTP] Loaded shabad map: {len(_SHABAD_MAP)} entries")
 
 # shabados/database `banis.id` → STTM Desktop Realm `Banis.ID`.
 # Built by matching Gurmukhi/Token across both DBs (scripts/dump_realm_banis.js).
@@ -67,6 +99,10 @@ class STTMHttpController(STTMController):
         self._client = httpx.AsyncClient(timeout=config.sttm.connect_timeout)
         self._active_shabad_id: int | None = None
         self._active_bani_id: int | None = None
+        # Realm ShabadID we actually sent to STTM (differs from self._active_shabad_id
+        # for Dasam/Ardaas where our sqlite has no sttm_id). Needed so navigate_line
+        # can keep re-sending the same id for subsequent lines of the same shabad.
+        self._active_realm_shabad_id: int | None = None
         self._active_line_idx: int = 0
         self._first_verse_cache: dict[int, int] = {}
         self._verse_ids_cache: dict[int, list[int]] = {}
@@ -99,24 +135,54 @@ class STTMHttpController(STTMController):
     async def display_shabad(self, shabad_id: int) -> bool:
         """Display a shabad by its ID.
 
-        For shabads that have no upstream ``sttm_id`` (Dasam Granth, Ardaas —
-        our ``shabad_id`` is synthesized above ``SYNTHETIC_ID_OFFSET``), STTM
-        Desktop's shabad-mode Realm DB can't resolve them. If any of the
-        shabad's lines belongs to a Nitnem bani (``bani_lines``), switch STTM
-        to Sundar Gutka bani-mode instead.
+        Routing priority:
+
+        1. **Realm shabad mapping present** — send ``type:"shabad"`` with the
+           translated Realm ``ShabadID`` + translated ``Verse.ID``. Works for
+           every shabad in STTM's Realm, including Dasam shabads with no
+           ``sttm_id`` (Gyan Prabodh, Charitropakhyan, etc.).
+        2. **Nitnem bani match** — when no shabad mapping exists but the line
+           belongs to one of the 29 Sundar Gutka banis, fall back to
+           ``type:"bani"``. Preserves the pre-mapping behaviour so the
+           controller still works without running the build script.
+        3. **Raw shabad id** — final fallback for SGGS (and anything else with
+           a real ``sttm_id``). This was the only path before the mapping
+           work; kept intact so removing the data files never breaks prod.
         """
         verse_ids = await self._get_verse_ids(shabad_id)
-        first_verse_id = verse_ids[0] if verse_ids else await self._get_first_verse_id(shabad_id)
-        bani_id = await self._get_bani_id(shabad_id)
+        first_verse_order_id = (
+            verse_ids[0] if verse_ids else await self._get_first_verse_id(shabad_id)
+        )
+        realm_verse_id = _VERSE_MAP.get(first_verse_order_id, first_verse_order_id)
+        realm_shabad_id = _SHABAD_MAP.get(shabad_id)
 
+        if realm_shabad_id is not None:
+            ok = await self._send_control({
+                "type": "shabad",
+                "shabadId": realm_shabad_id,
+                "id": realm_shabad_id,
+                "verseId": realm_verse_id,
+                "lineCount": 1,
+                "highlight": realm_verse_id,
+                "homeId": realm_verse_id,
+            })
+            if ok:
+                self._active_shabad_id = shabad_id
+                self._active_realm_shabad_id = realm_shabad_id
+                self._active_bani_id = None
+                self._active_line_idx = 0
+            return ok
+
+        bani_id = await self._get_bani_id(shabad_id)
         if bani_id is not None:
             ok = await self._send_control({
                 "type": "bani",
                 "baniId": bani_id,
-                "verseId": first_verse_id,
+                "verseId": realm_verse_id,
             })
             if ok:
                 self._active_shabad_id = shabad_id
+                self._active_realm_shabad_id = None
                 self._active_bani_id = bani_id
                 self._active_line_idx = 0
             return ok
@@ -126,19 +192,26 @@ class STTMHttpController(STTMController):
             "shabadId": shabad_id,
             # Compatibility fields observed in STTM desktop internals.
             "id": shabad_id,
-            "verseId": first_verse_id,
+            "verseId": first_verse_order_id,
             "lineCount": 1,
-            "highlight": first_verse_id,
-            "homeId": first_verse_id,
+            "highlight": first_verse_order_id,
+            "homeId": first_verse_order_id,
         })
         if ok:
             self._active_shabad_id = shabad_id
+            self._active_realm_shabad_id = None
             self._active_bani_id = None
             self._active_line_idx = 0
         return ok
 
     async def navigate_line(self, direction: str = "next") -> bool:
-        """Move line by re-sending the active payload with the target verseId."""
+        """Move line by re-sending the active payload with the target verseId.
+
+        Mirrors the routing in :meth:`display_shabad`: if the shabad was sent
+        as a Realm-mapped shabad, keep re-sending shabad-mode with the Realm
+        ``ShabadID`` and a translated ``Verse.ID``; if it was sent as a bani,
+        keep bani-mode; otherwise fall back to raw sqlite ids.
+        """
         if self._active_shabad_id is None:
             return False
 
@@ -151,22 +224,33 @@ class STTMHttpController(STTMController):
         else:
             next_idx = min(len(verse_ids) - 1, self._active_line_idx + 1)
 
-        verse_id = verse_ids[next_idx]
+        raw_verse_id = verse_ids[next_idx]
+        realm_verse_id = _VERSE_MAP.get(raw_verse_id, raw_verse_id)
 
-        if self._active_bani_id is not None:
+        if self._active_realm_shabad_id is not None:
+            payload = {
+                "type": "shabad",
+                "shabadId": self._active_realm_shabad_id,
+                "id": self._active_realm_shabad_id,
+                "verseId": realm_verse_id,
+                "lineCount": next_idx + 1,
+                "highlight": realm_verse_id,
+                "homeId": _VERSE_MAP.get(verse_ids[0], verse_ids[0]),
+            }
+        elif self._active_bani_id is not None:
             payload = {
                 "type": "bani",
                 "baniId": self._active_bani_id,
-                "verseId": verse_id,
+                "verseId": realm_verse_id,
             }
         else:
             payload = {
                 "type": "shabad",
                 "shabadId": self._active_shabad_id,
                 "id": self._active_shabad_id,
-                "verseId": verse_id,
+                "verseId": raw_verse_id,
                 "lineCount": next_idx + 1,
-                "highlight": verse_id,
+                "highlight": raw_verse_id,
                 "homeId": verse_ids[0],
             }
 
