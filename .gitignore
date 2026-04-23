@@ -19,3 +19,7 @@ database.sqlite
 database.sqlite-shm
 database.sqlite-wal
 dataset-metadata.json
+
+# Large intermediate dump from STTM Realm — only need the built mapping files
+data/realm_verses.json
+data/gurbani.sqlite
