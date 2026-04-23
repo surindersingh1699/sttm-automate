@@ -252,6 +252,7 @@ class OfflineShabadSearcher:
                 f"""
                 SELECT
                     l1.gurmukhi       AS gurmukhi_ascii,
+                    l2.gurmukhi       AS gurmukhi_ascii_next,
                     l1.first_letters  AS first_letters,
                     l1.order_id       AS order_id,
                     l1.source_page    AS source_page,
@@ -283,7 +284,32 @@ class OfflineShabadSearcher:
             if len(results) >= limit:
                 break
 
-        return [self._row_to_candidate(r, signal) for r in list(results.values())[:limit]]
+        return [
+            self._row_to_multiline_candidate(r, signal)
+            for r in list(results.values())[:limit]
+        ]
+
+    @staticmethod
+    def _row_to_multiline_candidate(row: sqlite3.Row, signal: str) -> ShabadCandidate:
+        """
+        Build a candidate that carries BOTH matched lines' text, so the scorer's
+        letter-ratio and word-overlap logic can see the full query's worth of
+        content instead of only line N. Without this, a 12-letter query scored
+        against ~6 letters of line N gets penalized even on a perfect 2-line hit.
+        """
+        ascii_line1 = row["gurmukhi_ascii"] or ""
+        ascii_line2 = row["gurmukhi_ascii_next"] or ""
+        combined_ascii = f"{ascii_line1} {ascii_line2}".strip()
+        combined_unicode = f"{_to_unicode(ascii_line1)} {_to_unicode(ascii_line2)}".strip()
+        return ShabadCandidate(
+            shabad_id=row["sttm_id"],
+            gurmukhi=combined_ascii,
+            unicode=combined_unicode,
+            english=row["english"] or "",
+            source_id="G",
+            page_no=row["source_page"],
+            retrieval_sources={signal} if signal else set(),
+        )
 
     def _fullword_search(self, transcript_text: str, limit: int, signal: str) -> list[ShabadCandidate]:
         """Phrase search: match transcript words against Unicode Gurmukhi lines.

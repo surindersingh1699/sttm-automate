@@ -65,7 +65,7 @@
                     <dd><em>Drop any window whose RTF > 2.0.</em> Slow decodes are usually garbled/repetitive. When tripped, the window is thrown away (no match update, no line-align, no challenger). Keeps the current lock stable instead of letting junk poison it. <strong>On by default.</strong></dd>
 
                     <dt>Multi-line search</dt>
-                    <dd><em>Split long queries, require consecutive line hits.</em> When one audio window holds 2+ DB lines of text (nitnem, fast kirtan), single-line prefix match fails. This splits the first-letter query in half and looks for shabads where both halves hit consecutive lines — then adds a score bonus. Fixes dense-text matching. <strong>On by default.</strong></dd>
+                    <dd><em>Split long queries, require consecutive line hits, score against both lines.</em> When one audio window holds 2+ DB lines of text (nitnem, fast kirtan), single-line prefix match fails. This splits the first-letter query in half and looks for shabads where both halves hit consecutive lines. Candidates carry both lines' text so the letter-ratio and word-overlap scoring see the full query's worth of content — otherwise a perfect 2-line match gets penalized for letters that "aren't" in line N. Plus a score bonus. <strong>On by default.</strong></dd>
                 </dl>
             </div>
             <input id="controller-pin" class="control-input" type="number" inputmode="numeric" placeholder="Controller PIN">
