@@ -6,8 +6,7 @@ from typing import Callable, Awaitable
 
 from src.config import config
 from src.audio.capture import AudioCapture
-from src.audio.buffer import AudioRingBuffer
-from src.transcription.engine import TranscriptionEngine
+from src.transcription.factory import create_engine
 from src.transcription.processor import TranscriptionProcessor
 from src.transcription.transliterate import extract_first_letters
 from src.matcher.search import ShabadCandidate
@@ -42,8 +41,7 @@ class PipelineOrchestrator:
         if audio_device is None:
             audio_device = AudioCapture.find_best_device()
         self.audio = AudioCapture(device=audio_device)
-        self.buffer = AudioRingBuffer()
-        self.transcriber = TranscriptionEngine()
+        self.transcriber = create_engine(config.whisper.engine)
         self.processor = TranscriptionProcessor()
         self.searcher = OfflineShabadSearcher()
         self.scorer = ConfidenceScorer()
@@ -69,7 +67,16 @@ class PipelineOrchestrator:
         self.running = False
         self.paused = False
         self._audio_source = "local"  # "local" or "remote"
-        self._remote_audio_queue: asyncio.Queue[np.ndarray] = asyncio.Queue()
+        # Parallel capture ↔ decode handoff.
+        # The capture task wakes every `step_duration` seconds, grabs the newest
+        # `window_duration` seconds of audio from the AudioCapture ring, and stashes
+        # it here. The decode task awaits `_window_ready`, reads whatever is most
+        # recent, and runs Whisper on it. If the decoder is busy when new snapshots
+        # arrive, they silently overwrite the slot — we always decode the freshest
+        # audio, never a backlog. This is what keeps the UI live when Whisper RTF > 1.
+        self._latest_window_data: dict | None = None
+        self._window_ready = asyncio.Event()
+        self._latest_window_lock = asyncio.Lock()
         self._weak_line_windows = 0
         self._silence_windows = 0
         self._after_break_windows = 0
@@ -81,6 +88,21 @@ class PipelineOrchestrator:
         self._prev_first_letters = ""
         self._candidate_lock_misses = 0
         self._speech_rate_lps = 0.0
+        # Recent per-window line scores while LOCKED — used to decide if the lock is
+        # "stable enough" to switch to the micro (3 s) listening window.
+        self._recent_line_scores: list[float] = []
+        # Alap / detour state: shabad_id → consecutive windows we've flagged this
+        # history shabad as a detour. When it crosses alap_commit_windows we promote
+        # to a real switch; otherwise we just display it and keep STTM on current.
+        self._alap_detour_wins: dict[int, int] = {}
+        # Fast-switch: count consecutive windows where the current shabad's line
+        # alignment has been weak. Combined with a strong challenger this short-circuits
+        # the usual 3-window challenger persistence.
+        self._current_weak_windows = 0
+        # Last listening mode actually used by the decoder — referenced by _handle_locked
+        # to suppress fast-switch counting on micro (3 s) windows, which are inherently
+        # noisier per-window and must not by themselves trigger a lock change.
+        self._last_listening_mode: str = "search"
 
     async def start(self):
         """Initialize components and start the processing loop."""
@@ -101,7 +123,25 @@ class PipelineOrchestrator:
         self.running = True
 
         print("[Pipeline] Pipeline running. Listening for kirtan...")
-        await self._run_loop()
+        # Capture ticks on wall-clock time; decode runs at Whisper's pace and always
+        # picks up the freshest snapshot. Running them concurrently is what keeps the
+        # UI live even when the decoder is slower than realtime.
+        capture_task = asyncio.create_task(self._capture_tick_task())
+        decode_task = asyncio.create_task(self._decode_loop())
+        try:
+            done, pending = await asyncio.wait(
+                {capture_task, decode_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+            for task in done | pending:
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception) as exc:
+                    if not isinstance(exc, asyncio.CancelledError):
+                        print(f"[Pipeline] Task error: {exc}")
+        finally:
+            self.running = False
 
     async def stop(self):
         """Stop the pipeline."""
@@ -127,19 +167,36 @@ class PipelineOrchestrator:
         self._audio_source = source
         if source == "remote":
             self.audio.stop()
-            # Clear any stale remote audio
-            while not self._remote_audio_queue.empty():
-                try:
-                    self._remote_audio_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
         elif source == "local":
             if not self.audio.start():
                 print("[Pipeline] No local audio hardware. Staying on remote mic.")
                 self._audio_source = "remote"
                 return
-        self.buffer.reset()
+        self.audio.reset_ring()
         print(f"[Pipeline] Audio source switched to: {source}")
+
+    async def switch_engine(self, name: str) -> tuple[bool, str | None]:
+        """Hot-swap the transcription backend. Returns (ok, error_message)."""
+        from src.transcription.factory import SUPPORTED_ENGINES
+        if name not in SUPPORTED_ENGINES:
+            return False, f"Unknown engine '{name}'."
+        if name == config.whisper.engine and self.transcriber is not None:
+            return True, None
+        prev = self.transcriber
+        try:
+            new_engine = create_engine(name)
+            await asyncio.to_thread(new_engine.load)
+        except Exception as e:
+            print(f"[Pipeline] Engine switch to '{name}' failed: {e}")
+            return False, str(e)
+        # Only commit config/swap after the new engine has loaded successfully.
+        self.transcriber = new_engine
+        config.whisper.engine = name
+        self.audio.reset_ring()
+        # Release old model memory (helps mlx/ggml releases).
+        del prev
+        print(f"[Pipeline] Transcription engine switched to: {name}")
+        return True, None
 
     def switch_audio_device(self, device_index: int | None):
         """Switch local audio input device (e.g. BlackHole vs MacBook Mic)."""
@@ -150,7 +207,7 @@ class PipelineOrchestrator:
             if not self.audio.start():
                 print(f"[Pipeline] Could not start audio device {device_index}.")
                 return False
-        self.buffer.reset()
+        self.audio.reset_ring()
         device_name = self._get_device_name(device_index)
         print(f"[Pipeline] Audio device switched to: {device_name} (index={device_index})")
         return True
@@ -168,35 +225,12 @@ class PipelineOrchestrator:
             return f"Device {device_index}"
 
     def push_remote_audio(self, audio_data: np.ndarray):
-        """Push audio from browser mic into the pipeline."""
-        try:
-            self._remote_audio_queue.put_nowait(audio_data)
-        except asyncio.QueueFull:
-            pass
+        """Push audio from browser mic into the AudioCapture ring.
 
-    async def _get_audio_chunk(self) -> np.ndarray | None:
-        """Get next audio chunk from either local mic or remote browser mic."""
-        if self._audio_source == "remote":
-            samples_needed = int(config.audio.step_duration * config.audio.samplerate)
-            collected: list[np.ndarray] = []
-            collected_samples = 0
-            while collected_samples < samples_needed:
-                if not self.running:
-                    return None
-                try:
-                    block = await asyncio.wait_for(
-                        self._remote_audio_queue.get(), timeout=10.0
-                    )
-                    collected.append(block)
-                    collected_samples += len(block)
-                except asyncio.TimeoutError:
-                    if not self.running:
-                        return None
-                    continue
-            audio = np.concatenate(collected)[:samples_needed]
-            return audio
-        else:
-            return await asyncio.to_thread(self.audio.get_chunk)
+        Remote audio shares the same ring as the local mic — the decode path
+        never has to branch on source, and old samples roll off naturally.
+        """
+        self.audio.push_external(audio_data)
 
     async def manual_select(self, shabad_id: int):
         """Manually select a shabad (override from dashboard)."""
@@ -236,11 +270,40 @@ class PipelineOrchestrator:
         old_id = current.shabad_id
         self.tracker.release_lock()
         self._weak_line_windows = 0
+        self._recent_line_scores.clear()
+        self._alap_detour_wins.clear()
+        self._current_weak_windows = 0
         await self._broadcast({
             "type": "shabad_switched",
             "old_shabad_id": old_id,
             "new_shabad_id": None,
             "reason": "force_unlock",
+        })
+
+    async def flush_context(self):
+        """
+        Drop the rolling audio window and short-term pipeline memory so the
+        next transcription starts from whatever is being recited right now.
+        Keeps the current shabad lock (and its line position) intact.
+        """
+        self.audio.reset_ring()
+        self._prev_first_letters = ""
+        self._silence_autolock_candidate = None
+        self._silence_autolock_ttl = 0
+        self._weak_line_windows = 0
+        self._candidate_lock_misses = 0
+        self._after_break_windows = 0
+        self._in_vocal_break = False
+        self._silence_windows = 0
+        self._speech_rate_lps = 0.0
+        self._recent_line_scores.clear()
+        self._alap_detour_wins.clear()
+        self._current_weak_windows = 0
+        self.tracker.clear_short_term_memory()
+        print("[Pipeline] Context flushed — starting from fresh audio.")
+        await self._broadcast({
+            "type": "context_flushed",
+            "shabad_id": self.tracker.current.shabad_id if self.tracker.current else None,
         })
 
     def set_confidence_mode(self, mode: str):
@@ -354,33 +417,27 @@ class PipelineOrchestrator:
                 ],
             })
 
-    async def _run_loop(self):
-        """Main processing loop with state machine dispatch."""
-        import numpy as np
+    async def _capture_tick_task(self):
+        """Real-time capture ticker — independent of decoder speed.
 
+        Every `step_duration` seconds of wall clock, snapshot the freshest audio
+        from the AudioCapture ring, detect vocal breaks on the fresh slice, and
+        publish a window for the decoder to pick up. Runs continuously; never
+        waits on Whisper. This is what keeps the dashboard's audio level and
+        vocal-break detection live even when decode is behind.
+        """
+        step = max(0.1, float(config.audio.step_duration))
         while self.running:
             try:
-                self._window_index += 1
-                # 1. Get audio chunk (from local mic or remote browser)
-                chunk = await self._get_audio_chunk()
-                if chunk is None:
-                    break
+                fresh_chunk = self.audio.latest_window(step)
+                window = self.audio.latest_window(config.audio.window_duration)
 
-                print(f"  [DEBUG] Got audio chunk: {len(chunk)} samples, max={float(np.max(np.abs(chunk))):.4f}")
-
-                # Apply overlap buffer
-                window = self.buffer.process(chunk)
-
-                # Detect vocals from fresh chunk (not the long rolling window),
-                # so real breaks are detected quickly.
-                chunk_rms = float(np.sqrt(np.mean(chunk**2)))
-                has_vocals = bool(self.transcriber.has_vocal_content(chunk))
-                print(f"  [DEBUG] RMS={chunk_rms:.4f}, has_vocals={has_vocals}")
+                chunk_rms = float(np.sqrt(np.mean(fresh_chunk**2))) if fresh_chunk.size else 0.0
+                has_vocals = bool(self.transcriber.has_vocal_content(fresh_chunk))
                 self._update_vocal_break_state(has_vocals)
 
-                # Adaptive listening window: after a vocal break use short start window,
-                # while locked use medium window, otherwise use full search window.
                 audio_for_stt, listening_mode, window_seconds = self._select_transcription_audio(window)
+
                 await self._broadcast({
                     "type": "audio_level",
                     "rms": round(chunk_rms, 4),
@@ -389,6 +446,48 @@ class PipelineOrchestrator:
                     "listening_mode": listening_mode,
                     "window_seconds": round(window_seconds, 2),
                 })
+
+                async with self._latest_window_lock:
+                    self._latest_window_data = {
+                        "audio": audio_for_stt,
+                        "listening_mode": listening_mode,
+                        "window_seconds": window_seconds,
+                        "chunk_rms": chunk_rms,
+                        "has_vocals": has_vocals,
+                    }
+                    self._window_ready.set()
+            except Exception as e:
+                print(f"[Pipeline] Capture tick error: {e}")
+
+            await asyncio.sleep(step)
+
+    async def _decode_loop(self):
+        """Consume the freshest captured window, transcribe, and match.
+
+        Blocks on Whisper but never on capture. When decode takes longer than
+        `step_duration`, the capture task has already overwritten the window slot
+        with newer audio — we pick up that newer snapshot on the next iteration
+        and skip the intermediate ones. This prevents backlog accumulation.
+        """
+        import time as _time
+
+        while self.running:
+            try:
+                await self._window_ready.wait()
+                async with self._latest_window_lock:
+                    window_data = self._latest_window_data
+                    self._latest_window_data = None
+                    self._window_ready.clear()
+                if window_data is None:
+                    continue
+
+                self._window_index += 1
+                audio_for_stt = window_data["audio"]
+                listening_mode = window_data["listening_mode"]
+                self._last_listening_mode = listening_mode
+                window_seconds = window_data["window_seconds"]
+                chunk_rms = window_data["chunk_rms"]
+                has_vocals = window_data["has_vocals"]
 
                 if self.paused:
                     await self._broadcast({"type": "paused"})
@@ -409,7 +508,6 @@ class PipelineOrchestrator:
                     continue
 
                 # 2. Transcribe
-                import time as _time
                 _t0 = _time.monotonic()
                 print(f"  [DEBUG] Starting Whisper transcription ({window_seconds:.1f}s audio)...")
                 segments = await asyncio.to_thread(
@@ -659,39 +757,13 @@ class PipelineOrchestrator:
         elif current.current_line < 0:
             current.current_line = 0
 
-        combined_variants: list[tuple[str, str]] = []
-        if prev_first_letters:
-            candidate_combined = [
-                ("prev_current", f"{prev_first_letters}{first_letters}"),
-                ("current_prev", f"{first_letters}{prev_first_letters}"),
-            ]
-            # De-duplicate equivalent stitched strings while preserving order.
-            seen_combined: set[str] = set()
-            for label, letters in candidate_combined:
-                if letters and letters != first_letters and letters not in seen_combined:
-                    combined_variants.append((label, letters))
-                    seen_combined.add(letters)
-
-        # Pair-scoring mirrors Strategy 5's multi-line search on the verse side:
-        # when one audio window holds 2+ verses' worth of letters (dense nitnem),
-        # scoring against a single verse's first-letters ratios to ~0.5 and
-        # triggers weak-line recovery. So at each verse i we also try the stitched
-        # first-letters of (verse[i], verse[i+1]) and pick the best of all variants.
-        # Gated independently so it can be disabled without affecting search.
-        pair_align_enabled = (
-            config.matcher.multi_line_locked_align
-            and len(first_letters) >= config.matcher.multi_line_locked_min_query_length
-        )
-
-        # Score against each line using current-only baseline and stitched alternatives.
+        # First pass: fresh window only. This is the happy path — when the lock is
+        # confident, scoring the fresh 3 s alone gives us the next line immediately
+        # and avoids carrying the previous window's letters forward (which tends to
+        # keep the pointer stuck on the previous line during fast recitation).
         current_scores: list[float] = []
-        combined_scores: list[float] = []
-        combined_labels: list[str] = []
         best_current_idx = 0
         best_current_score = 0.0
-        best_combined_idx = 0
-        best_combined_score = 0.0
-        best_combined_label = "current"
         for i, verse in enumerate(current.verses):
             raw_current = self.scorer.score_line(first_letters, verse.first_letters)
             current_score = self._apply_progression_bias(i, current.current_line, raw_current)
@@ -700,52 +772,99 @@ class PipelineOrchestrator:
                 best_current_score = current_score
                 best_current_idx = i
 
-            line_best_combined = current_score
-            line_best_label = "current"
-            for label, query_letters in combined_variants:
-                raw_score = self.scorer.score_line(query_letters, verse.first_letters)
-                candidate_score = self._apply_progression_bias(i, current.current_line, raw_score)
-                if candidate_score > line_best_combined:
-                    line_best_combined = candidate_score
-                    line_best_label = label
+        line_scores = current_scores
+        best_line_idx = best_current_idx
+        best_line_score = best_current_score
+        best_line_variant = "current"
 
-            if pair_align_enabled and i + 1 < len(current.verses):
-                # Pair starting at i: [verse[i] + verse[i+1]]. Target line = i
-                # (the start of the multi-verse window).
-                paired_letters = f"{verse.first_letters}{current.verses[i + 1].first_letters}"
-                raw_pair = self.scorer.score_line(first_letters, paired_letters)
-                pair_score = self._apply_progression_bias(i, current.current_line, raw_pair)
-                if pair_score > line_best_combined:
-                    line_best_combined = pair_score
-                    line_best_label = "pair_i"
-                # Also try stitched query against the same pair — catches a window
-                # that captures end-of-i-1 + all-of-i + start-of-i+1 territory.
+        # Fallback pass: only if the fresh window wasn't convincing on its own,
+        # pay the cost of scoring stitched windows + consecutive-verse spans.
+        need_fallback_scoring = best_current_score < config.matcher.suggest_threshold
+        if need_fallback_scoring:
+            combined_variants: list[tuple[str, str]] = []
+            if prev_first_letters:
+                candidate_combined = [
+                    ("prev_current", f"{prev_first_letters}{first_letters}"),
+                    ("current_prev", f"{first_letters}{prev_first_letters}"),
+                ]
+                seen_combined: set[str] = set()
+                for label, letters in candidate_combined:
+                    if letters and letters != first_letters and letters not in seen_combined:
+                        combined_variants.append((label, letters))
+                        seen_combined.add(letters)
+
+            # Pair-scoring handles dense windows (one audio chunk holds 2+ verses).
+            pair_align_enabled = (
+                config.matcher.multi_line_locked_align
+                and len(first_letters) >= config.matcher.multi_line_locked_min_query_length
+            )
+            # Triple-span alignment fires above the trinary query-length threshold
+            # (Fix 3). Same shape as pair alignment but stitches verse[i]+[i+1]+[i+2].
+            triple_align_enabled = (
+                config.matcher.multi_line_locked_align
+                and len(first_letters) >= config.matcher.multi_line_locked_trinary_min_query_length
+            )
+
+            combined_scores: list[float] = []
+            combined_labels: list[str] = []
+            best_combined_idx = 0
+            best_combined_score = 0.0
+            best_combined_label = "current"
+            for i, verse in enumerate(current.verses):
+                line_best_combined = current_scores[i]
+                line_best_label = "current"
                 for label, query_letters in combined_variants:
-                    raw_stitch = self.scorer.score_line(query_letters, paired_letters)
-                    stitch_score = self._apply_progression_bias(i, current.current_line, raw_stitch)
-                    if stitch_score > line_best_combined:
-                        line_best_combined = stitch_score
-                        line_best_label = f"pair_i+{label}"
+                    raw_score = self.scorer.score_line(query_letters, verse.first_letters)
+                    candidate_score = self._apply_progression_bias(i, current.current_line, raw_score)
+                    if candidate_score > line_best_combined:
+                        line_best_combined = candidate_score
+                        line_best_label = label
 
-            combined_scores.append(line_best_combined)
-            combined_labels.append(line_best_label)
-            if line_best_combined > best_combined_score:
-                best_combined_score = line_best_combined
-                best_combined_idx = i
-                best_combined_label = line_best_label
+                if pair_align_enabled and i + 1 < len(current.verses):
+                    paired_letters = f"{verse.first_letters}{current.verses[i + 1].first_letters}"
+                    raw_pair = self.scorer.score_line(first_letters, paired_letters)
+                    pair_score = self._apply_progression_bias(i, current.current_line, raw_pair)
+                    if pair_score > line_best_combined:
+                        line_best_combined = pair_score
+                        line_best_label = "pair_i"
+                    for label, query_letters in combined_variants:
+                        raw_stitch = self.scorer.score_line(query_letters, paired_letters)
+                        stitch_score = self._apply_progression_bias(i, current.current_line, raw_stitch)
+                        if stitch_score > line_best_combined:
+                            line_best_combined = stitch_score
+                            line_best_label = f"pair_i+{label}"
 
-        # Only pick stitched result when it beats the single-window baseline.
-        use_combined = best_combined_label != "current" and best_combined_score > best_current_score
-        if use_combined:
-            line_scores = combined_scores
-            best_line_idx = best_combined_idx
-            best_line_score = best_combined_score
-            best_line_variant = best_combined_label
-        else:
-            line_scores = current_scores
-            best_line_idx = best_current_idx
-            best_line_score = best_current_score
-            best_line_variant = "current"
+                if triple_align_enabled and i + 2 < len(current.verses):
+                    triple_letters = (
+                        f"{verse.first_letters}"
+                        f"{current.verses[i + 1].first_letters}"
+                        f"{current.verses[i + 2].first_letters}"
+                    )
+                    raw_triple = self.scorer.score_line(first_letters, triple_letters)
+                    triple_score = self._apply_progression_bias(i, current.current_line, raw_triple)
+                    if triple_score > line_best_combined:
+                        line_best_combined = triple_score
+                        line_best_label = "triple_i"
+                    for label, query_letters in combined_variants:
+                        raw_stitch3 = self.scorer.score_line(query_letters, triple_letters)
+                        stitch3_score = self._apply_progression_bias(i, current.current_line, raw_stitch3)
+                        if stitch3_score > line_best_combined:
+                            line_best_combined = stitch3_score
+                            line_best_label = f"triple_i+{label}"
+
+                combined_scores.append(line_best_combined)
+                combined_labels.append(line_best_label)
+                if line_best_combined > best_combined_score:
+                    best_combined_score = line_best_combined
+                    best_combined_idx = i
+                    best_combined_label = line_best_label
+
+            use_combined = best_combined_label != "current" and best_combined_score > best_current_score
+            if use_combined:
+                line_scores = combined_scores
+                best_line_idx = best_combined_idx
+                best_line_score = best_combined_score
+                best_line_variant = best_combined_label
 
         # Fallback: follow nearby lines at lower confidence to avoid getting stuck.
         # This keeps movement local and avoids large random jumps.
@@ -761,6 +880,60 @@ class PipelineOrchestrator:
                 local_best_score = line_scores[idx]
                 local_best_idx = idx
 
+        # Shadow match against recently-sung shabads (sticky set) to detect alap —
+        # a brief detour to another shabad the ragi already sang. We flag it on the
+        # dashboard but do NOT move STTM unless the detour persists past the commit
+        # threshold (at which point it's a real shabad switch).
+        detour_match = self._score_sticky_set(first_letters)
+        is_detour = False
+        on_micro_window_flag = self._last_listening_mode == "locked_micro"
+        if (
+            detour_match
+            and detour_match["score"] >= config.matcher.alap_detour_min_score
+            and detour_match["score"] > best_line_score + 0.05
+        ):
+            is_detour = True
+            shabad_id = detour_match["shabad_id"]
+            # Show the detour on the dashboard regardless of window size, but only
+            # accumulate toward the auto-commit on non-micro windows. 3 s of audio
+            # is too little evidence on its own to take STTM off the current shabad.
+            if not on_micro_window_flag:
+                self._alap_detour_wins[shabad_id] = (
+                    self._alap_detour_wins.get(shabad_id, 0) + 1
+                )
+                for sid in list(self._alap_detour_wins):
+                    if sid != shabad_id:
+                        self._alap_detour_wins[sid] = max(0, self._alap_detour_wins[sid] - 1)
+                        if self._alap_detour_wins[sid] == 0:
+                            self._alap_detour_wins.pop(sid, None)
+            await self._broadcast({
+                "type": "alap_detour",
+                "shabad_id": shabad_id,
+                "line_index": detour_match["line_idx"],
+                "line_unicode": detour_match["unicode"],
+                "line_english": detour_match["english"],
+                "score": round(detour_match["score"], 3),
+                "wins": self._alap_detour_wins.get(shabad_id, 0),
+                "commit_at": config.matcher.alap_commit_windows,
+                "current_shabad_id": current.shabad_id,
+                "current_line_score": round(best_line_score, 3),
+                "listening_mode": self._last_listening_mode,
+            })
+            if self._alap_detour_wins.get(shabad_id, 0) >= config.matcher.alap_commit_windows:
+                print(
+                    f"  [ALAP → SWITCH] Sustained detour to shabad {shabad_id} "
+                    f"({self._alap_detour_wins[shabad_id]} windows) — committing switch"
+                )
+                self._alap_detour_wins.clear()
+                await self._commit_sticky_switch(detour_match, current.shabad_id)
+                return
+        else:
+            # Decay so a brief spurious detour window doesn't accumulate across alaps.
+            for sid in list(self._alap_detour_wins):
+                self._alap_detour_wins[sid] = max(0, self._alap_detour_wins[sid] - 1)
+                if self._alap_detour_wins[sid] == 0:
+                    self._alap_detour_wins.pop(sid, None)
+
         # Broadcast line alignment
         best_verse = current.verses[best_line_idx]
         await self._broadcast({
@@ -771,10 +944,33 @@ class PipelineOrchestrator:
             "line_english": best_verse.english,
             "match_variant": best_line_variant,
             "pipeline_state": "locked",
+            "is_detour": is_detour,
         })
 
+        # Track recent line scores so _is_lock_stable can decide when the micro window
+        # is safe to use. Detour windows don't represent current-shabad alignment, so
+        # they don't contribute to stability.
+        if not is_detour:
+            self._recent_line_scores.append(best_line_score)
+            if len(self._recent_line_scores) > 4:
+                self._recent_line_scores.pop(0)
+
+        # Fast-switch bookkeeping: count consecutive windows where current-shabad
+        # alignment is weak. Detour windows don't count (expected misalignment), and
+        # neither do micro-window cycles (3 s is noisier per-window — a single dip is
+        # normal and must not on its own motivate a switch).
+        on_micro_window = self._last_listening_mode == "locked_micro"
+        if is_detour or on_micro_window:
+            pass
+        elif best_line_score < config.matcher.fast_switch_current_weak_score:
+            self._current_weak_windows += 1
+        else:
+            self._current_weak_windows = 0
+
         # If current line matches well, or nearby line matches reasonably, update position.
-        should_update_line = (
+        # During alap we intentionally freeze the line pointer — STTM stays on the current
+        # shabad and we don't chase the detour audio.
+        should_update_line = not is_detour and (
             best_line_score >= config.matcher.suggest_threshold
             or (
                 local_best_score >= config.matcher.local_line_follow_threshold
@@ -809,7 +1005,17 @@ class PipelineOrchestrator:
         else:
             self.tracker.mark_unstable()
 
-            if best_line_score < config.matcher.weak_line_recovery_score:
+            if is_detour:
+                # During alap we expect the current shabad to score weakly — don't
+                # let that push us toward a recovery release.
+                pass
+            elif on_micro_window_flag:
+                # A single-micro-window dip is normal (3 s = few letters); don't feed
+                # it into the release counter either. If the micro window is persistently
+                # bad _is_lock_stable() will switch us back off micro, after which the
+                # regular counter can correctly detect a sustained weak alignment.
+                pass
+            elif best_line_score < config.matcher.weak_line_recovery_score:
                 self._weak_line_windows += 1
             else:
                 self._weak_line_windows = max(0, self._weak_line_windows - 1)
@@ -828,6 +1034,12 @@ class PipelineOrchestrator:
                     "reason": "weak_locked_recovery",
                 })
                 return
+
+        # Skip global challenger scan during an alap detour — the sticky-set handler
+        # already tracks the would-be switch and will commit on its own timeline. Running
+        # both races the counters and can cause premature switches on brief alaps.
+        if is_detour:
+            return
 
         # Run challenger scan every locked cycle (not only weak cycles) so wrong-lock
         # recovery can happen quickly.
@@ -907,9 +1119,19 @@ class PipelineOrchestrator:
 
         top_raw_score = float(top.get("raw_score", top["score"]))
         top_word_overlap = int(top.get("word_overlap", 0))
+        top_dense_dominant = bool(top.get("dense_dominant", False))
+        # When a challenger's score was driven by dense_coverage (substring match
+        # against its whole-shabad first-letters), raise the overlap bar — such
+        # hits are prone to spurious high scores against unrelated shabads that
+        # happen to contain similar sequences somewhere in their text.
+        required_overlap = (
+            config.matcher.dense_dominant_instant_overlap_min
+            if top_dense_dominant
+            else config.matcher.word_overlap_instant_challenger_min
+        )
         instant_switch = (
             top_raw_score >= config.matcher.instant_challenger_switch_score
-            and top_word_overlap >= config.matcher.word_overlap_instant_challenger_min
+            and top_word_overlap >= required_overlap
             and (
                 top_raw_score - current_shabad_search_score
                 >= config.matcher.instant_challenger_switch_margin
@@ -948,8 +1170,34 @@ class PipelineOrchestrator:
                 f"with score={top['score']:.2f} (current line={best_line_score:.2f})"
             )
 
+        # Fast-switch: if current-shabad alignment has been weak for several windows
+        # in a row and the challenger is *clearly* stronger, shorten the persistence
+        # requirement so the switch commits in ~6 s instead of ~9 s. All four guards
+        # matter — without them transient noise + an opportunistic top candidate will
+        # kick STTM off the correct shabad.
+        top_word_overlap_for_fast = int(top.get("word_overlap", 0))
+        fast_switch_active = (
+            self._current_weak_windows >= config.matcher.fast_switch_current_weak_windows
+            and top["action"] == "auto"
+            and top["score"] >= config.matcher.auto_threshold
+            and top_word_overlap_for_fast >= config.matcher.word_overlap_evidence_min
+            and (top["score"] - current_shabad_search_score)
+                >= max(config.matcher.challenger_margin, 0.15)
+        )
+        windows_override = (
+            config.matcher.fast_switch_challenger_windows if fast_switch_active else None
+        )
+        if fast_switch_active:
+            print(
+                f"  [FAST-SWITCH] current weak for {self._current_weak_windows} windows, "
+                f"challenger={top['shabad_id']} score={top['score']:.2f} — "
+                f"requiring only {config.matcher.fast_switch_challenger_windows} wins"
+            )
         result = self.tracker.challenge(
-            top["shabad_id"], top["score"], current_shabad_search_score
+            top["shabad_id"],
+            top["score"],
+            current_shabad_search_score,
+            windows_override=windows_override,
         )
 
         if result["action"] == "switched":
@@ -987,11 +1235,13 @@ class PipelineOrchestrator:
         current_id = self.tracker.current.shabad_id if self.tracker.current else None
         scored = []
         for candidate in candidates:
-            score = self.scorer.score(
+            detail = self.scorer.score_detailed(
                 first_letters,
                 candidate,
                 current_id,
             )
+            score = detail["score"]
+            dense_dominant = detail["dense_dominant"]
             overlap_source = candidate.unicode
             if candidate.gurmukhi and candidate.gurmukhi not in overlap_source:
                 overlap_source = f"{overlap_source} {candidate.gurmukhi}"
@@ -1008,8 +1258,30 @@ class PipelineOrchestrator:
                 # Both halves of a long query hit consecutive lines — strong signal
                 # for dense text (nitnem, fast kirtan) where one window = 2+ DB lines.
                 score += config.matcher.multi_line_score_bonus
+            if "multiline3" in retrieval_sources:
+                # All three thirds of the query hit 3 consecutive lines — even
+                # stronger evidence for very fast / dense recitation (Fix 3).
+                score += config.matcher.multi_line_trinary_score_bonus
+            if "type3_words" in retrieval_sources:
+                # Word-level IDF vote (Fix 2). Bonus scaled by distinct-word-hits —
+                # more distinct real words in the transcript hitting this shabad
+                # means stronger corroboration on top of first-letter evidence.
+                hits = candidate.word_vote_hits
+                if hits >= 4:
+                    score += config.matcher.word_vote_bonus_4plus
+                elif hits == 3:
+                    score += config.matcher.word_vote_bonus_3
+                elif hits >= 2:
+                    score += config.matcher.word_vote_bonus_2
             score = min(1.0, max(0.0, score))
             action = self.scorer.classify(score)
+            # Safety floor: a candidate retrieved ONLY by word-vote (no first-letter
+            # strategy backed it up) must clear a higher bar before it can auto-lock.
+            # Prevents a buried-words false positive from hijacking the UI when the
+            # first-letter evidence is weak.
+            if action == "auto" and retrieval_sources == ["type3_words"]:
+                if score < config.matcher.auto_threshold + 0.05:
+                    action = "suggest"
             scored.append({
                 "shabad_id": candidate.shabad_id,
                 "gurmukhi": candidate.gurmukhi,
@@ -1020,6 +1292,9 @@ class PipelineOrchestrator:
                 "word_overlap": word_overlap,
                 "retrieval_sources": retrieval_sources,
                 "action": action,
+                "word_vote_hits": candidate.word_vote_hits,
+                "word_vote_score": candidate.word_vote_score,
+                "dense_dominant": dense_dominant,
             })
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored
@@ -1088,6 +1363,79 @@ class PipelineOrchestrator:
             "score": top["score"],
         })
 
+    def _score_sticky_set(self, first_letters: str) -> dict | None:
+        """
+        Score the fresh window against each recently-sung shabad in the sticky set
+        (tracker.history, TTL-bounded). Returns the best (shabad, line, score) across
+        that set — caller decides whether it clears the alap detour threshold.
+        """
+        if not first_letters or len(first_letters) < config.matcher.min_search_letters:
+            return None
+        sticky = self.tracker.get_sticky_set(
+            ttl_seconds=config.matcher.alap_sticky_ttl_seconds,
+            max_size=config.matcher.alap_sticky_max_size,
+        )
+        if not sticky:
+            return None
+        best: dict | None = None
+        for state in sticky:
+            best_idx = 0
+            best_score = 0.0
+            for i, verse in enumerate(state.verses):
+                score = self.scorer.score_line(first_letters, verse.first_letters)
+                if score > best_score:
+                    best_score = score
+                    best_idx = i
+            if best_score <= 0:
+                continue
+            if best is None or best_score > best["score"]:
+                verse = state.verses[best_idx]
+                best = {
+                    "shabad_id": state.shabad_id,
+                    "line_idx": best_idx,
+                    "score": best_score,
+                    "unicode": verse.unicode,
+                    "english": verse.english,
+                }
+        return best
+
+    async def _commit_sticky_switch(self, detour_match: dict, previous_shabad_id: int):
+        """
+        Promote an alap detour to a real shabad switch: recall the history shabad
+        (moves current → history, brings the detour back as current), drive STTM to
+        the detour line, and broadcast the usual switch + lock events.
+        """
+        shabad_id = detour_match["shabad_id"]
+        if not self.tracker.recall_from_history(shabad_id):
+            return
+        self._weak_line_windows = 0
+        self._current_weak_windows = 0
+        self._recent_line_scores.clear()
+        current = self.tracker.current
+        target_line = detour_match["line_idx"]
+        await self.controller.display_shabad(shabad_id)
+        if current and 0 <= target_line < len(current.verses):
+            # display_shabad resets STTM to line 0 — step forward to the detour line.
+            for _ in range(target_line):
+                await self.controller.navigate_line("next")
+            current.current_line = target_line
+        verses = current.verses if current else []
+        await self._broadcast({
+            "type": "shabad_switched",
+            "new_shabad_id": shabad_id,
+            "old_shabad_id": previous_shabad_id,
+            "reason": "alap_commit",
+        })
+        await self._broadcast({
+            "type": "shabad_locked",
+            "shabad_id": shabad_id,
+            "total_lines": len(verses),
+            "verses": [
+                {"unicode": v.unicode, "english": v.english}
+                for v in verses
+            ],
+        })
+
     async def _lock_shabad_from_top(self, top: dict):
         """Display a locked shabad and cache verses for line tracking."""
         await self.controller.display_shabad(top["shabad_id"])
@@ -1131,6 +1479,18 @@ class PipelineOrchestrator:
             self._in_vocal_break = True
             print("  [BREAK START] Detected vocal pause")
 
+    def _is_lock_stable(self) -> bool:
+        """
+        True when the last few windows have aligned strongly on the current shabad.
+        Gates the shortest (micro) audio window — we only trust 3 s of audio when
+        the line pointer has been moving confidently.
+        """
+        needed = max(1, config.matcher.locked_stable_min_windows)
+        if len(self._recent_line_scores) < needed:
+            return False
+        threshold = config.matcher.locked_stable_score_threshold
+        return all(score >= threshold for score in self._recent_line_scores[-needed:])
+
     def _select_transcription_audio(self, window):
         """Choose dynamic transcription window based on current tracking context."""
         samplerate = config.audio.samplerate
@@ -1141,6 +1501,17 @@ class PipelineOrchestrator:
             if self.tracker.state == PipelineState.UNSTABLE_LOCK or self._weak_line_windows > 0:
                 seconds = config.audio.locked_recovery_window_duration
                 mode = "locked_recover"
+            elif self._is_lock_stable():
+                # Ragi typically finishes a line in ~3 s. Once the lock is confirmed
+                # stable we only need one line's worth of audio to move the pointer,
+                # which lets the UI keep up with brisk recitation.
+                seconds = config.audio.locked_micro_window_duration
+                mode = "locked_micro"
+            elif self._speech_rate_lps >= config.matcher.very_fast_speech_letters_per_second:
+                # Very fast recitation — shrink the window further so one
+                # window doesn't routinely span 3+ lines (Fix 3).
+                seconds = config.audio.locked_very_fast_window_duration
+                mode = "locked_very_fast"
             elif self._speech_rate_lps >= config.matcher.fast_speech_letters_per_second:
                 seconds = config.audio.locked_fast_window_duration
                 mode = "locked_fast"

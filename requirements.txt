@@ -1,6 +1,10 @@
 faster-whisper>=1.0.0
-vosk>=0.3.44  # offline Hindi ASR — small model (42MB), fast (RTF ~0.07)
-google-cloud-speech>=2.21.0  # optional: only needed for online/Google STT mode
+ctranslate2>=4.0.0  # used by faster-whisper + HF→CT2 int8 conversion at first load
+transformers>=4.36.0  # needed for ct2-transformers converter
+# Alternative Whisper backends — selectable at runtime from the dashboard.
+mlx-whisper>=0.4.0; sys_platform == "darwin" and platform_machine == "arm64"
+pywhispercpp>=1.2.0  # whisper.cpp bindings (cross-platform, incl. iOS build path)
+gurmukhiutils>=0.3.1  # AnvaadLipi ASCII → Unicode Gurmukhi for display
 sounddevice>=0.4.6
 numpy>=1.24.0
 banidb>=0.4.1

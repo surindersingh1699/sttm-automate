@@ -1,8 +1,13 @@
-"""Audio capture from microphone or line-in using sounddevice."""
+"""Audio capture from microphone or line-in using sounddevice.
+
+Maintains a real-time ring of the most recently captured audio (`window_duration`
+seconds wide). The sounddevice callback writes directly into the ring; readers
+can pull the freshest N seconds at any time via `latest_window()` — decode-side
+code never has to drain a queue and so cannot fall behind real time.
+"""
 
 import numpy as np
-from queue import Queue, Empty
-from threading import Event
+from threading import Event, Lock
 
 from src.config import config
 
@@ -14,20 +19,38 @@ def _get_sd():
 
 
 class AudioCapture:
-    """Captures audio from an input device and provides chunks for transcription."""
+    """Captures audio from an input device and exposes the latest N seconds on demand."""
 
     def __init__(self, device: int | None = None):
         self.samplerate = config.audio.samplerate
         self.device = device or config.audio.device
-        self._queue: Queue[np.ndarray] = Queue()
+        # Ring size == full rolling window. Reader asks for ≤ window_duration seconds.
+        self._ring_samples = int(config.audio.window_duration * self.samplerate)
+        self._ring = np.zeros(self._ring_samples, dtype=np.float32)
+        self._ring_lock = Lock()
+        self._samples_written = 0  # monotonic counter, used to detect ring warmup + gaps
         self._stream = None
         self._stop_event = Event()
-        self.available = False  # True if local audio hardware works
+        self.available = False
 
     def _callback(self, indata: np.ndarray, frames: int, time_info, status):
         if status:
             print(f"[AudioCapture] status: {status}")
-        self._queue.put(indata[:, 0].copy())  # mono: take first channel
+        block = indata[:, 0]  # mono: first channel
+        n = block.shape[0]
+        if n == 0:
+            return
+        if n >= self._ring_samples:
+            # Oversize block — keep only the tail that fits.
+            with self._ring_lock:
+                self._ring[:] = block[-self._ring_samples:]
+                self._samples_written += n
+            return
+        with self._ring_lock:
+            # Shift the ring left by n, append new samples on the right.
+            self._ring[:-n] = self._ring[n:]
+            self._ring[-n:] = block
+            self._samples_written += n
 
     def start(self):
         """Start capturing audio. Returns True if started, False if no audio hardware."""
@@ -38,6 +61,9 @@ class AudioCapture:
             self.available = False
             return False
         self._stop_event.clear()
+        with self._ring_lock:
+            self._ring.fill(0.0)
+            self._samples_written = 0
         try:
             self._stream = sd.InputStream(
                 samplerate=self.samplerate,
@@ -56,29 +82,50 @@ class AudioCapture:
             self.available = False
             return False
 
-    def get_chunk(self, timeout: float = 10.0) -> np.ndarray | None:
-        """
-        Collect audio blocks until we have step_duration worth of new audio.
-        Returns a flat float32 numpy array, or None if stopped.
-        """
-        samples_needed = int(config.audio.step_duration * self.samplerate)
-        collected: list[np.ndarray] = []
-        collected_samples = 0
+    def push_external(self, block: np.ndarray) -> None:
+        """Feed audio from an external source (e.g. browser mic) into the ring.
 
-        while collected_samples < samples_needed:
-            if self._stop_event.is_set():
-                return None
-            try:
-                block = self._queue.get(timeout=timeout)
-                collected.append(block)
-                collected_samples += len(block)
-            except Empty:
-                if self._stop_event.is_set():
-                    return None
-                continue
+        Lets remote audio share the same "latest N seconds" surface as the local
+        mic without the decode side having to branch on source.
+        """
+        if block.ndim > 1:
+            block = block[:, 0]
+        block = np.ascontiguousarray(block, dtype=np.float32)
+        n = block.shape[0]
+        if n == 0:
+            return
+        if n >= self._ring_samples:
+            with self._ring_lock:
+                self._ring[:] = block[-self._ring_samples:]
+                self._samples_written += n
+            return
+        with self._ring_lock:
+            self._ring[:-n] = self._ring[n:]
+            self._ring[-n:] = block
+            self._samples_written += n
 
-        audio = np.concatenate(collected)[:samples_needed]
-        return audio
+    def reset_ring(self) -> None:
+        """Zero the ring and samples counter (e.g. on source switch)."""
+        with self._ring_lock:
+            self._ring.fill(0.0)
+            self._samples_written = 0
+
+    def latest_window(self, seconds: float) -> np.ndarray:
+        """Return a copy of the most recent `seconds` of captured audio (wall-clock).
+
+        Older audio is silently discarded — callers can never fall behind real time.
+        Before enough audio has been captured to fill the window, the leading portion
+        of the returned buffer is zeros (matches the prior `AudioRingBuffer` warmup).
+        """
+        samples = max(1, int(seconds * self.samplerate))
+        samples = min(samples, self._ring_samples)
+        with self._ring_lock:
+            return self._ring[-samples:].copy()
+
+    def samples_written(self) -> int:
+        """Monotonic count of audio samples the sounddevice callback has processed."""
+        with self._ring_lock:
+            return self._samples_written
 
     def stop(self):
         """Stop capturing audio."""
@@ -91,10 +138,25 @@ class AudioCapture:
                 pass
             self._stream = None
         self.available = False
+        with self._ring_lock:
+            self._ring.fill(0.0)
+            self._samples_written = 0
+
+    # Virtual / loopback devices we never want to expose in the dashboard picker.
+    _VIRTUAL_DEVICE_HINTS = (
+        "blackhole",
+        "microsoft teams",
+        "teams audio",
+        "speaker audio recorder",
+        "zoom",
+        "loopback",
+        "aggregate",
+        "multi-output",
+    )
 
     @staticmethod
     def list_devices() -> list[dict]:
-        """List available audio input devices."""
+        """List physical microphone input devices (virtual/loopback hidden)."""
         try:
             sd = _get_sd()
         except OSError:
@@ -102,13 +164,17 @@ class AudioCapture:
         devices = sd.query_devices()
         inputs = []
         for i, dev in enumerate(devices):
-            if dev["max_input_channels"] > 0:
-                inputs.append({
-                    "index": i,
-                    "name": dev["name"],
-                    "channels": dev["max_input_channels"],
-                    "default": i == sd.default.device[0],
-                })
+            if dev["max_input_channels"] <= 0:
+                continue
+            name_lower = dev["name"].lower()
+            if any(hint in name_lower for hint in AudioCapture._VIRTUAL_DEVICE_HINTS):
+                continue
+            inputs.append({
+                "index": i,
+                "name": dev["name"],
+                "channels": dev["max_input_channels"],
+                "default": i == sd.default.device[0],
+            })
         return inputs
 
     @staticmethod
@@ -126,27 +192,18 @@ class AudioCapture:
 
     @staticmethod
     def find_best_device() -> int | None:
-        """
-        Auto-select the best audio input device.
-        Priority: BlackHole > Multi-Output > system default.
-        """
+        """Auto-select the system default input (ignore virtual/loopback devices)."""
         try:
             sd = _get_sd()
         except OSError:
             print("[AudioCapture] PortAudio not available. Use remote mic mode.")
             return None
-        devices = sd.query_devices()
-        for i, dev in enumerate(devices):
-            if dev["max_input_channels"] > 0:
-                name = dev["name"].lower()
-                if "blackhole" in name:
-                    print(f"[AudioCapture] Using BlackHole: {dev['name']} (device {i})")
-                    return i
-        for i, dev in enumerate(devices):
-            if dev["max_input_channels"] > 0:
-                name = dev["name"].lower()
-                if "multi-output" in name or "aggregate" in name:
-                    print(f"[AudioCapture] Using aggregate device: {dev['name']} (device {i})")
-                    return i
-        # Fall back to system default
+        default_idx = sd.default.device[0]
+        try:
+            info = sd.query_devices(default_idx)
+            if info["max_input_channels"] > 0:
+                print(f"[AudioCapture] Using default input: {info['name']} (device {default_idx})")
+                return default_idx
+        except Exception:
+            pass
         return None

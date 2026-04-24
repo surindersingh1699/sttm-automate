@@ -13,13 +13,28 @@ class AudioConfig(BaseModel):
     locked_window_duration: float = 7.0  # medium window while following a locked shabad
     locked_fast_window_duration: float = 5.0  # short locked window for fast recitation
     locked_recovery_window_duration: float = 9.0  # longer locked window when recovering from weak match
+    locked_micro_window_duration: float = 3.0  # minimal window while locked + stable (1 line ≈ 3s recitation)
+    locked_very_fast_window_duration: float = 3.5  # locked window for *very* fast recitation (Fix 3 tier)
     search_fast_window_duration: float = 8.0  # shorter search window for very fast speech
     device: int | None = None  # None = auto-detect: BlackHole > aggregate > default
 
 
 class WhisperConfig(BaseModel):
+    # Which backend powers transcription. Swappable at runtime from the dashboard.
+    # "faster-whisper" = CTranslate2 int8 (default, cross-platform CPU)
+    # "mlx-whisper"    = Apple MLX (GPU/ANE, macOS Apple Silicon only)
+    # "whisper-cpp"    = whisper.cpp via pywhispercpp (cross-platform incl. iOS)
+    engine: str = "faster-whisper"
     hf_model_id: str = "surindersinghssj/surt-small-v3"  # HuggingFace repo (auto-converted to CT2 int8 on first load)
     local_model_dir: str = "data/surt-small-v3-ct2"  # where the converted CT2 model lives
+    # MLX-specific:
+    mlx_model_dir: str = "data/surt-small-v3-mlx"  # converted MLX weights cache
+    mlx_quantize: bool = True  # 4-bit quantize on conversion to shrink + speed up
+    mlx_quantize_bits: int = 4
+    # whisper.cpp-specific: GGML file path. Auto-converted from `hf_model_id`
+    # on first load via the vendored upstream converter.
+    whisper_cpp_model_path: str = "data/surt-small-v3.ggml"
+    whisper_cpp_threads: int = 4
     device: str = "cpu"
     compute_type: str = "int8"  # int8 for CPU, float16 for GPU
     language: str = "pa"  # Punjabi
@@ -83,6 +98,45 @@ class MatcherConfig(BaseModel):
     multi_line_score_bonus: float = 0.12  # score boost when both halves hit consecutive DB lines
     multi_line_locked_align: bool = True  # True → in LOCKED state, also score against pairs of consecutive verses
     multi_line_locked_min_query_length: int = 10  # query must be ≥ this many letters to try pair alignment
+    # 3-way multi-line split (Fix 3): fires alongside 2-way when the query is long enough
+    # to plausibly span 3 consecutive DB lines (dense nitnem / very fast kirtan).
+    multi_line_trinary_min_query_length: int = 18
+    multi_line_trinary_score_bonus: float = 0.15  # slightly > 2-way bonus: 3 consecutive hits is stronger evidence
+    multi_line_locked_trinary_min_query_length: int = 16
+    # Dense-window scoring (Fix 3): score query against the shabad's full concatenated
+    # first-letters so fast/multi-line windows don't get dragged down by line-level ratio.
+    dense_coverage_weight: float = 0.7
+    # When dense_coverage beats both letter_ratio and subsequence coverage by this margin,
+    # flag it "dense_dominant" — callers require extra corroboration (higher word overlap)
+    # before promoting such candidates to instant switches or auto-locks. Keeps spurious
+    # substring matches against unrelated shabads from hijacking a good lock.
+    dense_dominant_margin: float = 0.65
+    # Extra word-overlap bar to use when the challenger signal is dense_dominant.
+    dense_dominant_instant_overlap_min: int = 3
+    # Very-fast speech window tier (Fix 3) — shrink locked window further above this LPS.
+    very_fast_speech_letters_per_second: float = 2.2
+    # Word-level retrieval (Fix 2 / type3_words). IDF-weighted voting on transcript words.
+    word_vote_enabled: bool = True
+    word_vote_stopword_df_ratio: float = 0.25   # words in >25% of shabads count as stop-words (weight ≈ 0)
+    word_vote_min_distinct_hits: int = 2        # at least this many distinct transcript words must vote
+    word_vote_min_score: float = 1.5            # summed IDF weight floor before a candidate is returned
+    word_vote_bonus_2: float = 0.05             # _score_candidates bonus for 2 distinct word hits
+    word_vote_bonus_3: float = 0.10             # … 3 hits
+    word_vote_bonus_4plus: float = 0.15         # … 4+ hits
+    word_vote_only_floor: float = 0.45          # candidates from word-vote alone must clear this first-letter score before auto-lock
+    # Alap / detour handling — during alap ragi briefly sings a tuk from another shabad.
+    # We detect it and flag it on the dashboard but don't move STTM off the current shabad.
+    alap_detour_min_score: float = 0.70  # min sticky-set score to flag a detour
+    alap_sticky_max_size: int = 3  # track up to N recently-sung shabads as alap candidates
+    alap_sticky_ttl_seconds: float = 600.0  # drop history shabads from sticky set after this
+    alap_commit_windows: int = 4  # sustained detour windows before promoting to a real shabad switch
+    # Stable-lock fast tracking — when recent line alignments are strong, trust a very short window.
+    locked_stable_score_threshold: float = 0.55  # per-window score that counts as a "stable" line hit
+    locked_stable_min_windows: int = 2  # that many stable windows in a row ⇒ use locked_micro_window
+    # Fast real-switch path — if current shabad line is weak AND challenger is strong, switch fast.
+    fast_switch_current_weak_score: float = 0.35  # treat current-line score below this as weak
+    fast_switch_current_weak_windows: int = 2  # consecutive weak windows that unlock fast switch
+    fast_switch_challenger_windows: int = 2  # challenger windows needed under fast-switch conditions
 
 
 class STTMConfig(BaseModel):

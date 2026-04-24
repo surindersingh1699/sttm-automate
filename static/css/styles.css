@@ -475,3 +475,41 @@ main {
 .scrollable::-webkit-scrollbar { width: 6px; }
 .scrollable::-webkit-scrollbar-track { background: #1a1a2e; }
 .scrollable::-webkit-scrollbar-thumb { background: #0f3460; border-radius: 3px; }
+
+/* Alap detour banner — shown while ragi briefly sings a tuk from another shabad */
+.alap-detour {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.6rem;
+    padding: 0.4rem 0.65rem;
+    margin: 0.3rem 0;
+    background: #2a1f3f;
+    border-left: 3px solid #d4a24c;
+    border-radius: 3px;
+    font-size: 0.9rem;
+    color: #f0e2c2;
+}
+
+.alap-detour-badge {
+    background: #d4a24c;
+    color: #1a1a2e;
+    font-size: 0.68rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    padding: 0.1rem 0.4rem;
+    border-radius: 2px;
+}
+
+#alap-detour-text {
+    flex: 1;
+    min-width: 0;
+    font-family: "Gurbani Akhar", serif;
+}
+
+.alap-detour-meta {
+    font-size: 0.72rem;
+    color: #a89878;
+    white-space: nowrap;
+}

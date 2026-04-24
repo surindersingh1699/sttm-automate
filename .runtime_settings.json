@@ -1,7 +1,17 @@
 {
-  "controller_pin": null,
-  "confidence_mode": "balanced",
-  "transcription_engine": "whisper_hindi",
-  "google_credentials_path": null,
-  "whisper_model_size": "tiny"
+  "controller_pin": 8698,
+  "confidence_mode": "fast",
+  "audio_device": null,
+  "decoder_toggles": {
+    "greedy_decode": false,
+    "single_temperature": true,
+    "allow_repetition": true,
+    "independent_windows": false,
+    "cap_decode_length": false,
+    "skip_slow_windows": false,
+    "multi_line_search": true,
+    "multi_line_locked_align": true
+  },
+  "sggs_only": false,
+  "engine": "mlx-whisper"
 }

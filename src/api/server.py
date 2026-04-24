@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse
 from src.config import config
 from src.controller.sttm_http import STTMHttpController
 from src.pipeline.orchestrator import PipelineOrchestrator
+from src.transcription.factory import SUPPORTED_ENGINES
 
 # Connected WebSocket clients
 clients: list[WebSocket] = []
@@ -72,6 +73,10 @@ def load_runtime_settings():
                 _apply_decoder_toggle(key, toggles[key])
         if "sggs_only" in data:
             config.database.sggs_only = bool(data["sggs_only"])
+        if "engine" in data:
+            eng = data["engine"]
+            if eng in SUPPORTED_ENGINES:
+                config.whisper.engine = eng
     except Exception as e:
         print(f"[Server] Could not load runtime settings: {e}")
 
@@ -84,6 +89,7 @@ def save_runtime_settings():
         "audio_device": config.audio.device,
         "decoder_toggles": get_decoder_toggles(),
         "sggs_only": config.database.sggs_only,
+        "engine": config.whisper.engine,
     }
     try:
         runtime_settings_path.write_text(
@@ -174,6 +180,8 @@ async def websocket_endpoint(websocket: WebSocket):
             "hypotheses": pipeline.tracker.get_hypotheses(),
             "decoder_toggles": get_decoder_toggles(),
             "sggs_only": config.database.sggs_only,
+            "engine": config.whisper.engine,
+            "engines": list(SUPPORTED_ENGINES),
         }
         if current and current.verses:
             init_state["verses"] = [
@@ -233,6 +241,9 @@ async def websocket_endpoint(websocket: WebSocket):
             elif msg_type == "force_unlock":
                 await pipeline.force_unlock()
 
+            elif msg_type == "flush_context":
+                await pipeline.flush_context()
+
             elif msg_type == "set_confidence_mode":
                 mode = msg.get("mode", "balanced")
                 if mode not in ("conservative", "balanced", "fast"):
@@ -275,6 +286,45 @@ async def websocket_endpoint(websocket: WebSocket):
                     "type": "decoder_toggles_updated",
                     "toggles": get_decoder_toggles(),
                 })
+
+            elif msg_type == "reconnect_sttm":
+                # STTM Desktop might have been started (or restarted) after the
+                # Python server; re-probe its ports on demand.
+                await broadcast({"type": "sttm_reconnecting"})
+                ok = await pipeline.controller.connect()
+                await broadcast({
+                    "type": "sttm_reconnect_result",
+                    "connected": bool(ok),
+                    "base_url": pipeline.controller.base_url,
+                })
+
+            elif msg_type == "set_engine":
+                name = msg.get("engine")
+                if name not in SUPPORTED_ENGINES:
+                    await broadcast({
+                        "type": "engine_update_failed",
+                        "engine": name,
+                        "error": f"Unknown engine '{name}'.",
+                    })
+                else:
+                    await broadcast({
+                        "type": "engine_loading",
+                        "engine": name,
+                    })
+                    ok, err = await pipeline.switch_engine(name)
+                    if ok:
+                        save_runtime_settings()
+                        await broadcast({
+                            "type": "engine_updated",
+                            "engine": config.whisper.engine,
+                        })
+                    else:
+                        await broadcast({
+                            "type": "engine_update_failed",
+                            "engine": name,
+                            "error": err or "Engine load failed.",
+                            "current_engine": config.whisper.engine,
+                        })
 
             elif msg_type == "set_sggs_only":
                 config.database.sggs_only = bool(msg.get("enabled", False))

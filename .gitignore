@@ -11,6 +11,9 @@ cache.dat
 *.log
 data/vosk-model-*/
 data/surt-small-v3-ct2/
+data/surt-small-v3-mlx/
+data/surt-small-v3.ggml
+data/_whisper_cpp_assets/
 .DS_Store
 *.spec
 

@@ -5,34 +5,27 @@ The HF repo ships HF Transformers weights; on first load we convert to CTranslat
 int8 format and cache it under `data/surt-small-v3-ct2/`.
 """
 
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from faster_whisper import WhisperModel
 
 from src.config import config
+from src.transcription.base import BaseTranscriptionEngine, TranscriptionSegment
 
 
-@dataclass
-class TranscriptionSegment:
-    start: float
-    end: float
-    text: str
-
-
-class TranscriptionEngine:
-    """Transcribes audio using local faster-whisper models."""
+class FasterWhisperEngine(BaseTranscriptionEngine):
+    """Transcribes audio using local faster-whisper (CTranslate2) models."""
 
     def __init__(self):
-        self._model: WhisperModel | None = None
+        self._model = None
         self._language: str | None = config.whisper.language or None
 
     def load(self):
         """Load (and lazily convert) the fine-tuned Whisper model."""
+        from faster_whisper import WhisperModel
         model_dir = self._ensure_ct2_model()
         print(
-            f"[Whisper] Loading '{config.whisper.hf_model_id}' from {model_dir} "
+            f"[FasterWhisper] Loading '{config.whisper.hf_model_id}' from {model_dir} "
             f"(device={config.whisper.device}, compute={config.whisper.compute_type})..."
         )
         self._model = WhisperModel(
@@ -40,7 +33,7 @@ class TranscriptionEngine:
             device=config.whisper.device,
             compute_type=config.whisper.compute_type,
         )
-        print("[Whisper] Ready.")
+        print("[FasterWhisper] Ready.")
 
     @staticmethod
     def _ensure_ct2_model() -> Path:
@@ -194,23 +187,5 @@ class TranscriptionEngine:
                 return self._model.transcribe(audio, **kwargs)
             raise
 
-    @staticmethod
-    def _normalize(audio: np.ndarray, target_peak: float = 0.7) -> np.ndarray:
-        """Normalize quiet audio for more stable Whisper input."""
-        if audio.size == 0:
-            return audio
-        peak = float(np.max(np.abs(audio)))
-        if peak < 0.005:
-            return audio
-        gain = min(target_peak / peak, 20.0)
-        if gain > 1.2:
-            return np.clip(audio * gain, -1.0, 1.0).astype(np.float32)
-        return audio
-
-    @staticmethod
-    def has_vocal_content(audio: np.ndarray, samplerate: int = 16000) -> bool:
-        """Check if audio has any content worth transcribing."""
-        if audio.size == 0:
-            return False
-        rms = float(np.sqrt(np.mean(audio**2)))
-        return rms > 0.005
+# Back-compat alias for older imports (`TranscriptionEngine`).
+TranscriptionEngine = FasterWhisperEngine
