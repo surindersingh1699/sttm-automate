@@ -26,6 +26,7 @@ class ShabadState:
     verses: list[ShabadVerse] = field(default_factory=list)
     started_at: datetime = field(default_factory=datetime.now)
     last_seen_at: datetime = field(default_factory=datetime.now)
+    line_updated_at: datetime = field(default_factory=datetime.now)
 
     def to_dict(self) -> dict:
         return {
@@ -269,8 +270,11 @@ class ShabadTracker:
         """Update current line and mark lock as stable."""
         if not self.current:
             return {"action": "error"}
+        now = datetime.now()
+        if line_index != self.current.current_line:
+            self.current.line_updated_at = now
         self.current.current_line = line_index
-        self.current.last_seen_at = datetime.now()
+        self.current.last_seen_at = now
         self.state = PipelineState.LOCKED
         self._challenger = None
         return {

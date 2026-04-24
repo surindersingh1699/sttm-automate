@@ -90,6 +90,12 @@ class MatcherConfig(BaseModel):
     candidate_lock_windows: int = 2  # confirmations required in CANDIDATE_LOCK state
     candidate_lock_miss_windows: int = 4  # weak windows tolerated before dropping pending lock
     progression_high_confidence_bypass: float = 0.88  # skip proximity penalty above this
+    # Line-advance gate — keeps the pointer on the current pangati until the ragi has
+    # actually left it. Without this, the 3 s micro window advances mid-line as soon
+    # as the next line's first syllable bleeds in. Deliberately short so we still
+    # catch brisk recitation; the override lets overwhelming evidence bypass instantly.
+    min_line_dwell_seconds: float = 1.2
+    line_advance_override_score: float = 0.82  # next-line score that bypasses the dwell gate
     fast_speech_letters_per_second: float = 1.50  # above this, favor shorter windows
     slow_speech_letters_per_second: float = 0.65  # below this, favor longer windows
     speech_rate_ema_alpha: float = 0.35  # smoothing factor for speech-rate estimate

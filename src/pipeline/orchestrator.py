@@ -1,6 +1,7 @@
 """Main pipeline: audio → transcription → matching → STTM control → dashboard."""
 
 import asyncio
+from datetime import datetime
 import numpy as np
 from typing import Callable, Awaitable
 
@@ -988,6 +989,27 @@ class PipelineOrchestrator:
             ):
                 target_idx = local_best_idx
                 target_score = local_best_score
+
+            # Dwell gate: don't advance forward if we've been on the current line for
+            # less than min_line_dwell_seconds, unless next-line evidence is
+            # overwhelming. Moving backward (delta < 0) is always allowed — if we
+            # accidentally jumped ahead we want to snap back immediately.
+            if target_idx > old_line:
+                dwell = (
+                    datetime.now() - current.line_updated_at
+                ).total_seconds()
+                if (
+                    dwell < config.matcher.min_line_dwell_seconds
+                    and target_score < config.matcher.line_advance_override_score
+                ):
+                    print(
+                        f"  [DWELL HOLD] line {old_line}→{target_idx} "
+                        f"(dwell={dwell:.2f}s < {config.matcher.min_line_dwell_seconds:.1f}s, "
+                        f"score={target_score:.2f} < {config.matcher.line_advance_override_score:.2f})"
+                    )
+                    target_idx = old_line
+                    target_score = current_scores[old_line]
+
             self.tracker.update_line(target_idx, target_score)
             # Keep STTM line in sync in both directions to avoid drift.
             delta = target_idx - old_line
@@ -1311,11 +1333,14 @@ class PipelineOrchestrator:
         delta = index - current_line
         bonus = 0.0
         if delta == 0:
-            bonus = 0.12
-        elif delta == 1:
+            # Prefer staying on the current line — kirtan lines last ~3 s and the
+            # 3 s micro window catches the next line's first syllable near the
+            # handover, which used to edge next ahead on tied scores.
             bonus = 0.16
+        elif delta == 1:
+            bonus = 0.12
         elif delta == 2:
-            bonus = 0.10
+            bonus = 0.08
         elif delta < 0:
             bonus = -0.04 * min(abs(delta), 3)
         elif delta >= 4:
