@@ -121,6 +121,11 @@ class MatcherConfig(BaseModel):
     # bonuses and the 1-line jump cap when its raw score clears this threshold.
     # Lower than progression_high_confidence_bypass so confident jumps win earlier.
     progression_confident_jump_threshold: float = 0.85
+    # Two-phase line selection: bypass progression bias entirely when the *raw*
+    # best line clears progression_confident_jump_threshold OR when raw top-1
+    # leads raw top-2 by this gap.  Catches confident jumps that neither line
+    # individually meets the absolute threshold.
+    line_jump_gap_threshold: float = 0.20
     # When True (default), the high-confidence bypass only fires for non-current lines so
     # the current-line +0.22 bonus always applies. Set False to restore the original
     # behaviour (bypass strips all bonuses including delta=0) for A/B comparison.

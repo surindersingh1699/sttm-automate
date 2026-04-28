@@ -956,13 +956,18 @@ class PipelineOrchestrator:
         # and avoids carrying the previous window's letters forward (which tends to
         # keep the pointer stuck on the previous line during fast recitation).
         current_scores: list[float] = []
+        raw_line_scores: list[float] = []  # Change 9: parallel raw track for jump bypass
         best_current_idx = 0
         best_current_score = 0.0
+        best_raw_idx = 0
+        best_raw_score_v = 0.0
+        second_best_raw_score = 0.0
         for i, verse in enumerate(current.verses):
             # Line 0 is always the raag/mahala heading ("ਮਾਝ ਮਹਲਾ ੫ ॥") — never
             # sung.  Clamp its score to 0 so it never wins the line pointer race.
             if i == 0 and config.matcher.penalize_heading_line:
                 current_scores.append(0.0)
+                raw_line_scores.append(0.0)
                 continue
             if config.matcher.word_match_line_scoring and transcript_text:
                 raw_current = self.scorer.score_line_word_overlap(transcript_text, verse.unicode)
@@ -977,16 +982,45 @@ class PipelineOrchestrator:
             # Change 6: Smith-Waterman word alignment — takes max so it only helps.
             if config.matcher.sw_line_scoring_enabled and transcript_text and _word_count >= 2:
                 raw_current = max(raw_current, self.scorer.score_line_sw(transcript_text, verse.unicode))
+            raw_line_scores.append(raw_current)
+            # Track top-2 raw scores for the gap-based bypass below
+            if raw_current > best_raw_score_v:
+                second_best_raw_score = best_raw_score_v
+                best_raw_score_v = raw_current
+                best_raw_idx = i
+            elif raw_current > second_best_raw_score:
+                second_best_raw_score = raw_current
+
             current_score = self._apply_progression_bias(i, current.current_line, raw_current, _time_pressure)
             current_scores.append(current_score)
             if current_score > best_current_score:
                 best_current_score = current_score
                 best_current_idx = i
 
-        line_scores = current_scores
-        best_line_idx = best_current_idx
-        best_line_score = best_current_score
-        best_line_variant = "current"
+        # Change 9 (extended): two-phase confident-jump bypass.  When the raw best
+        # line is clearly stronger — either by absolute threshold or by a wide gap
+        # over second-best — skip progression bias entirely and use the raw winner.
+        # This catches the case where every candidate scores below the absolute
+        # threshold but the top-1 / top-2 spread makes the choice unambiguous.
+        raw_gap = best_raw_score_v - second_best_raw_score
+        confident_jump = best_raw_idx != current.current_line and (
+            best_raw_score_v >= config.matcher.progression_confident_jump_threshold
+            or raw_gap >= config.matcher.line_jump_gap_threshold
+        )
+        if confident_jump and best_raw_idx != best_current_idx:
+            print(
+                f"  [CONFIDENT JUMP] line {current.current_line} → {best_raw_idx} "
+                f"raw={best_raw_score_v:.2f} gap={raw_gap:.2f}"
+            )
+            line_scores = raw_line_scores
+            best_line_idx = best_raw_idx
+            best_line_score = best_raw_score_v
+            best_line_variant = "confident_jump"
+        else:
+            line_scores = current_scores
+            best_line_idx = best_current_idx
+            best_line_score = best_current_score
+            best_line_variant = "current"
 
         # Fallback pass: only if the fresh window wasn't convincing on its own,
         # pay the cost of scoring stitched windows + consecutive-verse spans.
