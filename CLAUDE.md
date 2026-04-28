@@ -39,6 +39,31 @@ to keep candidate dedup working.
 
 Audio (sounddevice) → Transcription (faster-whisper) → Transliteration (Gurmukhi→first-letter codes) → Local SQLite Search → Confidence Scoring → STTM Control → Web Dashboard
 
+## Running the app
+
+Project-local virtualenv lives at `.venv/` (Python 3.11). Start the dashboard with:
+
+```bash
+source .venv/bin/activate
+uvicorn src.api.server:app --host 0.0.0.0 --port 8080 --reload
+```
+
+For a detached background launch (survives shell exit):
+
+```bash
+nohup .venv/bin/python -m uvicorn src.api.server:app --host 0.0.0.0 --port 8080 --reload > /tmp/sttm-automate.log 2>&1 &
+disown
+```
+
+Dashboard is at <http://localhost:8080>. Logs go to `/tmp/sttm-automate.log`.
+
+If `.venv/` is missing, recreate it:
+
+```bash
+/Library/Frameworks/Python.framework/Versions/3.11/bin/python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
 ## Conventions
 
 - Use `async/await` throughout the pipeline
