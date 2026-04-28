@@ -103,6 +103,33 @@ def _extract_verse_first_letters(unicode_text: str) -> str:
 
 _GURMUKHI_TOKEN = re.compile(r"[\u0A00-\u0A7F]+")
 
+# Kirtan filler words that ragis commonly prefix/suffix to a tuk but are absent
+# from the DB line.  Stripping them before FL extraction tightens the FL match
+# and prevents the extra first-letter from degrading score margin.
+_KIRTAN_FILLER = frozenset([
+    "ਵਾਹਿਗੁਰੂ", "ਵਾਹਿਗੁਰ", "ਵਾਹੁਗੁਰੂ", "ਵਾਹਗੁਰੂ",
+    "ਜੀਉ", "ਜੀਓ", "ਜੀ",
+    "ਵਾਹੁ", "ਵਾਹ",
+    "ਰਾਮ",
+    "ਸਤਿਨਾਮੁ", "ਸਤਿਨਾਮ",
+])
+
+
+def _strip_filler_words(transcript: str) -> str:
+    """Remove known kirtan filler words from the start and end of a transcript.
+
+    Only strips from the edges — interior words are kept as they may be part of
+    the actual tuk and removing them would corrupt the FL string.
+    """
+    if not transcript:
+        return transcript
+    words = transcript.split()
+    while words and words[0] in _KIRTAN_FILLER:
+        words = words[1:]
+    while words and words[-1] in _KIRTAN_FILLER:
+        words = words[:-1]
+    return " ".join(words)
+
 
 def _tokenize_gurmukhi_words(text: str) -> list[str]:
     """Extract Gurmukhi word tokens (≥2 chars) from Unicode text.
@@ -132,6 +159,10 @@ class OfflineShabadSearcher:
         self._doc_freq: dict[str, int] | None = None
         self._total_shabads: int = 0
         self._shabad_first_letters: dict[int, str] | None = None
+        # Char 4-gram Unicode index (Strategy 9): 4-gram → list[line_rowid]
+        self._ngram4_index: dict[str, list[int]] | None = None
+        # line_rowid → (sttm_id, unicode_text, first_letters_ascii, frozenset of 4-grams)
+        self._ngram4_line_data: dict[int, tuple[int, str, str, frozenset]] | None = None
 
     def _ensure_word_index(self) -> None:
         """Build word→shabad and shabad→first-letters indices on first use.
@@ -193,6 +224,135 @@ class OfflineShabadSearcher:
         assert self._shabad_first_letters is not None  # set by _ensure_word_index
         return self._shabad_first_letters.get(shabad_id)
 
+    def _ensure_ngram_index(self) -> None:
+        """Build char-4-gram Unicode index over all DB lines on first use.
+
+        Catches end-fragment kirtan patterns (ragi sings only the 2nd half of a
+        line) that FL prefix/contains strategies miss entirely, because the DB
+        line's first letters don't match the query's first letters at all.
+
+        Build cost: ~4-6 s cold; zero thereafter (checked via None sentinel).
+        """
+        if self._ngram4_index is not None:
+            return
+
+        from src.transcription.transliterate import normalize_for_fullword_search
+
+        ngram4_index: dict[str, list[int]] = defaultdict(list)
+        line_data: dict[int, tuple[int, str, str, frozenset]] = {}
+
+        rows = self._conn.execute(
+            f"""
+            SELECT
+                l.rowid          AS line_rowid,
+                {_SHABAD_ID_EXPR} AS sttm_id,
+                l.gurmukhi       AS gurmukhi_ascii,
+                l.first_letters  AS first_letters
+            FROM lines l
+            JOIN shabads s ON l.shabad_id = s.id
+            ORDER BY l.order_id
+            """
+        ).fetchall()
+
+        for row in rows:
+            sid = row["sttm_id"]
+            if sid is None:
+                continue
+            line_rowid = row["line_rowid"]
+            unicode_text = _to_unicode(row["gurmukhi_ascii"] or "")
+            normalized = normalize_for_fullword_search(unicode_text)
+            s = normalized.strip()
+            if len(s) < 4:
+                grams: frozenset = frozenset({s} if s else set())
+            else:
+                grams = frozenset(s[i: i + 4] for i in range(len(s) - 3))
+            line_data[line_rowid] = (sid, unicode_text, row["first_letters"] or "", grams)
+            for gram in grams:
+                ngram4_index[gram].append(line_rowid)
+
+        self._ngram4_index = dict(ngram4_index)
+        self._ngram4_line_data = line_data
+
+    def _ngram4_search(
+        self,
+        transcript_text: str,
+        limit: int,
+        signal: str,
+    ) -> list["ShabadCandidate"]:
+        """Char-4-gram overlap-coefficient retrieval over Unicode Gurmukhi lines.
+
+        Overlap coefficient = |q4 ∩ l4| / min(|q4|, |l4|).  Verbatim match → 1.0,
+        partial/noisy → graceful decay.  Ignores FL alignment entirely — designed
+        for the kirtan pattern where the ragi sings only the 2nd half of a line,
+        making FL search blind to the correct shabad.
+        """
+        self._ensure_ngram_index()
+        assert self._ngram4_index is not None
+        assert self._ngram4_line_data is not None
+
+        from src.transcription.transliterate import normalize_for_fullword_search
+
+        normalized = normalize_for_fullword_search(transcript_text)
+        s = normalized.strip()
+        if len(s) < 4:
+            q4: frozenset = frozenset({s} if s else set())
+        else:
+            q4 = frozenset(s[i: i + 4] for i in range(len(s) - 3))
+        if not q4:
+            return []
+
+        # Collect candidate line IDs via inverted index
+        candidate_line_ids: set[int] = set()
+        for gram in q4:
+            for lid in self._ngram4_index.get(gram, ()):
+                candidate_line_ids.add(lid)
+
+        if not candidate_line_ids:
+            return []
+
+        min_overlap = config.matcher.ngram4_min_overlap
+        q4_size = len(q4)
+
+        # Score each candidate line; keep best per shabad
+        best_per_shabad: dict[int, tuple[float, int]] = {}  # sttm_id → (score, line_rowid)
+        for lid in candidate_line_ids:
+            entry = self._ngram4_line_data.get(lid)
+            if entry is None:
+                continue
+            sid, _, _, l4 = entry
+            if not l4:
+                continue
+            intersection = len(q4 & l4)
+            overlap = intersection / min(q4_size, len(l4))
+            if overlap < min_overlap:
+                continue
+            prev = best_per_shabad.get(sid)
+            if prev is None or overlap > prev[0]:
+                best_per_shabad[sid] = (overlap, lid)
+
+        if not best_per_shabad:
+            return []
+
+        ranked = sorted(best_per_shabad.items(), key=lambda kv: kv[1][0], reverse=True)
+
+        # Hydrate top candidates using _row_to_candidate
+        candidates: list[ShabadCandidate] = []
+        for sttm_id, (score, line_rowid) in ranked[:limit]:
+            entry = self._ngram4_line_data.get(line_rowid)
+            if entry is None:
+                continue
+            _, unicode_text, fl_ascii, _ = entry
+            # Fetch the full DB row to use _row_to_candidate
+            row = self._conn.execute(
+                _LINE_SELECT + " AND l.rowid = ?",
+                (line_rowid,),
+            ).fetchone()
+            if row is None:
+                continue
+            candidate = self._row_to_candidate(row, signal)
+            candidates.append(candidate)
+        return candidates
+
     def search(
         self,
         first_letters: str,
@@ -203,6 +363,16 @@ class OfflineShabadSearcher:
         """Search using first-letter codes with multiple strategies."""
         if len(first_letters) < 3 and not transcript_text.strip():
             return []
+
+        # Strip kirtan filler words (ਵਾਹਿਗੁਰੂ, ਜੀਉ, etc.) from the transcript
+        # edges before deriving FL so the extra first-letter doesn't compress
+        # the score margin for the real shabad.
+        if transcript_text.strip():
+            cleaned = _strip_filler_words(transcript_text)
+            if cleaned != transcript_text:
+                from src.transcription.transliterate import extract_first_letters as _efl
+                first_letters = _efl(cleaned)
+                transcript_text = cleaned
 
         candidates: list[ShabadCandidate] = []
         seen_ids: set[int] = set()
@@ -217,6 +387,13 @@ class OfflineShabadSearcher:
             # Strategy 2: substring match on first_letters index.
             if len(candidates) < 3 and (not start_mode or len(candidates) == 0):
                 self._add_unique(self._contains_search(query, max_results, "type1"), candidates, seen_ids)
+
+            # Strategy 2b: rotation fallback for short queries — ASR may capture words in
+            # a different order than the DB line (e.g. query "tmm" → rotation "mmt" hits
+            # "kkjmmthj"). Only fires for ≤4 chars to keep rotation count and false-positive
+            # rate manageable.
+            if len(candidates) < 2 and len(query) <= 4:
+                self._add_unique(self._rotation_search(query, 5, "rotation"), candidates, seen_ids)
 
             # Strategy 3: shorter substring fallback — prefix + sliding contains.
             # Contains catches mid-line matches: kirtan often starts at a chorus
@@ -259,7 +436,19 @@ class OfflineShabadSearcher:
                     seen_ids,
                 )
 
-        # Strategy 6 (Fix 2): word-level IDF-weighted voting. Catches shabads where
+        # Strategy 6: rotation search — ragi sang words out of canonical line order.
+        # Always run for short queries (≤4 chars): type1 may find other candidates
+        # but the correct shabad requires a rotation (e.g. "tmm" misses "kkjmmthj"
+        # but rotation "mmt" hits pos 3-5). Scorer ranks all candidates by confidence.
+        if len(first_letters) >= 3 and len(first_letters) <= 4:
+            ascii_rot = gurmukhi_to_ascii(first_letters)
+            self._add_unique(
+                self._rotation_search(ascii_rot, max_results, "type_rotation"),
+                candidates,
+                seen_ids,
+            )
+
+        # Strategy 7 (Fix 2): word-level IDF-weighted voting. Catches shabads where
         # the transcript's real words survived among Whisper filler, even if the
         # resulting first-letters string is too noisy for prefix/contains search.
         if (
@@ -267,7 +456,51 @@ class OfflineShabadSearcher:
             and transcript_text.strip()
         ):
             self._add_unique(
-                self._word_vote_search(transcript_text, max_results, "type3_words"),
+                self._word_vote_search(transcript_text, max_results, "type3_words", first_letters=first_letters),
+                candidates,
+                seen_ids,
+            )
+
+        # Strategy 8: phonetic substitution — retry with common ASR confusions.
+        # ਬ(b)↔ਵ(v) are nearly identical in Punjabi speech; Whisper routinely
+        # hears ਬਿਸਾਰਹੁ as ਵਿਸਾਰਿ, breaking every first-letter strategy above.
+        # Also tries 4-char substrings of each phonetic variant to handle cases where
+        # Whisper prepends an extra word (e.g. singing "ਤੇਰਾ ਮੋਹਿ..." before the tuk
+        # starts at "ਮੋਹਿ" in the DB, so the full variant doesn't substring-match).
+        # Only fires when the original query found few candidates.
+        if len(first_letters) >= 3:
+            ascii_fl_ph = gurmukhi_to_ascii(first_letters)
+            for variant in self._phonetic_variants(ascii_fl_ph):
+                self._add_unique(
+                    self._prefix_search(variant, max_results, "phonetic"),
+                    candidates,
+                    seen_ids,
+                )
+                self._add_unique(
+                    self._contains_search(variant, max_results, "phonetic"),
+                    candidates,
+                    seen_ids,
+                )
+                if len(variant) > 4:
+                    seen_ph_subs: set[str] = set()
+                    for ph_start in (0, len(variant) // 2 - 2, len(variant) - 4):
+                        ph_start = max(0, min(ph_start, len(variant) - 4))
+                        ph_sub = variant[ph_start:ph_start + 4]
+                        if ph_sub in seen_ph_subs:
+                            continue
+                        seen_ph_subs.add(ph_sub)
+                        self._add_unique(
+                            self._contains_search(ph_sub, 5, "phonetic_sub"),
+                            candidates,
+                            seen_ids,
+                        )
+
+        # Strategy 9: char 4-gram Unicode retrieval — catches end-fragment kirtan
+        # patterns (ragi repeats 2nd half of a line) that are invisible to FL search.
+        # Gated by config so it can be disabled if the index build cost is a concern.
+        if config.matcher.ngram4_search_enabled and transcript_text.strip():
+            self._add_unique(
+                self._ngram4_search(transcript_text, config.matcher.ngram4_max_results, "ngram4"),
                 candidates,
                 seen_ids,
             )
@@ -319,6 +552,23 @@ class OfflineShabadSearcher:
                 )
             )
         return verses
+
+    def _rotation_search(self, ascii_query: str, limit: int, signal: str) -> list[ShabadCandidate]:
+        """Try all cyclic rotations of a short (≤4 char) query as substring matches."""
+        results: list[ShabadCandidate] = []
+        seen_ids: set[int] = set()
+        seen_rotations: set[str] = {ascii_query}
+        q = ascii_query
+        for _ in range(len(q) - 1):
+            q = q[1:] + q[0]
+            if q in seen_rotations:
+                continue
+            seen_rotations.add(q)
+            for c in self._contains_search(q, limit, signal):
+                if c.shabad_id not in seen_ids:
+                    seen_ids.add(c.shabad_id)
+                    results.append(c)
+        return results
 
     def _prefix_search(self, ascii_query: str, limit: int, signal: str) -> list[ShabadCandidate]:
         """ASCII first-letter prefix match."""
@@ -589,7 +839,7 @@ class OfflineShabadSearcher:
         return [self._row_to_candidate(r, signal) for r in rows]
 
     def _word_vote_search(
-        self, transcript_text: str, limit: int, signal: str
+        self, transcript_text: str, limit: int, signal: str, first_letters: str = ""
     ) -> list[ShabadCandidate]:
         """IDF-weighted word voting: score shabads by how many rare transcript words hit them.
 
@@ -630,47 +880,156 @@ class OfflineShabadSearcher:
         if not shabad_scores:
             return []
 
-        # Require ≥ min_distinct_hits and ≥ min_score before a shabad is returned —
-        # prevents a single rare word from inventing a candidate out of thin air.
+        # Require ≥ min_distinct_hits and ≥ min_score before a shabad is returned.
+        # Exception: a single word whose IDF weight alone clears single_hit_min_score
+        # is strong enough evidence — covers kirtan repetition of one rare/distinctive word.
         min_hits = config.matcher.word_vote_min_distinct_hits
         min_score = config.matcher.word_vote_min_score
+        single_hit_min = config.matcher.word_vote_single_hit_min_score
         ranked = sorted(
             (
                 (score, shabad_hits[sid], sid)
                 for sid, score in shabad_scores.items()
-                if shabad_hits[sid] >= min_hits and score >= min_score
+                if (shabad_hits[sid] >= min_hits and score >= min_score)
+                or (shabad_hits[sid] >= 1 and score >= single_hit_min)
             ),
             reverse=True,
         )
         if not ranked:
             return []
 
-        # Hydrate top candidates via the existing line-select path so they carry
-        # translation + source metadata identical to other retrieval strategies.
+        # Hydrate top candidates: fetch ALL lines for the winning shabads so we can
+        # pick the line that best matches the audio query — not just the first line
+        # (which is often a raag header like "ਗਉੜੀ ਮਹਲਾ ੫ ॥" that scores near-zero).
         sids = [sid for _, _, sid in ranked[:limit]]
         placeholders = ",".join("?" * len(sids))
-        rows = self._conn.execute(
+        all_rows = self._conn.execute(
             _LINE_SELECT
             + _scope_clause()
-            + f"""
-            AND {_SHABAD_ID_EXPR} IN ({placeholders})
-            GROUP BY s.sttm_id
-            ORDER BY l.order_id
-            """,
+            + f"AND {_SHABAD_ID_EXPR} IN ({placeholders}) ORDER BY l.order_id",
             sids,
         ).fetchall()
-        by_id = {row["sttm_id"]: row for row in rows}
+
+        from collections import defaultdict as _defaultdict
+        lines_by_shabad: dict = _defaultdict(list)
+        for row in all_rows:
+            lines_by_shabad[row["sttm_id"]].append(row)
+
+        ascii_fl = gurmukhi_to_ascii(first_letters) if first_letters else ""
+
+        def _line_score(fl_row: str) -> float:
+            if not ascii_fl or not fl_row:
+                return 0.0
+            # Fraction of the candidate line's letters that appear as a
+            # subsequence of the query — identical to _subsequence_coverage in scorer.
+            n = len(fl_row)
+            j = 0
+            for ch in ascii_fl:
+                if j < n and ch == fl_row[j]:
+                    j += 1
+            return j / n
 
         candidates: list[ShabadCandidate] = []
         for score, hits, sid in ranked[:limit]:
-            row = by_id.get(sid)
-            if row is None:
+            lines = lines_by_shabad.get(sid)
+            if not lines:
                 continue
-            candidate = self._row_to_candidate(row, signal)
+            # Pick the line whose first_letters best matches the query; fall back to
+            # the second line (skip typical single-line headers) when no query given.
+            if ascii_fl:
+                best_row = max(lines, key=lambda r: _line_score(r["first_letters"] or ""))
+            else:
+                best_row = lines[1] if len(lines) > 1 else lines[0]
+            candidate = self._row_to_candidate(best_row, signal)
             candidate.word_vote_score = round(score, 3)
             candidate.word_vote_hits = hits
             candidates.append(candidate)
         return candidates
+
+    @staticmethod
+    def _phonetic_variants(ascii_query: str) -> list[str]:
+        """Generate ASCII first-letter variants with common Punjabi ASR confusions.
+
+        Pairs: b↔v, s↔S (sa/sha), n↔N (dental/retroflex), t↔T, d↔D, plus h-drop.
+        Generates single-substitution variants first, then second-level combinations
+        of those, capped at phonetic_max_variants to bound search load.
+        """
+        _PAIRS: list[tuple[str, str]] = [
+            ("b", "v"), ("v", "b"),
+            ("s", "S"), ("S", "s"),
+            ("n", "N"), ("N", "n"),
+            ("t", "T"), ("T", "t"),
+            ("d", "D"), ("D", "d"),
+        ]
+        max_v = config.matcher.phonetic_max_variants
+        seen: set[str] = {ascii_query}
+        variants: list[str] = []
+
+        # Level 1: single-pair substitutions
+        for src, dst in _PAIRS:
+            if src in ascii_query:
+                alt = ascii_query.replace(src, dst)
+                if alt not in seen:
+                    seen.add(alt)
+                    variants.append(alt)
+                    if len(variants) >= max_v:
+                        return variants
+
+        # H-drop: remove all 'h' characters
+        if "h" in ascii_query:
+            alt = ascii_query.replace("h", "")
+            if alt and alt not in seen:
+                seen.add(alt)
+                variants.append(alt)
+                if len(variants) >= max_v:
+                    return variants
+
+        # Level 2: apply pairs to each level-1 variant for combined confusions
+        for base in list(variants):
+            for src, dst in _PAIRS:
+                if src in base:
+                    alt = base.replace(src, dst)
+                    if alt not in seen:
+                        seen.add(alt)
+                        variants.append(alt)
+                        if len(variants) >= max_v:
+                            return variants
+            if "h" in base:
+                alt = base.replace("h", "")
+                if alt and alt not in seen:
+                    seen.add(alt)
+                    variants.append(alt)
+                    if len(variants) >= max_v:
+                        return variants
+
+        return variants
+
+    def _rotation_search(self, ascii_query: str, limit: int, signal: str) -> list[ShabadCandidate]:
+        """Try all cyclic rotations of a short query as contains searches.
+
+        Handles out-of-order singing: if the ragi starts mid-line, the first-letter
+        query may be a rotation of what sits in the DB. Each unique rotation is tried
+        as a contains search; the original query is skipped (already tried by type1).
+        Uses a wider internal fetch (5× limit) because ORDER BY l.order_id in the
+        grouped contains query would otherwise miss shabads whose matching line sits
+        late in the shabad but is actually the best match.
+        """
+        n = len(ascii_query)
+        seen_rotations: set[str] = {ascii_query}
+        results: list[ShabadCandidate] = []
+        seen_ids: set[int] = set()
+        inner_limit = 250  # wide net — scorer handles ranking, not this method
+        for i in range(1, n):
+            rotation = ascii_query[i:] + ascii_query[:i]
+            if rotation in seen_rotations:
+                continue
+            seen_rotations.add(rotation)
+            hits = self._contains_search(rotation, inner_limit, signal)
+            for c in hits:
+                if c.shabad_id not in seen_ids:
+                    seen_ids.add(c.shabad_id)
+                    results.append(c)
+        return results
 
     @staticmethod
     def _row_to_candidate(row: sqlite3.Row, signal: str) -> ShabadCandidate:
@@ -710,3 +1069,9 @@ class OfflineShabadSearcher:
                 existing_c = by_id.get(c.shabad_id)
                 if existing_c is not None:
                     existing_c.retrieval_sources.update(c.retrieval_sources)
+                    # Propagate word-vote metadata — it's only set on candidates
+                    # returned by _word_vote_search and is lost if another path
+                    # already claimed the slot.
+                    if c.word_vote_hits and not existing_c.word_vote_hits:
+                        existing_c.word_vote_hits = c.word_vote_hits
+                        existing_c.word_vote_score = c.word_vote_score

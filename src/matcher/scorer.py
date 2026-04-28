@@ -10,6 +10,17 @@ from src.transcription.transliterate import gurmukhi_to_ascii, normalize_first_l
 
 _TOKEN_SPLIT = re.compile(r"\s+")
 
+# Gurmukhi matras (vowel signs) stripped before word-level comparison so that
+# "ਨਾਮੁ" (u-matra) and "ਨਾਮਿ" (i-matra) both reduce to the same consonant stem.
+_GURMUKHI_MATRAS = frozenset(
+    "\u0A3E\u0A3F\u0A40\u0A41\u0A42\u0A47\u0A48\u0A4B\u0A4C"
+    "\u0A70\u0A71\u0A02\u0A01\u0A4D\u0A3C"
+)
+
+
+def _strip_matras(text: str) -> str:
+    return "".join(ch for ch in text if ch not in _GURMUKHI_MATRAS)
+
 
 def _subsequence_coverage(query: str, target: str) -> float:
     """Fraction of target letters that appear as a subsequence of query.
@@ -67,6 +78,20 @@ def _dense_substring_coverage(query: str, shabad_concat: str | None) -> float:
         0, len(q_ascii), 0, len(c_ascii)
     )
     return match.size / max(len(q_ascii), 1)
+
+
+def _char_4grams(text: str) -> set[str]:
+    s = (text or "").strip()
+    if len(s) < 4:
+        return {s} if s else set()
+    return {s[i: i + 4] for i in range(len(s) - 3)}
+
+
+def _ngram_overlap(a: set[str], b: set[str]) -> float:
+    """Overlap coefficient |a∩b| / min(|a|,|b|). Robust when query >> verse."""
+    if not a or not b:
+        return 0.0
+    return len(a & b) / min(len(a), len(b))
 
 
 class ConfidenceScorer:
@@ -198,6 +223,96 @@ class ConfidenceScorer:
             1.0 - config.matcher.dense_coverage_weight
         ) * consec_ratio
         return max(baseline, coverage_path)
+
+    def score_line_ngram(self, transcript_text: str, verse_unicode: str) -> float:
+        """Char-4-gram overlap coefficient between transcript and a verse's Unicode text.
+
+        Normalizes the transcript to Gurmukhi (handles Devanagari / mixed script)
+        then computes overlap-coefficient on 4-grams. Verbatim match → 1.0, partial
+        or noisy → graceful decay. Complement to score_line: FL is sharp on correct
+        first-letters; ngram is robust when matras or extra syllables differ.
+        """
+        if not transcript_text or not verse_unicode:
+            return 0.0
+        from src.transcription.transliterate import normalize_for_fullword_search
+        normalized = normalize_for_fullword_search(transcript_text)
+        if not normalized:
+            return 0.0
+        return _ngram_overlap(_char_4grams(normalized), _char_4grams(verse_unicode))
+
+    def score_line_word_overlap(self, transcript_text: str, verse_unicode: str) -> float:
+        """Word-set overlap: fraction of normalized transcript words found in the verse.
+
+        Used by the word_match_line_scoring toggle — picks the line that contains
+        the most transcript words regardless of order. Matras are stripped so
+        "ਨਾਮੁ" and "ਨਾਮਿ" both reduce to the same consonant stem. Returns |q ∩ v| / |q|.
+        """
+        if not transcript_text or not verse_unicode:
+            return 0.0
+        from src.transcription.transliterate import normalize_for_fullword_search
+        q_norm = _strip_matras(normalize_for_fullword_search(transcript_text))
+        v_norm = _strip_matras(normalize_for_fullword_search(verse_unicode))
+        if not q_norm or not v_norm:
+            return 0.0
+        q_words = set(q_norm.split())
+        v_words = set(v_norm.split())
+        if not q_words:
+            return 0.0
+        return len(q_words & v_words) / len(q_words)
+
+    def score_line_word_match(self, transcript_text: str, verse_unicode: str) -> float:
+        """Sequential normalized word match for short (2-word) queries within the locked shabad.
+
+        Normalizes both sides then checks how many query words appear in order as a
+        subsequence of the verse's word list. Returns matched / total so 2/2 → 1.0,
+        1/2 → 0.5, 0/2 → 0.0. Used only for line pointer positioning, never for
+        shabad retrieval or switching.
+        """
+        if not transcript_text or not verse_unicode:
+            return 0.0
+        from src.transcription.transliterate import normalize_for_fullword_search
+        q_norm = _strip_matras(normalize_for_fullword_search(transcript_text))
+        v_norm = _strip_matras(normalize_for_fullword_search(verse_unicode))
+        if not q_norm or not v_norm:
+            return 0.0
+        q_words = q_norm.split()
+        v_words = v_norm.split()
+        if not q_words:
+            return 0.0
+        qi = 0
+        for vw in v_words:
+            if qi < len(q_words) and vw == q_words[qi]:
+                qi += 1
+        return qi / len(q_words)
+
+    def score_line_sw(self, transcript_text: str, verse_unicode: str) -> float:
+        """Word-level Smith-Waterman local alignment score.
+
+        match=2, mismatch=-1, gap=-1. Normalized by 2 * len(query_words) and
+        clamped to [0, 1]. Used in locked-state line scoring only (never retrieval).
+        """
+        if not transcript_text or not verse_unicode:
+            return 0.0
+        from src.transcription.transliterate import normalize_for_fullword_search
+        q_norm = _strip_matras(normalize_for_fullword_search(transcript_text))
+        v_norm = _strip_matras(normalize_for_fullword_search(verse_unicode))
+        if not q_norm or not v_norm:
+            return 0.0
+        q_words = q_norm.split()
+        v_words = v_norm.split()
+        if not q_words:
+            return 0.0
+        MATCH, MISMATCH, GAP = 2, -1, -1
+        m, n = len(q_words), len(v_words)
+        H = [[0] * (n + 1) for _ in range(m + 1)]
+        best = 0
+        for i in range(1, m + 1):
+            for j in range(1, n + 1):
+                s = MATCH if q_words[i - 1] == v_words[j - 1] else MISMATCH
+                H[i][j] = max(0, H[i - 1][j - 1] + s, H[i - 1][j] + GAP, H[i][j - 1] + GAP)
+                if H[i][j] > best:
+                    best = H[i][j]
+        return min(1.0, max(0.0, best / (MATCH * m)))
 
     def classify(self, score: float) -> str:
         """Classify score into action: 'auto', 'suggest', or 'ignore'."""

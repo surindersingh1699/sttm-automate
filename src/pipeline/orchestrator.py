@@ -20,6 +20,44 @@ from src.controller.base import STTMController
 # Type for the dashboard broadcast callback
 BroadcastFn = Callable[[dict], Awaitable[None]]
 
+# Gurmukhi standalone vowels (U+0A05–U+0A14) and vowel matras (U+0A3E–U+0A4C).
+# A word consisting only of these characters is a bare vowel sound — typical of
+# melismatic/alaap singing where no consonant-rooted syllable is articulated.
+_GURMUKHI_VOWELS = frozenset(
+    "\u0A05\u0A06\u0A07\u0A08\u0A09\u0A0A\u0A0F\u0A10\u0A13\u0A14"  # standalone
+    "\u0A3E\u0A3F\u0A40\u0A41\u0A42\u0A47\u0A48\u0A4B\u0A4C"        # matras
+)
+
+
+def _is_vowel_only(word: str) -> bool:
+    """True when every Gurmukhi character in the word is a standalone vowel or matra."""
+    gurmukhi_chars = [ch for ch in word if "\u0A00" <= ch <= "\u0A7F"]
+    return bool(gurmukhi_chars) and all(ch in _GURMUKHI_VOWELS for ch in gurmukhi_chars)
+
+
+def _is_alaap_output(transcript_text: str) -> bool:
+    """Detect non-lexical melismatic windows (alaap, vowel extension, melisma).
+
+    Heuristics:
+      - Empty / whitespace → silence/instrumental
+      - >60% of words are bare vowel sounds
+      - Only 1–2 distinct tokens repeated ≥3 times (raga syllable loop)
+      - All tokens ≤2 chars (short melisma bursts with no real words)
+    """
+    if not transcript_text.strip():
+        return True
+    words = [w for w in transcript_text.split() if w]
+    if not words:
+        return True
+    vowel_ratio = sum(1 for w in words if _is_vowel_only(w)) / len(words)
+    if vowel_ratio > 0.6:
+        return True
+    if len(set(words)) <= 2 and len(words) >= 3:
+        return True
+    if all(len(w) <= 2 for w in words):
+        return True
+    return False
+
 
 class PipelineOrchestrator:
     """
@@ -104,6 +142,37 @@ class PipelineOrchestrator:
         # to suppress fast-switch counting on micro (3 s) windows, which are inherently
         # noisier per-window and must not by themselves trigger a lock change.
         self._last_listening_mode: str = "search"
+        # Predictive line tracking (Layers 2 & 3).
+        self._line_dwell_history: list[float] = []
+        self._ema_dwell_seconds: float = config.matcher.predictive_dwell_seed_seconds
+        self._confirmed_advance_count: int = 0
+        self._predicted_line_idx: int | None = None
+        # Manual navigation override — after the operator jumps to a line, suppress
+        # automatic backward movement for this many windows so the pipeline doesn't
+        # snap back to wherever the audio was.
+        self._manual_nav_hold_windows: int = 0
+        # Set to True immediately after a new shabad locks so the first _handle_locked
+        # window can jump directly to the best-matching line (bypassing the 1-line cap
+        # and dwell gate). Cleared as soon as the first successful line update runs.
+        self._just_locked: bool = False
+        # Alaap detection (Change 7): consecutive windows that scored as melismatic.
+        self._alaap_window_count: int = 0
+        # Transition mode (Change 8): entered when 2+ transition signals fire.
+        self._in_transition_mode: bool = False
+        self._transition_mode_start: float = 0.0
+        self._transition_alaap_seconds: float = 0.0  # accumulated alaap/silence seconds
+        # Tiered lock (Change 1): monotonic timestamp of the first window where each
+        # shabad_id was the top suggest-level candidate.  Promoted to lockable once
+        # (now - first_seen) >= suggest_confirmation_seconds.
+        self._suggest_first_seen: dict[int, float] = {}
+        # Challenger confirmation (Change 5): monotonic timestamp when each challenger
+        # shabad_id first started outscoring the locked shabad.  Switch committed once
+        # (now - first_seen) >= challenger_confirmation_seconds.
+        # Reset whenever the current locked shabad wins a window.
+        self._challenger_first_seen: dict[int, float] = {}
+        # Last time a decode window was processed — used to detect ASR lag and
+        # invalidate stale suggest/challenger memory.
+        self._last_window_timestamp: float = 0.0
 
     async def start(self):
         """Initialize components and start the processing loop."""
@@ -262,6 +331,9 @@ class PipelineOrchestrator:
             self.tracker.advance_line()
         elif direction == "prev" and self.tracker.current:
             self.tracker.set_line(max(0, self.tracker.current.current_line - 1))
+        # Hold automatic line tracking for ~5 windows so the pipeline doesn't snap
+        # back to the audio-derived line immediately after a manual jump.
+        self._manual_nav_hold_windows = 5
 
     async def force_unlock(self):
         """Operator safety action: immediately release current lock."""
@@ -274,6 +346,12 @@ class PipelineOrchestrator:
         self._recent_line_scores.clear()
         self._alap_detour_wins.clear()
         self._current_weak_windows = 0
+        self._confirmed_advance_count = 0
+        self._predicted_line_idx = None
+        self._suggest_first_seen.clear()
+        self._challenger_first_seen.clear()
+        self._alaap_window_count = 0
+        self._in_transition_mode = False
         await self._broadcast({
             "type": "shabad_switched",
             "old_shabad_id": old_id,
@@ -301,6 +379,15 @@ class PipelineOrchestrator:
         self._alap_detour_wins.clear()
         self._current_weak_windows = 0
         self.tracker.clear_short_term_memory()
+        self._line_dwell_history.clear()
+        self._ema_dwell_seconds = config.matcher.predictive_dwell_seed_seconds
+        self._confirmed_advance_count = 0
+        self._predicted_line_idx = None
+        self._suggest_first_seen.clear()
+        self._challenger_first_seen.clear()
+        self._alaap_window_count = 0
+        self._in_transition_mode = False
+        self._transition_alaap_seconds = 0.0
         print("[Pipeline] Context flushed — starting from fresh audio.")
         await self._broadcast({
             "type": "context_flushed",
@@ -401,6 +488,12 @@ class PipelineOrchestrator:
     def confidence_mode(self) -> str:
         return self._confidence_mode
 
+    def reset_predictive_dwell(self):
+        """Clear dwell history and reset EMA when Layer 2 is toggled off."""
+        self._line_dwell_history.clear()
+        self._ema_dwell_seconds = config.matcher.predictive_dwell_seed_seconds
+        self._confirmed_advance_count = 0
+
     async def recall_shabad(self, shabad_id: int):
         """Recall a shabad from history."""
         found = self.tracker.recall_from_history(shabad_id)
@@ -483,6 +576,24 @@ class PipelineOrchestrator:
                     continue
 
                 self._window_index += 1
+                # Stale-memory reset: if this window arrives too long after the last
+                # one (ASR lag, paused pipeline, etc.) the suggest/challenger timestamps
+                # are from a different audio context and must be discarded.
+                import time as _time_now
+                _now_mono = _time_now.monotonic()
+                if (
+                    self._last_window_timestamp > 0
+                    and (_now_mono - self._last_window_timestamp)
+                    > config.matcher.stale_memory_threshold_seconds
+                ):
+                    self._suggest_first_seen.clear()
+                    self._challenger_first_seen.clear()
+                    print(
+                        f"  [STALE RESET] gap={_now_mono - self._last_window_timestamp:.1f}s "
+                        f"> {config.matcher.stale_memory_threshold_seconds:.0f}s — "
+                        "suggest/challenger memory cleared"
+                    )
+                self._last_window_timestamp = _now_mono
                 audio_for_stt = window_data["audio"]
                 listening_mode = window_data["listening_mode"]
                 self._last_listening_mode = listening_mode
@@ -568,6 +679,40 @@ class PipelineOrchestrator:
                     msg["transcribe_ms"] = int(_elapsed * 1000)
                     msg["rtf"] = round(_elapsed / max(window_seconds, 0.001), 3)
                 await self._broadcast(msg)
+
+                # 6a. Alaap detection (Change 7): detect melismatic/non-lexical windows.
+                # When enabled, freeze line pointer and skip challenger logic for
+                # windows where ASR output looks like alaap rather than lyrics.
+                _is_alaap = (
+                    config.matcher.alaap_detection_enabled
+                    and _is_alaap_output(text)
+                )
+                if _is_alaap:
+                    self._alaap_window_count += 1
+                    self._transition_alaap_seconds += max(window_seconds, float(config.audio.step_duration))
+                else:
+                    self._alaap_window_count = 0
+
+                # 6b. Transition mode (Change 8): enter when 2+ signals suggest the
+                # shabad is about to change, relaxing challenger/override thresholds.
+                if config.matcher.transition_mode_enabled:
+                    self._update_transition_mode(window_seconds)
+
+                # When alaap is confirmed (N consecutive windows) and we're LOCKED:
+                # broadcast the freeze and skip matching for this window.
+                _alaap_freeze = (
+                    _is_alaap
+                    and self._alaap_window_count >= config.matcher.alaap_consecutive_windows
+                    and self.tracker.state.value == "locked"
+                )
+                if _alaap_freeze:
+                    await self._broadcast({
+                        "type": "alaap_freeze",
+                        "windows": self._alaap_window_count,
+                        "transcript": text,
+                    })
+                    self._prev_first_letters = first_letters
+                    continue
 
                 # 6. Dispatch to state handler
                 if self.tracker.state in (
@@ -659,19 +804,21 @@ class PipelineOrchestrator:
         # Select winner from cumulative hypothesis evidence.
         top = None
         if best_hypothesis:
-            top = next(
-                (
-                    candidate
-                    for candidate in top_candidates
-                    if candidate["shabad_id"] == best_hypothesis["shabad_id"]
-                ),
+            hypothesis_candidate = next(
+                (c for c in top_candidates if c["shabad_id"] == best_hypothesis["shabad_id"]),
                 None,
             )
-            if top:
-                top = dict(top)
-                top["raw_score"] = top["score"]
-                top["evidence_score"] = round(best_hypothesis["evidence_score"], 3)
-                top["stability"] = best_hypothesis["stability"]
+            if hypothesis_candidate:
+                top_score_this_window = top_candidates[0]["score"] if top_candidates else 0.0
+                # Only let accumulated evidence promote a hypothesis if it is
+                # competitive this window. When the current audio strongly favours a
+                # different shabad (gap > 0.12), trust the present over past windows —
+                # otherwise a stale hypothesis can override the clearly-correct candidate.
+                if hypothesis_candidate["score"] >= top_score_this_window - 0.12:
+                    top = dict(hypothesis_candidate)
+                    top["raw_score"] = top["score"]
+                    top["evidence_score"] = round(best_hypothesis["evidence_score"], 3)
+                    top["stability"] = best_hypothesis["stability"]
         if top is None and top_candidates:
             top = dict(top_candidates[0])
             top["raw_score"] = top["score"]
@@ -684,19 +831,53 @@ class PipelineOrchestrator:
             evidence_score = float(top.get("evidence_score", raw_score))
             word_overlap = int(top.get("word_overlap", 0))
             top["score"] = round(max(raw_score, evidence_score), 3)
+            top_dense_dominant = bool(top.get("dense_dominant", False))
+            auto_overlap_min = (
+                config.matcher.word_overlap_evidence_min
+                if top_dense_dominant
+                else config.matcher.word_overlap_auto_min
+            )
             meets_raw_auto = (
                 raw_score >= config.matcher.auto_threshold
-                and word_overlap >= config.matcher.word_overlap_auto_min
+                and word_overlap >= auto_overlap_min
             )
             meets_evidence = (
                 evidence_score >= config.matcher.auto_threshold
                 and int(top.get("stability", 1)) >= config.matcher.candidate_lock_windows
                 and word_overlap >= config.matcher.word_overlap_evidence_min
             )
+
+            # Change 4: confidence gap check.
+            # High-confidence bypass (≥0.90): skip gap requirement entirely.
+            # Otherwise require top-1 to lead top-2 by ≥ gap_threshold — prevents
+            # coin-flip locks when two shabads score within noise of each other.
+            second_best_score = top_candidates[1]["score"] if len(top_candidates) > 1 else 0.0
+            gap = raw_score - second_best_score
+            if raw_score < config.matcher.high_confidence_lock_threshold:
+                if gap < config.matcher.gap_threshold:
+                    meets_raw_auto = False  # kill per-window auto; evidence path still open
+
             lockable = (
                 raw_score >= config.matcher.min_raw_lock_score
                 and (meets_raw_auto or meets_evidence)
             )
+
+            # Change 1: tiered lock — suggest-level candidate promoted to lockable
+            # after suggest_confirmation_seconds of being the top candidate.
+            import time as _t_now
+            _now = _t_now.monotonic()
+            top_id = top["shabad_id"]
+            for sid in list(self._suggest_first_seen):
+                if sid != top_id:
+                    del self._suggest_first_seen[sid]
+            if not lockable and raw_score >= config.matcher.suggest_threshold:
+                if top_id not in self._suggest_first_seen:
+                    self._suggest_first_seen[top_id] = _now
+                elapsed = _now - self._suggest_first_seen[top_id]
+                if elapsed >= config.matcher.suggest_confirmation_seconds:
+                    lockable = True
+            elif lockable:
+                self._suggest_first_seen.clear()
         else:
             raw_score = 0.0
             evidence_score = 0.0
@@ -758,6 +939,18 @@ class PipelineOrchestrator:
         elif current.current_line < 0:
             current.current_line = 0
 
+        # Layer 1 + 2: fraction of the current line's estimated duration that has elapsed.
+        # Passed to _apply_progression_bias so the delta=+1 bonus grows as the line ages.
+        _elapsed_on_line = (datetime.now() - current.line_updated_at).total_seconds()
+        if config.matcher.predictive_dwell_enabled and self._ema_dwell_seconds > 0:
+            _dwell_est = self._ema_dwell_seconds
+        else:
+            _cur_fl_len = len(current.verses[current.current_line].first_letters)
+            _dwell_est = _cur_fl_len / max(self._speech_rate_lps, 0.3)
+        _time_pressure = min(1.5, _elapsed_on_line / max(_dwell_est, 0.5))
+
+        _word_count = len(transcript_text.split()) if transcript_text else 0
+
         # First pass: fresh window only. This is the happy path — when the lock is
         # confident, scoring the fresh 3 s alone gives us the next line immediately
         # and avoids carrying the previous window's letters forward (which tends to
@@ -766,8 +959,25 @@ class PipelineOrchestrator:
         best_current_idx = 0
         best_current_score = 0.0
         for i, verse in enumerate(current.verses):
-            raw_current = self.scorer.score_line(first_letters, verse.first_letters)
-            current_score = self._apply_progression_bias(i, current.current_line, raw_current)
+            # Line 0 is always the raag/mahala heading ("ਮਾਝ ਮਹਲਾ ੫ ॥") — never
+            # sung.  Clamp its score to 0 so it never wins the line pointer race.
+            if i == 0 and config.matcher.penalize_heading_line:
+                current_scores.append(0.0)
+                continue
+            if config.matcher.word_match_line_scoring and transcript_text:
+                raw_current = self.scorer.score_line_word_overlap(transcript_text, verse.unicode)
+            elif transcript_text and _word_count == 2:
+                raw_current = self.scorer.score_line_word_match(transcript_text, verse.unicode)
+            elif config.matcher.ngram_line_scoring and transcript_text and len(first_letters) <= 3:
+                raw_current = self.scorer.score_line_ngram(transcript_text, verse.unicode)
+            else:
+                raw_current = self.scorer.score_line(first_letters, verse.first_letters)
+                if config.matcher.ngram_line_scoring and transcript_text:
+                    raw_current = max(raw_current, self.scorer.score_line_ngram(transcript_text, verse.unicode))
+            # Change 6: Smith-Waterman word alignment — takes max so it only helps.
+            if config.matcher.sw_line_scoring_enabled and transcript_text and _word_count >= 2:
+                raw_current = max(raw_current, self.scorer.score_line_sw(transcript_text, verse.unicode))
+            current_score = self._apply_progression_bias(i, current.current_line, raw_current, _time_pressure)
             current_scores.append(current_score)
             if current_score > best_current_score:
                 best_current_score = current_score
@@ -812,11 +1022,18 @@ class PipelineOrchestrator:
             best_combined_score = 0.0
             best_combined_label = "current"
             for i, verse in enumerate(current.verses):
+                if i == 0 and config.matcher.penalize_heading_line:
+                    combined_scores.append(0.0)
+                    combined_labels.append("heading_skip")
+                    continue
                 line_best_combined = current_scores[i]
                 line_best_label = "current"
                 for label, query_letters in combined_variants:
-                    raw_score = self.scorer.score_line(query_letters, verse.first_letters)
-                    candidate_score = self._apply_progression_bias(i, current.current_line, raw_score)
+                    if config.matcher.ngram_line_scoring and transcript_text and len(query_letters) <= 3:
+                        raw_score = self.scorer.score_line_ngram(transcript_text, verse.unicode)
+                    else:
+                        raw_score = self.scorer.score_line(query_letters, verse.first_letters)
+                    candidate_score = self._apply_progression_bias(i, current.current_line, raw_score, _time_pressure)
                     if candidate_score > line_best_combined:
                         line_best_combined = candidate_score
                         line_best_label = label
@@ -824,13 +1041,13 @@ class PipelineOrchestrator:
                 if pair_align_enabled and i + 1 < len(current.verses):
                     paired_letters = f"{verse.first_letters}{current.verses[i + 1].first_letters}"
                     raw_pair = self.scorer.score_line(first_letters, paired_letters)
-                    pair_score = self._apply_progression_bias(i, current.current_line, raw_pair)
+                    pair_score = self._apply_progression_bias(i, current.current_line, raw_pair, _time_pressure)
                     if pair_score > line_best_combined:
                         line_best_combined = pair_score
                         line_best_label = "pair_i"
                     for label, query_letters in combined_variants:
                         raw_stitch = self.scorer.score_line(query_letters, paired_letters)
-                        stitch_score = self._apply_progression_bias(i, current.current_line, raw_stitch)
+                        stitch_score = self._apply_progression_bias(i, current.current_line, raw_stitch, _time_pressure)
                         if stitch_score > line_best_combined:
                             line_best_combined = stitch_score
                             line_best_label = f"pair_i+{label}"
@@ -842,13 +1059,13 @@ class PipelineOrchestrator:
                         f"{current.verses[i + 2].first_letters}"
                     )
                     raw_triple = self.scorer.score_line(first_letters, triple_letters)
-                    triple_score = self._apply_progression_bias(i, current.current_line, raw_triple)
+                    triple_score = self._apply_progression_bias(i, current.current_line, raw_triple, _time_pressure)
                     if triple_score > line_best_combined:
                         line_best_combined = triple_score
                         line_best_label = "triple_i"
                     for label, query_letters in combined_variants:
                         raw_stitch3 = self.scorer.score_line(query_letters, triple_letters)
-                        stitch3_score = self._apply_progression_bias(i, current.current_line, raw_stitch3)
+                        stitch3_score = self._apply_progression_bias(i, current.current_line, raw_stitch3, _time_pressure)
                         if stitch3_score > line_best_combined:
                             line_best_combined = stitch3_score
                             line_best_label = f"triple_i+{label}"
@@ -866,6 +1083,27 @@ class PipelineOrchestrator:
                 best_line_idx = best_combined_idx
                 best_line_score = best_combined_score
                 best_line_variant = best_combined_label
+
+        # Layer 3: confirm or rollback a tentative advance issued in the previous window.
+        # Must happen after best_line_idx is finalised but before we touch the tracker.
+        prediction_confirmed_this_window = False
+        if self._predicted_line_idx is not None:
+            if best_line_idx >= self._predicted_line_idx:
+                # Audio confirms the prediction — snap tracker to predicted line and
+                # reset the dwell clock so the next prediction starts from now.
+                self.tracker.set_line(self._predicted_line_idx)
+                if self.tracker.current:
+                    self.tracker.current.line_updated_at = datetime.now()
+                prediction_confirmed_this_window = True
+                print(f"  [PREDICT CONFIRM] line {self._predicted_line_idx}")
+            else:
+                # Audio disagrees — revert the STTM display step we took early.
+                await self.controller.navigate_line("prev")
+                print(
+                    f"  [PREDICT ROLLBACK] audio best={best_line_idx} "
+                    f"< predicted={self._predicted_line_idx}"
+                )
+            self._predicted_line_idx = None
 
         # Fallback: follow nearby lines at lower confidence to avoid getting stuck.
         # This keeps movement local and avoids large random jumps.
@@ -935,19 +1173,6 @@ class PipelineOrchestrator:
                 if self._alap_detour_wins[sid] == 0:
                     self._alap_detour_wins.pop(sid, None)
 
-        # Broadcast line alignment
-        best_verse = current.verses[best_line_idx]
-        await self._broadcast({
-            "type": "line_aligned",
-            "line_index": best_line_idx,
-            "line_score": round(best_line_score, 3),
-            "line_unicode": best_verse.unicode,
-            "line_english": best_verse.english,
-            "match_variant": best_line_variant,
-            "pipeline_state": "locked",
-            "is_detour": is_detour,
-        })
-
         # Track recent line scores so _is_lock_stable can decide when the micro window
         # is safe to use. Detour windows don't represent current-shabad alignment, so
         # they don't contribute to stability.
@@ -971,7 +1196,8 @@ class PipelineOrchestrator:
         # If current line matches well, or nearby line matches reasonably, update position.
         # During alap we intentionally freeze the line pointer — STTM stays on the current
         # shabad and we don't chase the detour audio.
-        should_update_line = not is_detour and (
+        _enough_words = _word_count >= config.matcher.min_words_for_line_advance
+        should_update_line = not is_detour and _enough_words and (
             best_line_score >= config.matcher.suggest_threshold
             or (
                 local_best_score >= config.matcher.local_line_follow_threshold
@@ -980,6 +1206,7 @@ class PipelineOrchestrator:
         )
         if should_update_line:
             self._weak_line_windows = 0
+            self._challenger_first_seen.clear()
             old_line = current.current_line
             target_idx = best_line_idx
             target_score = best_line_score
@@ -990,31 +1217,67 @@ class PipelineOrchestrator:
                 target_idx = local_best_idx
                 target_score = local_best_score
 
-            # Dwell gate: don't advance forward if we've been on the current line for
-            # less than min_line_dwell_seconds, unless next-line evidence is
-            # overwhelming. Moving backward (delta < 0) is always allowed — if we
-            # accidentally jumped ahead we want to snap back immediately.
-            if target_idx > old_line:
-                dwell = (
-                    datetime.now() - current.line_updated_at
-                ).total_seconds()
-                if (
-                    dwell < config.matcher.min_line_dwell_seconds
-                    and target_score < config.matcher.line_advance_override_score
-                ):
-                    print(
-                        f"  [DWELL HOLD] line {old_line}→{target_idx} "
-                        f"(dwell={dwell:.2f}s < {config.matcher.min_line_dwell_seconds:.1f}s, "
-                        f"score={target_score:.2f} < {config.matcher.line_advance_override_score:.2f})"
-                    )
+            # Manual-nav hold: operator jumped to a specific line; don't snap back
+            # for the next N windows. Allow forward advances (audio caught up) but
+            # block any backward movement so the manual position is respected.
+            if self._manual_nav_hold_windows > 0:
+                self._manual_nav_hold_windows -= 1
+                if target_idx < old_line:
                     target_idx = old_line
                     target_score = current_scores[old_line]
 
+            if not self._just_locked:
+                # Cap: never advance more than 1 line per window — kirtan never skips
+                # 2+ lines in a single 3-9s chunk; larger jumps are always bad matches.
+                if target_idx > old_line + 1:
+                    target_idx = old_line + 1
+                    target_score = line_scores[old_line + 1] if old_line + 1 < len(line_scores) else target_score
+
+                # Dwell gate: don't advance forward if we've been on the current line for
+                # less than min_line_dwell_seconds, unless next-line evidence is
+                # overwhelming. Moving backward (delta < 0) is always allowed — if we
+                # accidentally jumped ahead we want to snap back immediately.
+                if target_idx > old_line:
+                    dwell = (
+                        datetime.now() - current.line_updated_at
+                    ).total_seconds()
+                    if (
+                        dwell < config.matcher.min_line_dwell_seconds
+                        and target_score < config.matcher.line_advance_override_score
+                    ):
+                        print(
+                            f"  [DWELL HOLD] line {old_line}→{target_idx} "
+                            f"(dwell={dwell:.2f}s < {config.matcher.min_line_dwell_seconds:.1f}s, "
+                            f"score={target_score:.2f} < {config.matcher.line_advance_override_score:.2f})"
+                        )
+                        target_idx = old_line
+                        target_score = current_scores[old_line]
+
+            # Layer 2: record the dwell on this line before update_line resets the clock.
+            # `dwell` is already computed by the dwell-gate block above when target_idx > old_line.
+            if config.matcher.predictive_dwell_enabled and target_idx > old_line:
+                _dwell_obs = (datetime.now() - current.line_updated_at).total_seconds()
+                if (
+                    config.matcher.predictive_dwell_min_seconds
+                    < _dwell_obs
+                    < config.matcher.predictive_dwell_max_seconds
+                ):
+                    self._line_dwell_history.append(_dwell_obs)
+                    if len(self._line_dwell_history) > 5:
+                        self._line_dwell_history.pop(0)
+                    _alpha = config.matcher.predictive_dwell_ema_alpha
+                    self._ema_dwell_seconds = (
+                        _alpha * _dwell_obs + (1.0 - _alpha) * self._ema_dwell_seconds
+                    )
+                self._confirmed_advance_count += 1
             self.tracker.update_line(target_idx, target_score)
+            self._just_locked = False
             # Keep STTM line in sync in both directions to avoid drift.
+            # Layer 3: subtract the one step already taken by a confirmed prediction.
             delta = target_idx - old_line
             if delta > 0:
-                for _ in range(delta):
+                _nav_steps = delta - (1 if prediction_confirmed_this_window else 0)
+                for _ in range(max(0, _nav_steps)):
                     await self.controller.navigate_line("next")
             elif delta < 0:
                 for _ in range(abs(delta)):
@@ -1057,14 +1320,43 @@ class PipelineOrchestrator:
                 })
                 return
 
+        # Broadcast line alignment AFTER dwell-gate so the highlight reflects the
+        # line we actually stayed on, not the scoring candidate before gating.
+        _actual_idx = current.current_line
+        if _actual_idx < len(current.verses):
+            _actual_verse = current.verses[_actual_idx]
+            _actual_score = line_scores[_actual_idx] if _actual_idx < len(line_scores) else 0.0
+            await self._broadcast({
+                "type": "line_aligned",
+                "line_index": _actual_idx,
+                "line_score": round(_actual_score, 3),
+                "line_unicode": _actual_verse.unicode,
+                "line_english": _actual_verse.english,
+                "match_variant": best_line_variant,
+                "pipeline_state": "locked",
+                "is_detour": is_detour,
+            })
+
         # Skip global challenger scan during an alap detour — the sticky-set handler
         # already tracks the would-be switch and will commit on its own timeline. Running
         # both races the counters and can cause premature switches on brief alaps.
         if is_detour:
             return
 
+        # Micro windows (3 s) are too short to reliably identify a new shabad — they
+        # exist only for fast line tracking. Skip the challenger scan unless the
+        # current-line alignment has already gone weak, in which case recovery still
+        # needs to fire.
+        if on_micro_window_flag and self._weak_line_windows < max(
+            1, config.matcher.weak_line_recovery_windows - 1
+        ):
+            return
+
         # Run challenger scan every locked cycle (not only weak cycles) so wrong-lock
-        # recovery can happen quickly.
+        # recovery can happen quickly. Skip on short (≤2-word) windows — they only
+        # drive line pointer positioning within the current shabad, never a switch.
+        if _word_count <= 2:
+            return
         reason = "background_monitor" if should_update_line else "weak_line_match"
         await self._scan_challenger(
             first_letters=first_letters,
@@ -1074,6 +1366,57 @@ class PipelineOrchestrator:
             best_line_score=best_line_score,
             reason=reason,
         )
+
+        # Layer 3: schedule a tentative advance when timing says the current line is
+        # nearly done. STTM moves one step early; the next window confirms or rolls back.
+        if (
+            config.matcher.predictive_advance_enabled
+            and self._predicted_line_idx is None
+            and not prediction_confirmed_this_window
+            and self._confirmed_advance_count >= config.matcher.predictive_advance_min_confirms
+            and self.tracker.state == PipelineState.LOCKED
+        ):
+            _cur_now = self.tracker.current
+            if _cur_now and _cur_now.verses:
+                _next_pred = _cur_now.current_line + 1
+                if _next_pred < len(_cur_now.verses):
+                    _elapsed_pred = (
+                        datetime.now() - _cur_now.line_updated_at
+                    ).total_seconds()
+                    if config.matcher.predictive_dwell_enabled:
+                        _dwell_pred = self._ema_dwell_seconds
+                    else:
+                        _fl = len(_cur_now.verses[_cur_now.current_line].first_letters)
+                        _dwell_pred = _fl / max(self._speech_rate_lps, 0.3)
+                    _tp_pred = min(1.5, _elapsed_pred / max(_dwell_pred, 0.5))
+                    _cur_score_pred = (
+                        line_scores[_cur_now.current_line]
+                        if _cur_now.current_line < len(line_scores)
+                        else 0.0
+                    )
+                    _is_repeating = (
+                        _tp_pred > 1.05
+                        and _cur_score_pred > config.matcher.predictive_advance_repeat_score
+                    )
+                    _too_uncertain = _cur_score_pred < 0.15
+                    if (
+                        _tp_pred >= config.matcher.predictive_advance_threshold
+                        and not _is_repeating
+                        and not _too_uncertain
+                        and _elapsed_pred >= config.matcher.min_line_dwell_seconds
+                    ):
+                        self._predicted_line_idx = _next_pred
+                        await self.controller.navigate_line("next")
+                        print(
+                            f"  [PREDICT] tentative advance → line {_next_pred} "
+                            f"(tp={_tp_pred:.2f}, dwell_est={_dwell_pred:.1f}s)"
+                        )
+                        await self._broadcast({
+                            "type": "predictive_advance",
+                            "predicted_line_idx": _next_pred,
+                            "time_pressure": round(_tp_pred, 2),
+                            "dwell_estimate_s": round(_dwell_pred, 2),
+                        })
 
     async def _scan_challenger(
         self,
@@ -1142,22 +1485,18 @@ class PipelineOrchestrator:
         top_raw_score = float(top.get("raw_score", top["score"]))
         top_word_overlap = int(top.get("word_overlap", 0))
         top_dense_dominant = bool(top.get("dense_dominant", False))
-        # When a challenger's score was driven by dense_coverage (substring match
-        # against its whole-shabad first-letters), raise the overlap bar — such
-        # hits are prone to spurious high scores against unrelated shabads that
-        # happen to contain similar sequences somewhere in their text.
         required_overlap = (
             config.matcher.dense_dominant_instant_overlap_min
             if top_dense_dominant
             else config.matcher.word_overlap_instant_challenger_min
         )
+        challenger_gap = top_raw_score - current_shabad_search_score
+        # Change 5: strong override — immediate switch when challenger clearly leads.
+        # Thresholds relax automatically in transition mode (Change 8).
         instant_switch = (
-            top_raw_score >= config.matcher.instant_challenger_switch_score
+            top_raw_score >= self._active_override_threshold()
             and top_word_overlap >= required_overlap
-            and (
-                top_raw_score - current_shabad_search_score
-                >= config.matcher.instant_challenger_switch_margin
-            )
+            and challenger_gap >= self._active_override_min_gap()
         )
         if instant_switch:
             old_shabad_id = current.shabad_id
@@ -1224,6 +1563,7 @@ class PipelineOrchestrator:
 
         if result["action"] == "switched":
             self._weak_line_windows = 0
+            self._challenger_first_seen.clear()
             new_id = result["new_shabad_id"]
             print(f"  [SWITCH] Challenger {new_id} wins! Transitioning...")
             await self._broadcast({
@@ -1231,20 +1571,52 @@ class PipelineOrchestrator:
                 "new_shabad_id": new_id,
                 "old_shabad_id": current.shabad_id,
             })
-            # The tracker moved to CANDIDATE_LOCK with pending_id pre-seeded,
-            # so next cycle's try_lock will confirm and lock the new shabad.
             return
 
         if result["action"] == "challenging":
+            # Change 5: time-based challenger confirmation.
+            # Track the first time this challenger appeared; commit after
+            # challenger_confirmation_seconds of sustained outscoring.
+            import time as _t_ch
+            _now_ch = _t_ch.monotonic()
+            ch_id = top["shabad_id"]
+            for sid in list(self._challenger_first_seen):
+                if sid != ch_id:
+                    del self._challenger_first_seen[sid]
+            if ch_id not in self._challenger_first_seen:
+                self._challenger_first_seen[ch_id] = _now_ch
+            ch_elapsed = _now_ch - self._challenger_first_seen[ch_id]
+            _req_s = self._active_challenger_confirmation_s()
             print(
-                f"  [CHALLENGER] {top['shabad_id']} "
-                f"wins {result['wins']}/{result['needed']}"
+                f"  [CHALLENGER] {ch_id} "
+                f"wins {result['wins']}/{result['needed']} "
+                f"({ch_elapsed:.1f}s / {_req_s:.1f}s"
+                + (" TRANSITION" if self._in_transition_mode else "")
+                + ")"
             )
+            if ch_elapsed >= _req_s:
+                # Time threshold met — force switch via tracker instant lock
+                print(
+                    f"  [TIMED SWITCH] {ch_id} confirmed after {ch_elapsed:.1f}s — committing"
+                )
+                self._challenger_first_seen.clear()
+                self._weak_line_windows = 0
+                self.tracker.try_lock(ch_id, top["score"], instant=True)
+                await self._broadcast({
+                    "type": "shabad_switched",
+                    "new_shabad_id": ch_id,
+                    "old_shabad_id": current.shabad_id,
+                    "reason": "timed_challenger",
+                })
+                await self._lock_shabad_from_top(top)
+                return
             await self._broadcast({
                 "type": "challenger_update",
                 "challenger": top,
                 "wins": result["wins"],
                 "needed": result["needed"],
+                "elapsed_s": round(ch_elapsed, 1),
+                "required_s": config.matcher.challenger_confirmation_seconds,
             })
 
     def _score_candidates(
@@ -1304,6 +1676,13 @@ class PipelineOrchestrator:
             if action == "auto" and retrieval_sources == ["type3_words"]:
                 if score < config.matcher.auto_threshold + 0.05:
                     action = "suggest"
+            # Change 3: dense_dominant + ngram4-only → downgrade to suggest.
+            # When the only retrieval signal is the char-4-gram index AND the score
+            # was driven by a dense substring match (not genuine line-level FL overlap),
+            # the hit is prone to spurious substring collisions.  Let the tiered-lock
+            # timer in Change 1 handle promotion after sustained evidence.
+            if action == "auto" and dense_dominant and retrieval_sources == ["ngram4"]:
+                action = "suggest"
             scored.append({
                 "shabad_id": candidate.shabad_id,
                 "gurmukhi": candidate.gurmukhi,
@@ -1322,23 +1701,52 @@ class PipelineOrchestrator:
         return scored
 
     def _apply_progression_bias(
-        self, index: int, current_line: int, raw_score: float
+        self, index: int, current_line: int, raw_score: float, time_pressure: float = 0.0
     ) -> float:
         """
         Prefer expected recitation flow: current, next, next+1.
         Penalize far jumps unless raw confidence is already very high.
+        `time_pressure` (Layer 1): scales the delta=+1 bonus up as the current
+        line ages past its estimated duration (0 = just started, 1.0 = expected end).
+
+        progression_symmetric_bypass=True (default): bypass only fires for non-current
+        lines, so the +0.22 current-line bonus is never stripped. Without this, a
+        confident current line (raw ≥ bypass) returned its raw score while a mediocre
+        next line (raw < bypass) still received its +0.12 bias and won. Set False to
+        restore the original (asymmetric) behaviour for A/B comparison.
         """
-        if raw_score >= config.matcher.progression_high_confidence_bypass:
-            return raw_score
+        # Legacy asymmetric mode: bypass fires before any delta check, stripping the
+        # current-line bonus. Preserved behind a toggle for A/B comparison.
+        if not config.matcher.progression_symmetric_bypass:
+            if raw_score >= config.matcher.progression_high_confidence_bypass:
+                return raw_score
+
         delta = index - current_line
+
+        # next_line_bias_enabled=False: pure raw-score comparison with a tiny tiebreaker
+        # on the current line. No time-pressure ramp, no forward positional nudge.
+        if not config.matcher.next_line_bias_enabled:
+            if delta == 0:
+                bonus = 0.05  # tiebreaker only — stay here when scores are equal
+            elif raw_score >= config.matcher.progression_high_confidence_bypass:
+                return raw_score
+            elif delta < 0:
+                bonus = -0.04 * min(abs(delta), 3)
+            elif delta >= 4:
+                bonus = -0.08
+            else:
+                bonus = -0.02 * abs(delta)  # delta=1 → -0.02, delta=2 → -0.04, delta=3 → -0.06
+            return min(1.0, max(0.0, raw_score + bonus))
+
+        # next_line_bias_enabled=True (legacy): delta=0 gets +0.22 inertia, delta=+1 gets
+        # a base 0.12 forward nudge that grows with time pressure.
         bonus = 0.0
         if delta == 0:
-            # Prefer staying on the current line — kirtan lines last ~3 s and the
-            # 3 s micro window catches the next line's first syllable near the
-            # handover, which used to edge next ahead on tied scores.
-            bonus = 0.16
+            bonus = 0.22
+        elif raw_score >= config.matcher.progression_high_confidence_bypass:
+            return raw_score
         elif delta == 1:
-            bonus = 0.12
+            bonus = 0.12 + config.matcher.predictive_time_bias_max * min(1.0, time_pressure)
         elif delta == 2:
             bonus = 0.08
         elif delta < 0:
@@ -1470,6 +1878,12 @@ class PipelineOrchestrator:
         self.tracker.set_shabad_details(
             top["gurmukhi"], top["unicode"], top["english"], verses
         )
+        # Snap the line pointer to the verse that actually matched during search,
+        # so STTM doesn't start stuck on the raag heading (line 0).
+        initial_line = top.get("line_idx", 0)
+        if initial_line > 0 and initial_line < len(verses):
+            await self.controller.navigate_to_line(initial_line)
+            self.tracker.set_line(initial_line)
         await self._broadcast({
             "type": "shabad_locked",
             "shabad_id": top["shabad_id"],
@@ -1480,8 +1894,22 @@ class PipelineOrchestrator:
                 for v in verses
             ],
         })
+        self._confirmed_advance_count = 0
+        self._predicted_line_idx = None
         self._silence_autolock_candidate = None
         self._silence_autolock_ttl = 0
+        self._suggest_first_seen.clear()
+        self._challenger_first_seen.clear()
+        self._in_transition_mode = False
+        self._transition_alaap_seconds = 0.0
+        self._alaap_window_count = 0
+        # Drop carry-over text from the previous shabad so the stitched-window
+        # scorer doesn't mix old lyrics into the first post-lock alignment pass.
+        self._prev_first_letters = ""
+        # Force 2 short (start-boost) windows after locking so the rolling audio
+        # ring flushes old-shabad audio before we attempt line alignment.
+        self._after_break_windows = max(self._after_break_windows, 2)
+        self._just_locked = True
 
     def _update_vocal_break_state(self, has_vocals: bool):
         """Track no-lyrics gaps and trigger a short post-break start mode."""
@@ -1503,6 +1931,60 @@ class PipelineOrchestrator:
         ):
             self._in_vocal_break = True
             print("  [BREAK START] Detected vocal pause")
+
+    def _update_transition_mode(self, window_seconds: float) -> None:
+        """Change 8: enter/exit transition mode based on transition signal count."""
+        import time as _tm
+        _now = _tm.monotonic()
+
+        # Exit if timed out
+        if self._in_transition_mode:
+            if _now - self._transition_mode_start >= config.matcher.transition_max_duration_seconds:
+                self._in_transition_mode = False
+                self._transition_alaap_seconds = 0.0
+                print("  [TRANSITION] Timed out — exiting transition mode")
+            return
+
+        # Count signals
+        if self.tracker.state.value != "locked":
+            return
+        signals = 0
+        # Signal 1: locked shabad scoring low for ≥ transition_weak_seconds
+        weak_s = self._weak_line_windows * float(config.audio.step_duration)
+        if weak_s >= config.matcher.transition_weak_seconds:
+            signals += 1
+        # Signal 2: current line near end of shabad (last 2 lines)
+        cur = self.tracker.current
+        if cur and cur.verses and (len(cur.verses) - cur.current_line) <= 2:
+            signals += 1
+        # Signal 3: accumulated alaap/silence time
+        if self._transition_alaap_seconds >= config.matcher.transition_silence_seconds:
+            signals += 1
+        # Signal 4: recent windows are all filler (alaap_window_count sustained)
+        if self._alaap_window_count >= config.matcher.alaap_consecutive_windows:
+            signals += 1
+
+        if signals >= config.matcher.transition_min_signals:
+            self._in_transition_mode = True
+            self._transition_mode_start = _now
+            print(f"  [TRANSITION] Entering transition mode ({signals} signals)")
+            self._transition_alaap_seconds = 0.0
+
+    def _active_challenger_confirmation_s(self) -> float:
+        """Return the effective challenger confirmation seconds (relaxed in transition mode)."""
+        if self._in_transition_mode:
+            return config.matcher.transition_challenger_confirmation_s
+        return config.matcher.challenger_confirmation_seconds
+
+    def _active_override_threshold(self) -> float:
+        if self._in_transition_mode:
+            return config.matcher.transition_override_threshold
+        return config.matcher.strong_override_threshold
+
+    def _active_override_min_gap(self) -> float:
+        if self._in_transition_mode:
+            return config.matcher.transition_override_min_gap
+        return config.matcher.override_min_gap
 
     def _is_lock_stable(self) -> bool:
         """

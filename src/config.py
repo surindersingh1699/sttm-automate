@@ -66,6 +66,33 @@ class MatcherConfig(BaseModel):
     instant_challenger_switch_margin: float = 0.08  # minimum lead over current shabad score for instant switch
     word_overlap_instant_challenger_min: int = 1  # min overlap words for instant challenger switch
     suggest_threshold: float = 0.60
+    # Confidence gap (Change 4) — bypass above high_confidence, else require gap between top-1 and top-2
+    high_confidence_lock_threshold: float = 0.90
+    gap_threshold: float = 0.10
+    # Tiered lock (Change 1) — suggest-level candidate promoted after this many seconds as top candidate
+    suggest_confirmation_seconds: float = 4.0
+    # Challenger switch (Change 5) — immediate override vs time-based confirmation
+    strong_override_threshold: float = 0.90
+    override_min_gap: float = 0.05
+    challenger_confirmation_seconds: float = 4.0
+    # Stale-memory reset — if gap between windows exceeds this, counters are too old to trust
+    stale_memory_threshold_seconds: float = 10.0
+    # Phonetic (Change 2) — cap on combinatorial variant count
+    phonetic_max_variants: int = 32
+    # Smith-Waterman word alignment in locked-state line scoring (Change 6)
+    sw_line_scoring_enabled: bool = True
+    # Alaap detection (Change 7): freeze line pointer on melismatic/non-lexical windows
+    alaap_detection_enabled: bool = True
+    alaap_consecutive_windows: int = 2  # N consecutive alaap windows before freezing
+    # Transition mode (Change 8): relax thresholds when shabad is likely transitioning
+    transition_mode_enabled: bool = True
+    transition_min_signals: int = 2          # signals needed to enter transition mode
+    transition_weak_seconds: float = 6.0    # seconds of low locked-line score = 1 signal
+    transition_silence_seconds: float = 8.0  # recent alaap/silence seconds = 1 signal
+    transition_max_duration_seconds: float = 30.0  # max time in transition mode
+    transition_challenger_confirmation_s: float = 1.5   # relaxed challenger timer
+    transition_override_threshold: float = 0.80         # relaxed override threshold
+    transition_override_min_gap: float = 0.05           # relaxed gap
     # Scoring weights (must sum to 1.0)
     weight_letter_match: float = 0.4
     weight_consecutive: float = 0.3
@@ -90,11 +117,34 @@ class MatcherConfig(BaseModel):
     candidate_lock_windows: int = 2  # confirmations required in CANDIDATE_LOCK state
     candidate_lock_miss_windows: int = 4  # weak windows tolerated before dropping pending lock
     progression_high_confidence_bypass: float = 0.88  # skip proximity penalty above this
+    # When True (default), the high-confidence bypass only fires for non-current lines so
+    # the current-line +0.22 bonus always applies. Set False to restore the original
+    # behaviour (bypass strips all bonuses including delta=0) for A/B comparison.
+    progression_symmetric_bypass: bool = True
+    # When False, the delta=+1 next-line bonus (0.12 + time-pressure ramp) is removed so
+    # the next line must beat the current line on raw score alone. The current-line inertia
+    # bonus is also reduced from 0.22 to 0.05 (pure tiebreaker). Enables pure evidence-
+    # driven advancement — no time-based or positional nudges.
+    next_line_bias_enabled: bool = False
+    # Use char-4-gram overlap on full Unicode Gurmukhi verse text alongside first-letter
+    # scoring inside locked state. Takes max(FL_score, ngram_score) per line so it only
+    # helps, never hurts.
+    ngram_line_scoring: bool = True
+    # When True, line pointer positioning uses normalized word-set overlap instead of
+    # FL/ngram scoring — picks the verse that contains the most transcript words.
+    # Applies to all query lengths within the locked shabad. 2-word sequential match
+    # and the ngram/FL paths are bypassed when this is on.
+    word_match_line_scoring: bool = False
+    # Minimum Gurmukhi word count in the transcript before the line pointer is updated.
+    # 1-word fragments are too noisy to move the pointer. 2-word fragments are allowed
+    # but use normalized full-word matching (not FL/ngram) — only within the current
+    # locked shabad, never to challenge or switch to a different shabad.
+    min_words_for_line_advance: int = 2
     # Line-advance gate — keeps the pointer on the current pangati until the ragi has
     # actually left it. Without this, the 3 s micro window advances mid-line as soon
-    # as the next line's first syllable bleeds in. Deliberately short so we still
-    # catch brisk recitation; the override lets overwhelming evidence bypass instantly.
-    min_line_dwell_seconds: float = 1.2
+    # as the next line's first syllable bleeds in. Matches the micro window duration
+    # so the pointer cannot advance faster than one window tick.
+    min_line_dwell_seconds: float = 4.5
     line_advance_override_score: float = 0.82  # next-line score that bypasses the dwell gate
     fast_speech_letters_per_second: float = 1.50  # above this, favor shorter windows
     slow_speech_letters_per_second: float = 0.65  # below this, favor longer windows
@@ -126,6 +176,12 @@ class MatcherConfig(BaseModel):
     word_vote_stopword_df_ratio: float = 0.25   # words in >25% of shabads count as stop-words (weight ≈ 0)
     word_vote_min_distinct_hits: int = 2        # at least this many distinct transcript words must vote
     word_vote_min_score: float = 1.5            # summed IDF weight floor before a candidate is returned
+    word_vote_single_hit_min_score: float = 3.5  # allow 1 hit if its IDF weight alone clears this (rare/distinctive word)
+    # Char 4-gram Unicode retrieval (Strategy 9) — catches end-fragment kirtan patterns
+    # where ragi sings only the 2nd half of a DB line (FL prefix/contains can't find it).
+    ngram4_search_enabled: bool = True
+    ngram4_min_overlap: float = 0.30  # overlap-coefficient floor before a line is considered
+    ngram4_max_results: int = 8
     word_vote_bonus_2: float = 0.05             # _score_candidates bonus for 2 distinct word hits
     word_vote_bonus_3: float = 0.10             # … 3 hits
     word_vote_bonus_4plus: float = 0.15         # … 4+ hits
@@ -137,16 +193,36 @@ class MatcherConfig(BaseModel):
     alap_sticky_ttl_seconds: float = 600.0  # drop history shabads from sticky set after this
     alap_commit_windows: int = 4  # sustained detour windows before promoting to a real shabad switch
     # Stable-lock fast tracking — when recent line alignments are strong, trust a very short window.
+    # Penalize line 0 (raag heading) in locked-state line pointer so it never
+    # wins the line race once we've locked.  Line 0 is always the raag/mahala
+    # header ("ਮਾਝ ਮਹਲਾ ੫ ॥") and is never sung — a positive score for it is
+    # always a false positive driven by short FL or tiebreaker arithmetic.
+    penalize_heading_line: bool = True
     locked_stable_score_threshold: float = 0.55  # per-window score that counts as a "stable" line hit
     locked_stable_min_windows: int = 2  # that many stable windows in a row ⇒ use locked_micro_window
     # Fast real-switch path — if current shabad line is weak AND challenger is strong, switch fast.
     fast_switch_current_weak_score: float = 0.35  # treat current-line score below this as weak
     fast_switch_current_weak_windows: int = 2  # consecutive weak windows that unlock fast switch
     fast_switch_challenger_windows: int = 2  # challenger windows needed under fast-switch conditions
+    # --- Predictive line tracking ---
+    # Layer 1: time-aware progression bias (always active when LOCKED).
+    # Scales the delta=+1 bonus linearly from 0 → max as the current line ages.
+    predictive_time_bias_max: float = 0.03
+    # Layer 2: per-session dwell-time estimator (toggle).
+    predictive_dwell_enabled: bool = False
+    predictive_dwell_ema_alpha: float = 0.30
+    predictive_dwell_seed_seconds: float = 4.0
+    predictive_dwell_min_seconds: float = 0.8   # ignore dwells outside this range
+    predictive_dwell_max_seconds: float = 12.0
+    # Layer 3: tentative predictive advance (toggle).
+    predictive_advance_enabled: bool = False
+    predictive_advance_threshold: float = 0.88  # time_pressure (0–1.5) that triggers advance
+    predictive_advance_min_confirms: int = 3    # confirmed advances needed before predicting
+    predictive_advance_repeat_score: float = 0.62  # current-line score above this → assume tuk repeat
 
 
 class STTMConfig(BaseModel):
-    ports: list[int] = [8001, 8000, 1397, 1469, 1539, 1552, 1574, 1581, 1606, 1644, 1661, 1665, 1675, 1708]
+    ports: list[int] = [8001, 1397, 1469, 1539, 1552, 1574, 1581, 1606, 1644, 1661, 1665, 1675, 1708]
     connect_timeout: float = 1.0  # seconds per port attempt
     cdp_port: int = 9222  # Chrome DevTools Protocol port for Playwright
     controller_pin: int | None = 8945  # Optional Bani Controller PIN for authenticated control payloads
