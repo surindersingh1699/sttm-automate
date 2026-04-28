@@ -1229,7 +1229,12 @@ class PipelineOrchestrator:
             if not self._just_locked:
                 # Cap: never advance more than 1 line per window — kirtan never skips
                 # 2+ lines in a single 3-9s chunk; larger jumps are always bad matches.
-                if target_idx > old_line + 1:
+                # Change 9: a sufficiently confident match (≥ progression_confident_jump_threshold)
+                # bypasses the cap so the pipeline can snap to the right line in one window.
+                if (
+                    target_idx > old_line + 1
+                    and target_score < config.matcher.progression_confident_jump_threshold
+                ):
                     target_idx = old_line + 1
                     target_score = line_scores[old_line + 1] if old_line + 1 < len(line_scores) else target_score
 
@@ -1715,6 +1720,12 @@ class PipelineOrchestrator:
         next line (raw < bypass) still received its +0.12 bias and won. Set False to
         restore the original (asymmetric) behaviour for A/B comparison.
         """
+        # Change 9: confident-jump bypass — ANY line clearing the threshold returns
+        # its raw score, ignoring delta-based bonuses entirely.  This lets a clearly
+        # better match elsewhere in the shabad win without competing against the
+        # current line's inertia bonus.
+        if raw_score >= config.matcher.progression_confident_jump_threshold:
+            return raw_score
         # Legacy asymmetric mode: bypass fires before any delta check, stripping the
         # current-line bonus. Preserved behind a toggle for A/B comparison.
         if not config.matcher.progression_symmetric_bypass:

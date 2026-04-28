@@ -117,6 +117,10 @@ class MatcherConfig(BaseModel):
     candidate_lock_windows: int = 2  # confirmations required in CANDIDATE_LOCK state
     candidate_lock_miss_windows: int = 4  # weak windows tolerated before dropping pending lock
     progression_high_confidence_bypass: float = 0.88  # skip proximity penalty above this
+    # Change 9: confident-jump bypass — ANY line (including current) skips all bias
+    # bonuses and the 1-line jump cap when its raw score clears this threshold.
+    # Lower than progression_high_confidence_bypass so confident jumps win earlier.
+    progression_confident_jump_threshold: float = 0.85
     # When True (default), the high-confidence bypass only fires for non-current lines so
     # the current-line +0.22 bonus always applies. Set False to restore the original
     # behaviour (bypass strips all bonuses including delta=0) for A/B comparison.

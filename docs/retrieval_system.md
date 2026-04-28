@@ -292,6 +292,10 @@ Immediate switch when `challenger_score >= strong_override_threshold (0.90) AND 
 
 `_is_alaap_output(text)` detects melismatic/non-lexical windows: empty text, >60% bare vowel words, ≤2 distinct tokens repeated ≥3 times, or all tokens ≤2 chars. When `alaap_consecutive_windows` consecutive windows fire while LOCKED, the line pointer is frozen and challenger logic is skipped for that window.
 
+### Change 9 — Confident-Jump Bypass in Progression Bias
+
+`_apply_progression_bias()` returns `raw_score` unchanged when `raw_score >= progression_confident_jump_threshold (0.85)` — for ALL lines including the current one. Also gates the 1-line `target_idx > old_line + 1` jump cap in `_handle_locked` behind the same threshold so a confident jump can land on a non-adjacent verse in a single window. Fixes the case where a clearly correct match elsewhere in the shabad lost to the current line's +0.05/+0.22 inertia bonus.
+
 ### Change 8 — Transition Mode
 
 Entered when ≥2 of these signals are present while LOCKED:
