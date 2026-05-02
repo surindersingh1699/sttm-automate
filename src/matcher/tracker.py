@@ -25,6 +25,8 @@ class ShabadState:
     current_line: int = 0
     verses: list[ShabadVerse] = field(default_factory=list)
     started_at: datetime = field(default_factory=datetime.now)
+    last_seen_at: datetime = field(default_factory=datetime.now)
+    line_updated_at: datetime = field(default_factory=datetime.now)
 
     def to_dict(self) -> dict:
         return {
@@ -119,6 +121,40 @@ class ShabadTracker:
         self._challenger_windows = max(1, challenger_windows)
         self._challenger_margin = max(0.01, challenger_margin)
         self._candidate_lock_windows = max(1, candidate_lock_windows)
+
+    @property
+    def challenger_windows(self) -> int:
+        return self._challenger_windows
+
+    def touch_current(self):
+        """Refresh the current shabad's last-seen timestamp (keeps it warm in the sticky set)."""
+        if self.current:
+            self.current.last_seen_at = datetime.now()
+
+    def get_sticky_set(
+        self, ttl_seconds: float, max_size: int
+    ) -> list[ShabadState]:
+        """
+        Recently-sung shabads (most recent first), excluding `current`.
+        Used by the alap/detour matcher to score against shabads the ragi just left.
+        Only returns entries with cached verses — scoring needs them.
+        """
+        if max_size <= 0 or not self.history:
+            return []
+        now = datetime.now()
+        keep: list[ShabadState] = []
+        for state in reversed(self.history):
+            if not state.verses:
+                continue
+            if self.current and state.shabad_id == self.current.shabad_id:
+                continue
+            age = (now - state.last_seen_at).total_seconds()
+            if age > ttl_seconds:
+                continue
+            keep.append(state)
+            if len(keep) >= max_size:
+                break
+        return keep
 
     # --- Hypothesis layer ---
 
@@ -234,7 +270,11 @@ class ShabadTracker:
         """Update current line and mark lock as stable."""
         if not self.current:
             return {"action": "error"}
+        now = datetime.now()
+        if line_index != self.current.current_line:
+            self.current.line_updated_at = now
         self.current.current_line = line_index
+        self.current.last_seen_at = now
         self.state = PipelineState.LOCKED
         self._challenger = None
         return {
@@ -254,10 +294,18 @@ class ShabadTracker:
             self.state = PipelineState.LOCKED
 
     def challenge(
-        self, challenger_id: int, challenger_score: float, current_score: float
+        self,
+        challenger_id: int,
+        challenger_score: float,
+        current_score: float,
+        windows_override: int | None = None,
     ) -> dict:
         """
         Evaluate challenger with margin + persistence rule.
+
+        `windows_override` temporarily shortens the persistence requirement (used by
+        the orchestrator's fast-switch path when the current shabad's alignment has
+        been weak for several windows in a row).
         """
         margin = challenger_score - current_score
         if margin < self._challenger_margin:
@@ -274,7 +322,8 @@ class ShabadTracker:
                 last_score=challenger_score,
             )
 
-        if self._challenger.consecutive_wins >= self._challenger_windows:
+        needed = self._challenger_windows if windows_override is None else max(1, windows_override)
+        if self._challenger.consecutive_wins >= needed:
             new_id = self._challenger.shabad_id
             self._switch_to(new_id)
             return {"action": "switched", "new_shabad_id": new_id}
@@ -283,7 +332,7 @@ class ShabadTracker:
             "action": "challenging",
             "challenger_id": challenger_id,
             "wins": self._challenger.consecutive_wins,
-            "needed": self._challenger_windows,
+            "needed": needed,
         }
 
     # --- Shared ---
@@ -366,3 +415,15 @@ class ShabadTracker:
         self._challenger = None
         self._clear_pending()
         self._hypotheses.clear()
+
+    def clear_short_term_memory(self):
+        """
+        Drop decaying evidence (hypotheses, pending candidate, challenger)
+        without touching the current lock or history. Used when the operator
+        wants the search layer to forget the past few minutes of audio.
+        """
+        self._hypotheses.clear()
+        self._challenger = None
+        self._clear_pending()
+        if self.state == PipelineState.CANDIDATE_LOCK and not self.current:
+            self.state = PipelineState.SEARCHING

@@ -475,3 +475,400 @@ main {
 .scrollable::-webkit-scrollbar { width: 6px; }
 .scrollable::-webkit-scrollbar-track { background: #1a1a2e; }
 .scrollable::-webkit-scrollbar-thumb { background: #0f3460; border-radius: 3px; }
+
+/* ── Tab bar ────────────────────────────────────────────────────────────── */
+
+.tab-bar {
+    display: flex;
+    gap: 0;
+    padding: 0 24px;
+    background: #16213e;
+    border-bottom: 1px solid #0f3460;
+}
+
+.tab-btn {
+    padding: 8px 20px;
+    background: transparent;
+    border: none;
+    border-bottom: 3px solid transparent;
+    color: #888;
+    font-size: 0.85rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: color 0.2s, border-color 0.2s;
+}
+
+.tab-btn:hover { color: #ccc; }
+
+.tab-btn.tab-active {
+    color: #4ecca3;
+    border-bottom-color: #4ecca3;
+}
+
+/* ── Eval tab layout ────────────────────────────────────────────────────── */
+
+.eval-container {
+    padding: 20px 24px;
+    max-width: 1400px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.eval-config-bar {
+    display: flex;
+    align-items: flex-end;
+    gap: 16px;
+    flex-wrap: wrap;
+    padding: 14px 16px;
+    background: #16213e;
+    border: 1px solid #0f3460;
+    border-radius: 8px;
+}
+
+.eval-label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 0.78rem;
+    color: #999;
+}
+
+.eval-status-text {
+    font-size: 0.85rem;
+    min-width: 200px;
+}
+.eval-status-info  { color: #999; }
+.eval-status-ok    { color: #4ecca3; }
+.eval-status-error { color: #e94560; }
+
+/* Progress bar */
+.eval-progress-wrap {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.eval-progress-track {
+    flex: 1;
+    height: 8px;
+    background: #0f3460;
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+.eval-progress-fill {
+    height: 100%;
+    background: #4ecca3;
+    border-radius: 4px;
+    transition: width 0.4s;
+}
+
+.eval-progress-label {
+    font-size: 0.8rem;
+    color: #888;
+    min-width: 120px;
+    text-align: right;
+}
+
+/* Live window feed */
+.eval-feed-wrap {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    background: #1a1a2e;
+    border-radius: 4px;
+    border: 1px solid #0f3460;
+}
+
+.eval-feed-label {
+    font-size: 0.7rem;
+    color: #555;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    white-space: nowrap;
+}
+
+.eval-window-feed {
+    font-family: ui-monospace, "SF Mono", Consolas, monospace;
+    font-size: 0.82rem;
+    color: #aaa;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Per-job results table */
+.eval-table-wrap {
+    max-height: 380px;
+    overflow-y: auto;
+    border: 1px solid #0f3460;
+    border-radius: 8px;
+    background: #16213e;
+}
+
+.eval-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.82rem;
+}
+
+.eval-table thead th {
+    position: sticky;
+    top: 0;
+    background: #0f3460;
+    color: #4ecca3;
+    text-align: left;
+    padding: 8px 12px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    font-size: 0.75rem;
+}
+
+.eval-table tbody tr:nth-child(even) { background: #1a1a2e; }
+.eval-table tbody tr:hover { background: #0f3460; }
+
+.eval-table td {
+    padding: 6px 12px;
+    color: #ccc;
+    border-bottom: 1px solid #1a1a2e;
+}
+
+.eval-mono  { font-family: ui-monospace, monospace; font-size: 0.78rem; color: #aaa; }
+.eval-center { text-align: center; }
+.eval-ok    { color: #4ecca3; font-weight: 600; }
+.eval-fail  { color: #e94560; font-weight: 600; }
+
+.eval-table-wrap::-webkit-scrollbar { width: 6px; }
+.eval-table-wrap::-webkit-scrollbar-track { background: #1a1a2e; }
+.eval-table-wrap::-webkit-scrollbar-thumb { background: #0f3460; border-radius: 3px; }
+
+/* Aggregate report */
+.eval-report {
+    background: #16213e;
+    border: 1px solid #4ecca3;
+    border-radius: 8px;
+    padding: 16px 20px;
+}
+
+.eval-report-title {
+    font-size: 0.85rem;
+    color: #4ecca3;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 14px;
+}
+
+.eval-report-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+    gap: 12px;
+}
+
+.eval-stat {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    background: #1a1a2e;
+    padding: 10px 12px;
+    border-radius: 6px;
+}
+
+.eval-stat-label {
+    font-size: 0.72rem;
+    color: #777;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+}
+
+.eval-stat-val {
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: #eee;
+}
+
+/* Alap detour banner — shown while ragi briefly sings a tuk from another shabad */
+.alap-detour {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.6rem;
+    padding: 0.4rem 0.65rem;
+    margin: 0.3rem 0;
+    background: #2a1f3f;
+    border-left: 3px solid #d4a24c;
+    border-radius: 3px;
+    font-size: 0.9rem;
+    color: #f0e2c2;
+}
+
+.alap-detour-badge {
+    background: #d4a24c;
+    color: #1a1a2e;
+    font-size: 0.68rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    padding: 0.1rem 0.4rem;
+    border-radius: 2px;
+}
+
+#alap-detour-text {
+    flex: 1;
+    min-width: 0;
+    font-family: "Gurbani Akhar", serif;
+}
+
+.alap-detour-meta {
+    font-size: 0.72rem;
+    color: #a89878;
+    white-space: nowrap;
+}
+
+/* ── Eval KPI sections (4-axis report) ─────────────────────────────────── */
+
+.eval-kpi-sections {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 12px;
+}
+
+.eval-kpi-section {
+    background: #1a1a2e;
+    border: 1px solid #0f3460;
+    border-radius: 6px;
+    padding: 12px 14px;
+}
+
+.eval-kpi-section--highlight {
+    border-color: #4ecca3;
+}
+
+.eval-kpi-section-head {
+    font-size: 0.72rem;
+    color: #4ecca3;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-weight: 600;
+    margin-bottom: 10px;
+}
+
+.eval-kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+    gap: 8px;
+}
+
+.eval-kpi-value {
+    font-size: 1.25rem;
+    font-weight: 700;
+    color: #eee;
+}
+
+.eval-stat--headline .eval-stat-val {
+    font-size: 1.5rem;
+}
+
+.eval-warn { color: #f0a500; font-weight: 600; }
+
+/* ── Past runs section ──────────────────────────────────────────────────── */
+
+.eval-past-runs {
+    background: #16213e;
+    border: 1px solid #0f3460;
+    border-radius: 8px;
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.eval-past-runs-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.eval-section-title {
+    font-size: 0.78rem;
+    color: #4ecca3;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-weight: 600;
+}
+
+.eval-btn-sm {
+    padding: 3px 10px;
+    font-size: 0.75rem;
+    background: #0f3460;
+    color: #ccc;
+    border: 1px solid #1a4a7a;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+
+.eval-btn-sm:hover { background: #1a4a7a; color: #fff; }
+
+.eval-past-table-wrap {
+    max-height: 260px;
+    overflow-y: auto;
+    border: 1px solid #0f3460;
+    border-radius: 6px;
+    background: #16213e;
+}
+
+.eval-past-table-wrap::-webkit-scrollbar { width: 6px; }
+.eval-past-table-wrap::-webkit-scrollbar-track { background: #1a1a2e; }
+.eval-past-table-wrap::-webkit-scrollbar-thumb { background: #0f3460; border-radius: 3px; }
+
+.eval-past-detail {
+    background: #1a1a2e;
+    border: 1px solid #0f3460;
+    border-radius: 6px;
+    padding: 12px 14px;
+    font-size: 0.82rem;
+    color: #ccc;
+    max-height: 320px;
+    overflow-y: auto;
+}
+
+.eval-past-detail::-webkit-scrollbar { width: 6px; }
+.eval-past-detail::-webkit-scrollbar-track { background: #1a1a2e; }
+.eval-past-detail::-webkit-scrollbar-thumb { background: #0f3460; border-radius: 3px; }
+
+.eval-table tbody tr.clickable { cursor: pointer; }
+
+/* ── Eval audio player ─────────────────────────────────────── */
+.eval-player-bar {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    margin-bottom: 4px;
+}
+.eval-player-title {
+    font-weight: 600;
+    font-size: 0.95rem;
+    color: #e8e8e8;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 340px;
+}
+.eval-player-segment {
+    font-size: 0.78rem;
+    color: #888;
+}
+.eval-player-hint {
+    font-size: 0.78rem;
+    color: #666;
+    margin-bottom: 8px;
+}
+#eval-audio {
+    height: 36px;
+}
+.eval-table tbody tr.selected td { background: #0f3460 !important; }

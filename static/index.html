@@ -11,56 +11,63 @@
         <h1>STTM Automate</h1>
         <div class="controls">
             <button id="btn-pause" class="btn btn-warning" onclick="togglePause()">Pause</button>
+            <button id="btn-mute-mic" class="btn btn-warning" onclick="toggleMicMute()" title="Fully release the microphone. Stops the OS-level mic stream so other apps can use it. Pause only halts processing — Mute also stops listening.">Mute Mic</button>
+            <button class="btn btn-small" onclick="flushContext()" title="Drop the rolling audio window and hypothesis memory so matching restarts from what's being recited right now. Keeps the current shabad lock.">Clear Audio Cache</button>
             <button class="btn btn-danger" onclick="forceUnlock()">Force Unlock</button>
             <select id="audio-device" class="control-input" onchange="setAudioDevice(this.value)" title="Audio input device">
                 <option value="auto">Auto (Default Mic)</option>
             </select>
+            <select id="whisper-engine" class="control-input" onchange="setWhisperEngine(this.value)" title="Transcription backend">
+                <option value="faster-whisper">faster-whisper (CT2 CPU)</option>
+                <option value="mlx-whisper">mlx-whisper (Apple Silicon)</option>
+                <option value="whisper-cpp">whisper.cpp f16 (488 MB)</option>
+                <option value="whisper-cpp-q8">whisper.cpp q8_0 (265 MB)</option>
+            </select>
+            <span id="engine-status" class="pin-status"></span>
+            <select id="whisper-model" class="control-input" onchange="setWhisperModel(this.value)" title="Active Whisper model. Switching reloads the engine with the new model paths — first load downloads + converts the model (~5–60 s depending on engine).">
+                <option value="surindersinghssj/surt-small-v3">surt-small-v3 (244M, full)</option>
+                <option value="surindersinghssj/surt-small-turbo-baseline-v0">surt-small-turbo-baseline-v0 (166M, distilled)</option>
+            </select>
+            <span id="model-status" class="pin-status"></span>
             <select id="audio-source" class="control-input" onchange="setAudioSource(this.value)" title="Local = server mic, Remote = your device mic">
                 <option value="local" selected>Local Mic (Server)</option>
                 <option value="remote">Remote Mic (This Device)</option>
             </select>
             <span id="mic-status" class="mic-status"></span>
-            <select id="confidence-mode" class="control-input" onchange="setConfidenceMode(this.value)">
+            <select id="confidence-mode" class="control-input" onchange="setConfidenceMode(this.value)" title="Bundled threshold profile. Gurudwara = strictest; pair with the streaming-mode + audio toggles for live PA conditions.">
                 <option value="conservative">Conservative</option>
                 <option value="balanced" selected>Balanced</option>
                 <option value="fast">Fast</option>
+                <option value="gurudwara">Gurudwara (live PA)</option>
             </select>
-            <div class="decoder-toggles" title="Decoder toggles — applied live, no model reload needed">
-                <span class="decoder-label">Decoder</span>
-                <button type="button" class="info-btn" id="decoder-info-btn" onclick="toggleDecoderInfo()" aria-label="What do these do?">?</button>
-                <label class="decoder-toggle"><input type="checkbox" id="dec-greedy" onchange="setDecoderToggle('greedy_decode', this.checked)"> Greedy</label>
-                <label class="decoder-toggle"><input type="checkbox" id="dec-single-temp" onchange="setDecoderToggle('single_temperature', this.checked)"> Single-pass</label>
-                <label class="decoder-toggle"><input type="checkbox" id="dec-allow-rep" onchange="setDecoderToggle('allow_repetition', this.checked)"> Allow repetition</label>
-                <label class="decoder-toggle"><input type="checkbox" id="dec-indep-win" onchange="setDecoderToggle('independent_windows', this.checked)"> Independent windows</label>
-                <label class="decoder-toggle"><input type="checkbox" id="dec-cap-tokens" onchange="setDecoderToggle('cap_decode_length', this.checked)"> Cap decode length</label>
-                <label class="decoder-toggle"><input type="checkbox" id="dec-skip-slow" onchange="setDecoderToggle('skip_slow_windows', this.checked)"> Skip slow windows</label>
-            </div>
-            <div id="decoder-info-popover" class="info-popover" hidden>
-                <div class="info-popover-head">
-                    <strong>Decoder toggles</strong>
-                    <button type="button" class="info-close" onclick="toggleDecoderInfo(false)" aria-label="Close">&times;</button>
-                </div>
-                <p class="info-note">All four flip the model live — no reload needed. Changes persist across restarts.</p>
-                <dl class="info-list">
-                    <dt>Greedy</dt>
-                    <dd><em>beam_size: 5 → 1.</em> 3–5× faster per window; minor accuracy hit. Try if RTF is consistently slow.</dd>
-
-                    <dt>Single-pass</dt>
-                    <dd><em>temperature: [0.0].</em> Skips Whisper's 6-step fallback loop (0.0 → 0.2 → … → 1.0) that fires when compression-ratio / logprob gates fail. Removes worst-case latency spikes. <strong>On by default.</strong></dd>
-
-                    <dt>Allow repetition</dt>
-                    <dd><em>compression_ratio_threshold: 2.4 → 10.0.</em> Kirtan repeats lines on purpose; the default trigger treats that as a hallucination and retries. Off = retries, on = trusts the output. <strong>On by default.</strong></dd>
-
-                    <dt>Independent windows</dt>
-                    <dd><em>condition_on_previous_text: false.</em> Stops Whisper from carrying the last window's text as context. Helps when a bad transcription poisons subsequent windows; slight quality loss on clean audio.</dd>
-
-                    <dt>Cap decode length</dt>
-                    <dd><em>max_new_tokens: 128.</em> Hard upper bound on tokens generated per window. Prevents the decoder from running off into long hallucination loops when "Allow repetition" is on. Safety net — keep on. <strong>On by default.</strong></dd>
-
-                    <dt>Skip slow windows</dt>
-                    <dd><em>Drop any window whose RTF > 2.0.</em> Slow decodes are usually garbled/repetitive. When tripped, the window is thrown away (no match update, no line-align, no challenger). Keeps the current lock stable instead of letting junk poison it. <strong>On by default.</strong></dd>
-                </dl>
-            </div>
+            <label class="decoder-toggle" title="Faster response: capture wakes every 1.5s (vs 3.0s), line dwell drops 4.5s→3.0s, and the tiered-lock confirmation drops 4.0s→2.5s. Accuracy thresholds (auto/instant lock, line-override score) are unchanged.">
+                <input type="checkbox" id="fast-response" onchange="setFastResponse(this.checked)"> Fast response
+            </label>
+            <label class="decoder-toggle" title="Drop suspect transcripts before they reach the matcher: low logprob, repetitive output, or high no-speech probability. Retries up the temperature ladder; segments that fail at every temperature are discarded. Stops the lock flipping during instrumental/silent stretches.">
+                <input type="checkbox" id="hallucination-guards" onchange="setHallucinationGuards(this.checked)"> Hallucination guards
+            </label>
+            <label class="decoder-toggle" title="Zero-overlap inference (REA-11): each cycle waits exactly the last-decoded window duration before the next wake. Each second of audio is transcribed once (vs ~2× under default 3s wake / 10s window). ~50% encoder savings; may clip words at chunk edges, but the matcher's first-letter retrieval is robust to one missing word in a multi-word query.">
+                <input type="checkbox" id="zero-overlap-window" onchange="setZeroOverlapWindow(this.checked)"> Zero-overlap window
+            </label>
+            <!-- REA-10 streaming-pipeline toggles. All default OFF — flipping any of
+                 these to ON enables the new behavior; OFF preserves the legacy path
+                 bit-for-bit. Documented in detail in REA-10. -->
+            <select id="streaming-mode" class="control-input" onchange="setStreamingMode(this.value)" title="Streaming pipeline mode. naive = today's 1.5s wake + 5s window. vad_segmented = decode once per VAD-bounded utterance (~3× CPU savings, fixes legit-duplicates bug). local_agreement = re-decode growing buffer with prefix-agreement commit (low flicker). hybrid = VAD bounds + LocalAgreement-2 inside (production target). Restart mic for mode change to take effect.">
+                <option value="naive" selected>naive (current)</option>
+                <option value="vad_segmented">vad_segmented</option>
+                <option value="local_agreement">local_agreement</option>
+                <option value="hybrid">hybrid</option>
+            </select>
+            <select id="dedup-strategy" class="control-input" onchange="setDedupStrategy(this.value)" title="Cross-window dedup strategy. text = today's prefix-strip (drops legit rahau/jaap repetition). audio_time = strict bug fix — only dedup when audio time ranges overlap. none = pass-through (use with VAD-segmented streaming).">
+                <option value="text" selected>dedup: text (current)</option>
+                <option value="audio_time">dedup: audio_time (rahau fix)</option>
+                <option value="none">dedup: none</option>
+            </select>
+            <label class="decoder-toggle" title="Pass the locked shabad's current pankti to Whisper as initial_prompt. Biases decoder toward known shabad text — typically +5–10 WER points on continuation. Off when not locked.">
+                <input type="checkbox" id="locked-prompt-anchor" onchange="setStreamingBool('locked_prompt_anchor', this.checked)"> Lock-prompt anchor
+            </label>
+            <button class="btn btn-small" id="btn-reconnect-sttm" onclick="reconnectSttm()" title="Re-probe STTM Desktop ports (use after starting or restarting STTM)">Reconnect STTM</button>
+            <span id="sttm-status" class="pin-status"></span>
             <input id="controller-pin" class="control-input" type="number" inputmode="numeric" placeholder="Controller PIN">
             <button class="btn btn-small" onclick="setControllerPin()">Set PIN</button>
             <button class="btn btn-small" onclick="clearControllerPin()">Clear</button>
@@ -70,12 +77,25 @@
         </div>
     </header>
 
+    <!-- Tab bar -->
+    <nav class="tab-bar">
+        <button class="tab-btn tab-active" onclick="switchTab('dashboard')" id="tab-dashboard">Dashboard</button>
+        <button class="tab-btn" onclick="switchTab('eval')" id="tab-eval">Eval</button>
+    </nav>
+
+    <!-- Dashboard view -->
+    <div id="view-dashboard">
     <main>
         <!-- Live Transcription -->
         <section class="panel" id="panel-transcription">
             <h2>Live Transcription <span id="model-speed" class="model-speed" title="Model inference latency / real-time factor"></span></h2>
             <div class="panel-content">
                 <div class="audio-bar"><div id="audio-level" class="audio-fill"></div></div>
+                <div id="alap-detour" class="alap-detour" hidden>
+                    <span class="alap-detour-badge">Alap detour</span>
+                    <span id="alap-detour-text"></span>
+                    <span id="alap-detour-meta" class="alap-detour-meta"></span>
+                </div>
                 <div id="transcription-text" class="scrollable">Waiting for audio...</div>
                 <div id="first-letters" class="first-letters"></div>
             </div>
@@ -125,7 +145,160 @@
             </div>
         </section>
     </main>
+    </div><!-- end #view-dashboard -->
+
+    <!-- Eval view -->
+    <div id="view-eval" hidden>
+    <div class="eval-container">
+
+        <!-- Config + controls -->
+        <div class="eval-config-bar">
+            <label class="eval-label">Mode
+                <select id="eval-mode" class="control-input" onchange="evalOnModeChange()">
+                    <option value="headless">Headless (CI)</option>
+                    <option value="mic">Mic (speaker playback)</option>
+                </select>
+            </label>
+            <label class="eval-label">Video ID
+                <input id="eval-video-id" type="text" class="control-input" placeholder="e.g. -Dyi8-Qyx4I" style="width:140px" oninput="evalOnVideoIdChange()">
+            </label>
+            <label class="eval-label">Limit videos
+                <input id="eval-limit" type="number" min="1" class="control-input" placeholder="all" style="width:75px">
+            </label>
+            <label class="eval-label">Min OCR score
+                <input id="eval-minscore" type="number" min="0" max="100" value="60" class="control-input" style="width:70px">
+            </label>
+            <button id="eval-start-btn" class="btn btn-primary" onclick="evalStart()">Start Scoring</button>
+            <span id="eval-status-text" class="eval-status-text eval-status-info"></span>
+        </div>
+
+        <!-- Progress bar -->
+        <div class="eval-progress-wrap">
+            <div class="eval-progress-track">
+                <div id="eval-progress-bar" class="eval-progress-fill" style="width:0%"></div>
+            </div>
+            <span id="eval-progress-label" class="eval-progress-label"></span>
+        </div>
+
+        <!-- Audio player (mic mode only) -->
+        <div id="eval-player-wrap" hidden>
+            <div class="eval-player-bar">
+                <span id="eval-player-title" class="eval-player-title">—</span>
+                <span id="eval-player-segment" class="eval-player-segment"></span>
+            </div>
+            <audio id="eval-audio" controls style="width:100%;margin:6px 0 2px"></audio>
+            <div class="eval-player-hint">
+                Seek to the marked start time, then click <strong>Start Scoring</strong> and play.
+            </div>
+        </div>
+
+        <!-- Current session progress feed -->
+        <div class="eval-feed-wrap">
+            <span class="eval-feed-label">Session</span>
+            <code id="eval-session-progress" class="eval-window-feed">—</code>
+        </div>
+
+        <!-- Per-session results table (current run) -->
+        <div class="eval-table-wrap">
+            <table class="eval-table">
+                <thead>
+                    <tr>
+                        <th>Session</th>
+                        <th title="Lock accuracy">Lock%</th>
+                        <th title="Time-to-first-correct-lock">TTFCL</th>
+                        <th title="Transition detection rate">Trans%</th>
+                        <th title="Line accuracy ±1">Line±1</th>
+                        <th title="% time on correct shabad+line">Correct%</th>
+                    </tr>
+                </thead>
+                <tbody id="eval-session-tbody"></tbody>
+            </table>
+        </div>
+
+        <!-- 4-axis KPI report (shown on completion) -->
+        <div id="eval-report" class="eval-report" hidden>
+            <h3 class="eval-report-title">Run Results</h3>
+
+            <div class="eval-kpi-sections">
+                <!-- A: Lock -->
+                <div class="eval-kpi-section">
+                    <div class="eval-kpi-section-head">A · Lock the right shabad</div>
+                    <div class="eval-kpi-grid">
+                        <div class="eval-stat"><span class="eval-stat-label">Lock accuracy</span><span id="eval-r-lock-acc" class="eval-stat-val eval-kpi-value">—</span></div>
+                        <div class="eval-stat"><span class="eval-stat-label">Lock coverage</span><span id="eval-r-lock-cov" class="eval-stat-val">—</span></div>
+                        <div class="eval-stat"><span class="eval-stat-label">TTFCL P50</span><span id="eval-r-ttfcl-p50" class="eval-stat-val">—</span></div>
+                        <div class="eval-stat"><span class="eval-stat-label">TTFCL P90</span><span id="eval-r-ttfcl-p90" class="eval-stat-val">—</span></div>
+                        <div class="eval-stat"><span class="eval-stat-label">Wrong-first rate</span><span id="eval-r-wrong-first" class="eval-stat-val">—</span></div>
+                        <div class="eval-stat"><span class="eval-stat-label">Never locked</span><span id="eval-r-never-locked" class="eval-stat-val">—</span></div>
+                    </div>
+                </div>
+                <!-- B: Transitions -->
+                <div class="eval-kpi-section">
+                    <div class="eval-kpi-section-head">B · Re-lock on transition</div>
+                    <div class="eval-kpi-grid">
+                        <div class="eval-stat"><span class="eval-stat-label">GT transitions</span><span id="eval-r-gt-trans" class="eval-stat-val">—</span></div>
+                        <div class="eval-stat"><span class="eval-stat-label">Detection ≤10s</span><span id="eval-r-trans-rate" class="eval-stat-val eval-kpi-value">—</span></div>
+                        <div class="eval-stat"><span class="eval-stat-label">Latency P50</span><span id="eval-r-trans-p50" class="eval-stat-val">—</span></div>
+                        <div class="eval-stat"><span class="eval-stat-label">Latency P90</span><span id="eval-r-trans-p90" class="eval-stat-val">—</span></div>
+                        <div class="eval-stat"><span class="eval-stat-label">Spurious/hr</span><span id="eval-r-spurious" class="eval-stat-val">—</span></div>
+                    </div>
+                </div>
+                <!-- C: Line tracking -->
+                <div class="eval-kpi-section">
+                    <div class="eval-kpi-section-head">C · Show current line</div>
+                    <div class="eval-kpi-grid">
+                        <div class="eval-stat"><span class="eval-stat-label">Line exact</span><span id="eval-r-line-exact" class="eval-stat-val">—</span></div>
+                        <div class="eval-stat"><span class="eval-stat-label">Line ±1</span><span id="eval-r-line-pm1" class="eval-stat-val eval-kpi-value">—</span></div>
+                        <div class="eval-stat"><span class="eval-stat-label">Lag P50</span><span id="eval-r-line-lag-p50" class="eval-stat-val">—</span></div>
+                        <div class="eval-stat"><span class="eval-stat-label">Lag P90</span><span id="eval-r-line-lag-p90" class="eval-stat-val">—</span></div>
+                        <div class="eval-stat"><span class="eval-stat-label">Lines skipped</span><span id="eval-r-line-skips" class="eval-stat-val">—</span></div>
+                        <div class="eval-stat"><span class="eval-stat-label">Flickers</span><span id="eval-r-line-flickers" class="eval-stat-val">—</span></div>
+                    </div>
+                </div>
+                <!-- D: Disruption -->
+                <div class="eval-kpi-section eval-kpi-section--highlight">
+                    <div class="eval-kpi-section-head">D · Recovery &amp; disruption</div>
+                    <div class="eval-kpi-grid">
+                        <div class="eval-stat"><span class="eval-stat-label">Recovery P50</span><span id="eval-r-ttr-p50" class="eval-stat-val">—</span></div>
+                        <div class="eval-stat"><span class="eval-stat-label">Recovery P90</span><span id="eval-r-ttr-p90" class="eval-stat-val">—</span></div>
+                        <div class="eval-stat"><span class="eval-stat-label">Disruptions/hr</span><span id="eval-r-disrupt-hr" class="eval-stat-val">—</span></div>
+                        <div class="eval-stat eval-stat--headline"><span class="eval-stat-label">% Time Correct</span><span id="eval-r-composite" class="eval-stat-val eval-kpi-value">—</span></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Past runs (loaded from disk on page open) -->
+        <div class="eval-past-runs">
+            <div class="eval-past-runs-header">
+                <span class="eval-section-title">Past Runs</span>
+                <button class="eval-btn-sm" onclick="evalLoadPastRuns()">↻ Refresh</button>
+            </div>
+            <div class="eval-table-wrap eval-past-table-wrap">
+                <table class="eval-table">
+                    <thead>
+                        <tr>
+                            <th>Run ID</th>
+                            <th>Date</th>
+                            <th>Mode</th>
+                            <th>Sessions</th>
+                            <th title="Median lock accuracy">Lock%</th>
+                            <th title="Transition detection rate">Trans%</th>
+                            <th title="Median line ±1 accuracy">Line±1</th>
+                            <th title="% time on correct shabad+line">Correct%</th>
+                        </tr>
+                    </thead>
+                    <tbody id="eval-past-tbody"></tbody>
+                </table>
+            </div>
+            <!-- Expanded run detail -->
+            <div id="eval-past-detail" class="eval-past-detail" hidden></div>
+        </div>
+
+    </div>
+    </div><!-- end #view-eval -->
 
     <script src="/static/js/app.js"></script>
+    <script src="/static/js/eval.js"></script>
 </body>
 </html>

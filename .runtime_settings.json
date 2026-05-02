@@ -1,7 +1,35 @@
 {
-  "controller_pin": null,
+  "controller_pin": 1389,
   "confidence_mode": "balanced",
-  "transcription_engine": "whisper_hindi",
-  "google_credentials_path": null,
-  "whisper_model_size": "tiny"
+  "audio_device": 1,
+  "decoder_toggles": {
+    "greedy_decode": false,
+    "single_temperature": true,
+    "allow_repetition": true,
+    "independent_windows": false,
+    "cap_decode_length": false,
+    "skip_slow_windows": false,
+    "hallucination_guards": false,
+    "multi_line_search": true,
+    "multi_line_locked_align": true,
+    "fast_response_enabled": false,
+    "zero_overlap_window": false
+  },
+  "streaming": {
+    "streaming_mode": "naive",
+    "vad_backend": "kirtan",
+    "vad_threshold": 0.65,
+    "vad_min_silence_ms": 200,
+    "vad_min_speech_ms": 300,
+    "vad_speech_pad_ms": 200,
+    "vad_max_utterance_ms": 30000,
+    "local_agreement_n": 2,
+    "local_agreement_decode_interval_ms": 1500,
+    "local_agreement_max_buffer_ms": 20000,
+    "dedup_strategy": "text",
+    "locked_prompt_anchor": false
+  },
+  "engine": "mlx-whisper",
+  "hf_model_id": "surindersinghssj/surt-small-turbo-baseline-v0",
+  "mic_muted": false
 }

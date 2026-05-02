@@ -5,6 +5,7 @@
 
 let ws = null;
 let isPaused = false;
+let micMuted = false;
 let reconnectTimer = null;
 let currentVerses = [];
 let currentLineIndex = -1;
@@ -18,14 +19,6 @@ let audioWs = null;
 let audioContext = null;
 let audioStream = null;
 let audioProcessor = null;
-let decoderToggles = {
-    greedy_decode: false,
-    single_temperature: true,
-    allow_repetition: true,
-    independent_windows: false,
-    cap_decode_length: true,
-    skip_slow_windows: true,
-};
 const DASHBOARD_STATE_KEY = "sttm_automate_dashboard_state_v1";
 
 // --- Safe DOM Helpers ---
@@ -151,11 +144,18 @@ function handleMessage(data) {
             highlightAutoSelected();
             break;
         case "line_aligned":
-            highlightPangati(data.line_index);
-            persistDashboardState();
+            if (!data.is_detour) {
+                highlightPangati(data.line_index);
+                hideAlapDetour();
+                persistDashboardState();
+            }
+            break;
+        case "alap_detour":
+            showAlapDetour(data);
             break;
         case "shabad_switched":
             clearPangati();
+            hideAlapDetour();
             persistDashboardState();
             break;
         case "auto_selected":
@@ -176,8 +176,35 @@ function handleMessage(data) {
             if (Object.prototype.hasOwnProperty.call(data, "audio_device")) {
                 updateAudioDevice(data.audio_device);
             }
+            if (Object.prototype.hasOwnProperty.call(data, "mic_muted")) {
+                updateMicMuted(data.mic_muted);
+            }
+            if (Object.prototype.hasOwnProperty.call(data, "fast_response_enabled")) {
+                updateFastResponse(data.fast_response_enabled);
+            }
+            // The nested `decoder_toggles` blob is the canonical source on first connect —
+            // covers any toggle whose checkbox isn't fed by a flat top-level field above.
             if (data.decoder_toggles) {
-                updateDecoderToggles(data.decoder_toggles);
+                if (Object.prototype.hasOwnProperty.call(data.decoder_toggles, "fast_response_enabled")) {
+                    updateFastResponse(data.decoder_toggles.fast_response_enabled);
+                }
+                if (Object.prototype.hasOwnProperty.call(data.decoder_toggles, "hallucination_guards")) {
+                    updateHallucinationGuards(data.decoder_toggles.hallucination_guards);
+                }
+                if (Object.prototype.hasOwnProperty.call(data.decoder_toggles, "zero_overlap_window")) {
+                    updateZeroOverlapWindow(data.decoder_toggles.zero_overlap_window);
+                }
+            }
+            if (Object.prototype.hasOwnProperty.call(data, "engine")) {
+                updateWhisperEngine(data.engine);
+            }
+            if (Object.prototype.hasOwnProperty.call(data, "hf_model_id")) {
+                updateWhisperModel(data.hf_model_id);
+            }
+            // REA-10 streaming settings — sync UI from the canonical blob so a page
+            // reload restores whatever was persisted in .runtime_settings.json.
+            if (data.streaming_settings) {
+                updateStreamingSettings(data.streaming_settings);
             }
             if (data.pipeline_state === "searching" || data.pipeline_state === "candidate_lock") {
                 if (currentVerses.length > 0) {
@@ -225,16 +252,98 @@ function handleMessage(data) {
         case "audio_device_updated":
             updateAudioDevice(data.device);
             break;
-        case "decoder_toggles_updated":
-            updateDecoderToggles(data.toggles);
+        case "mic_muted_updated":
+            updateMicMuted(data.muted);
             break;
+        case "decoder_toggles_updated":
+            if (data.toggles) {
+                if (Object.prototype.hasOwnProperty.call(data.toggles, "fast_response_enabled")) {
+                    updateFastResponse(data.toggles.fast_response_enabled);
+                }
+                if (Object.prototype.hasOwnProperty.call(data.toggles, "hallucination_guards")) {
+                    updateHallucinationGuards(data.toggles.hallucination_guards);
+                }
+                if (Object.prototype.hasOwnProperty.call(data.toggles, "zero_overlap_window")) {
+                    updateZeroOverlapWindow(data.toggles.zero_overlap_window);
+                }
+            }
+            break;
+        case "streaming_settings_updated":
+            // Server confirms our toggle change applied (or another client toggled).
+            if (data.settings) updateStreamingSettings(data.settings);
+            break;
+        case "engine_loading":
+            setEngineStatus("Loading " + data.engine + "…");
+            break;
+        case "engine_updated": {
+            updateWhisperEngine(data.engine);
+            var esel = document.getElementById("whisper-engine");
+            if (esel) esel.disabled = false;
+            setEngineStatus("Ready: " + data.engine);
+            setTimeout(function() { setEngineStatus(""); }, 3000);
+            break;
+        }
+        case "engine_update_failed": {
+            var fsel = document.getElementById("whisper-engine");
+            if (fsel) fsel.disabled = false;
+            if (data.current_engine) updateWhisperEngine(data.current_engine);
+            setEngineStatus("Failed: " + (data.error || "unknown error"));
+            break;
+        }
+        case "model_loading":
+            setModelStatus("Loading " + data.model_id + "…");
+            break;
+        case "model_updated": {
+            updateWhisperModel(data.model_id);
+            var msel = document.getElementById("whisper-model");
+            if (msel) msel.disabled = false;
+            setModelStatus("Ready: " + data.model_id);
+            setTimeout(function() { setModelStatus(""); }, 3000);
+            break;
+        }
+        case "model_update_failed": {
+            var mfsel = document.getElementById("whisper-model");
+            if (mfsel) mfsel.disabled = false;
+            if (data.current_model_id) updateWhisperModel(data.current_model_id);
+            setModelStatus("Failed: " + (data.error || "unknown error"));
+            break;
+        }
+        case "sttm_reconnecting":
+            setSttmStatus("Connecting…");
+            break;
+        case "sttm_reconnect_result": {
+            var rbtn = document.getElementById("btn-reconnect-sttm");
+            if (rbtn) rbtn.disabled = false;
+            if (data.connected) {
+                setSttmStatus("Connected " + (data.base_url || ""));
+                setTimeout(function() { setSttmStatus(""); }, 4000);
+            } else {
+                setSttmStatus("Not found — start STTM Desktop first");
+            }
+            break;
+        }
         case "audio_level":
             updateAudioLevel(data.rms, data.has_vocals);
             break;
         case "error":
             showError(data.message);
             break;
+        default:
+            if (typeof evalHandleMessage === "function" && data.type && data.type.startsWith("eval_")) {
+                evalHandleMessage(data);
+            }
+            break;
     }
+}
+
+// --- Tab switching ---
+
+function switchTab(name) {
+    document.getElementById("view-dashboard").hidden = name !== "dashboard";
+    document.getElementById("view-eval").hidden = name !== "eval";
+    document.getElementById("tab-dashboard").classList.toggle("tab-active", name === "dashboard");
+    document.getElementById("tab-eval").classList.toggle("tab-active", name === "eval");
+    if (name === "eval" && typeof evalInit === "function") evalInit();
 }
 
 // --- UI Updates ---
@@ -405,6 +514,32 @@ function clearPangati() {
     container.appendChild(createElement("p", "placeholder", "Lock a shabad to see its lines"));
 }
 
+let alapDetourHideTimer = null;
+
+function showAlapDetour(data) {
+    var banner = document.getElementById("alap-detour");
+    var text = document.getElementById("alap-detour-text");
+    var meta = document.getElementById("alap-detour-meta");
+    if (!banner || !text || !meta) return;
+    text.textContent = data.line_unicode || "";
+    var wins = data.wins || 0;
+    var commit = data.commit_at || 0;
+    var score = typeof data.score === "number" ? data.score.toFixed(2) : "?";
+    meta.textContent = "shabad " + data.shabad_id + " · score " + score + " · " + wins + "/" + commit;
+    banner.hidden = false;
+    if (alapDetourHideTimer) clearTimeout(alapDetourHideTimer);
+    alapDetourHideTimer = setTimeout(hideAlapDetour, 8000);
+}
+
+function hideAlapDetour() {
+    var banner = document.getElementById("alap-detour");
+    if (banner) banner.hidden = true;
+    if (alapDetourHideTimer) {
+        clearTimeout(alapDetourHideTimer);
+        alapDetourHideTimer = null;
+    }
+}
+
 function fetchVerses(shabadId) {
     // Track the most recent shabad requested so stale responses can be ignored.
     currentShabadId = shabadId;
@@ -501,6 +636,35 @@ function togglePause() {
     updatePauseButton();
 }
 
+function toggleMicMute() {
+    var next = !micMuted;
+    if (next && audioSource === "remote") {
+        // Also stop the browser-side capture so the OS mic indicator clears.
+        stopRemoteMic();
+    }
+    send({ type: "set_mic_muted", muted: next });
+    // Optimistic UI; server will confirm via mic_muted_updated.
+    updateMicMuted(next);
+    if (!next && audioSource === "remote" && !audioWs) {
+        startRemoteMic();
+    }
+}
+
+function updateMicMuted(muted) {
+    micMuted = !!muted;
+    var btn = document.getElementById("btn-mute-mic");
+    if (btn) {
+        btn.textContent = micMuted ? "Unmute Mic" : "Mute Mic";
+        btn.className = micMuted ? "btn btn-danger" : "btn btn-warning";
+    }
+    var micStatus = document.getElementById("mic-status");
+    if (micStatus && micMuted) {
+        micStatus.textContent = "Mic muted";
+    } else if (micStatus && audioSource !== "remote") {
+        micStatus.textContent = "";
+    }
+}
+
 function setControllerPin() {
     var input = document.getElementById("controller-pin");
     if (!input) return;
@@ -517,6 +681,10 @@ function clearControllerPin() {
 
 function forceUnlock() {
     send({ type: "force_unlock" });
+}
+
+function flushContext() {
+    send({ type: "flush_context" });
 }
 
 function setConfidenceMode(mode) {
@@ -716,57 +884,117 @@ function updateAudioDevice(device) {
     }
 }
 
-// --- Decoder Toggles ---
-
-var DECODER_TOGGLE_IDS = {
-    greedy_decode: "dec-greedy",
-    single_temperature: "dec-single-temp",
-    allow_repetition: "dec-allow-rep",
-    independent_windows: "dec-indep-win",
-    cap_decode_length: "dec-cap-tokens",
-    skip_slow_windows: "dec-skip-slow",
-};
-
-function updateDecoderToggles(toggles) {
-    if (!toggles) return;
-    Object.keys(DECODER_TOGGLE_IDS).forEach(function(key) {
-        if (Object.prototype.hasOwnProperty.call(toggles, key)) {
-            decoderToggles[key] = !!toggles[key];
-            var el = document.getElementById(DECODER_TOGGLE_IDS[key]);
-            if (el) el.checked = decoderToggles[key];
-        }
-    });
+function updateFastResponse(enabled) {
+    var el = document.getElementById("fast-response");
+    if (el) el.checked = !!enabled;
 }
 
-function setDecoderToggle(key, checked) {
-    decoderToggles[key] = !!checked;
-    var payload = {};
-    payload[key] = !!checked;
-    send({ type: "set_decoder_toggles", toggles: payload });
+function setFastResponse(enabled) {
+    send({ type: "set_decoder_toggles", toggles: { fast_response_enabled: !!enabled } });
 }
 
-function toggleDecoderInfo(force) {
-    var popover = document.getElementById("decoder-info-popover");
-    var btn = document.getElementById("decoder-info-btn");
-    if (!popover) return;
-    var show = typeof force === "boolean" ? force : popover.hasAttribute("hidden");
-    if (show) {
-        popover.removeAttribute("hidden");
-        if (btn) btn.classList.add("active");
-    } else {
-        popover.setAttribute("hidden", "");
-        if (btn) btn.classList.remove("active");
+// ─── REA-10: streaming-pipeline toggles ────────────────────────────────────
+// Each toggle posts a `set_streaming_settings` message with one or more
+// fields. The server responds with `streaming_settings_updated` carrying the
+// canonical settings blob, which calls back into updateStreamingSettings().
+function setStreamingMode(mode) {
+    send({ type: "set_streaming_settings", settings: { streaming_mode: mode } });
+}
+function setDedupStrategy(strategy) {
+    send({ type: "set_streaming_settings", settings: { dedup_strategy: strategy } });
+}
+function setStreamingBool(key, value) {
+    var settings = {};
+    settings[key] = !!value;
+    send({ type: "set_streaming_settings", settings: settings });
+}
+function updateStreamingSettings(settings) {
+    if (!settings) return;
+    var byId = function (id) { return document.getElementById(id); };
+    var sm = byId("streaming-mode");
+    if (sm && settings.streaming_mode) sm.value = settings.streaming_mode;
+    var ds = byId("dedup-strategy");
+    if (ds && settings.dedup_strategy) ds.value = settings.dedup_strategy;
+    var lp = byId("locked-prompt-anchor");
+    if (lp && Object.prototype.hasOwnProperty.call(settings, "locked_prompt_anchor")) {
+        lp.checked = !!settings.locked_prompt_anchor;
     }
 }
 
-document.addEventListener("click", function(e) {
-    var popover = document.getElementById("decoder-info-popover");
-    var btn = document.getElementById("decoder-info-btn");
-    if (!popover || popover.hasAttribute("hidden")) return;
-    if (popover.contains(e.target)) return;
-    if (btn && btn.contains(e.target)) return;
-    toggleDecoderInfo(false);
-});
+function updateHallucinationGuards(enabled) {
+    var el = document.getElementById("hallucination-guards");
+    if (el) el.checked = !!enabled;
+}
+
+function setHallucinationGuards(enabled) {
+    send({ type: "set_decoder_toggles", toggles: { hallucination_guards: !!enabled } });
+}
+
+// REA-11: zero-overlap window mode. Mirrors the hallucination-guards plumbing —
+// the orchestrator's _active_step_duration() reads config.audio.zero_overlap_window
+// each tick, so the toggle takes effect on the very next wake without restart.
+function updateZeroOverlapWindow(enabled) {
+    var el = document.getElementById("zero-overlap-window");
+    if (el) el.checked = !!enabled;
+}
+
+function setZeroOverlapWindow(enabled) {
+    send({ type: "set_decoder_toggles", toggles: { zero_overlap_window: !!enabled } });
+}
+
+// --- Whisper engine selector ---
+
+function updateWhisperEngine(name) {
+    var sel = document.getElementById("whisper-engine");
+    if (sel && name) sel.value = name;
+    setEngineStatus("");
+}
+
+function setWhisperEngine(name) {
+    setEngineStatus("Loading " + name + "…");
+    var sel = document.getElementById("whisper-engine");
+    if (sel) sel.disabled = true;
+    send({ type: "set_engine", engine: name });
+}
+
+function setEngineStatus(text) {
+    var el = document.getElementById("engine-status");
+    if (el) el.textContent = text || "";
+}
+
+// --- Whisper model selector ---
+
+function updateWhisperModel(modelId) {
+    var sel = document.getElementById("whisper-model");
+    if (sel && modelId) sel.value = modelId;
+    setModelStatus("");
+}
+
+function setWhisperModel(modelId) {
+    setModelStatus("Loading " + modelId + "…");
+    var sel = document.getElementById("whisper-model");
+    if (sel) sel.disabled = true;
+    send({ type: "set_model", model_id: modelId });
+}
+
+function setModelStatus(text) {
+    var el = document.getElementById("model-status");
+    if (el) el.textContent = text || "";
+}
+
+// --- STTM reconnect ---
+
+function reconnectSttm() {
+    var btn = document.getElementById("btn-reconnect-sttm");
+    if (btn) btn.disabled = true;
+    setSttmStatus("Connecting…");
+    send({ type: "reconnect_sttm" });
+}
+
+function setSttmStatus(text) {
+    var el = document.getElementById("sttm-status");
+    if (el) el.textContent = text || "";
+}
 
 // --- Initialize ---
 restoreDashboardState();

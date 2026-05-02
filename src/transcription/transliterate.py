@@ -1,9 +1,11 @@
 """
 Extract Gurmukhi first-letter codes from transcribed Punjabi text.
 
-BaniDB's first-letter search accepts Gurmukhi Unicode directly.
-This module extracts the first consonant/vowel from each word,
-converting Devanagari to Gurmukhi when needed.
+Output matches the ShabadOS first-letter indexing scheme used by
+`lines.first_letters` in our local SQLite DB. (The format is the same one
+BaniDB exposes, but we never call their API — all search is local.)
+This module extracts the first consonant/vowel from each word, converting
+Devanagari to Gurmukhi when needed.
 """
 
 # Gurmukhi Unicode ranges for character classification
@@ -12,7 +14,7 @@ _GURMUKHI_VOWELS = range(0x0A05, 0x0A15)        # ਅ-ਔ
 _GURMUKHI_EXTRA = {0x0A5C, 0x0A74}              # ੜ, ੴ
 _DEVANAGARI_OFFSET = 0x0100  # Devanagari → Gurmukhi offset
 
-# BaniDB first-letter indexing expects canonical vowel-carrier initials
+# ShabadOS first-letter indexing expects canonical vowel-carrier initials
 # for several independent vowels (e.g. ਆ -> ਅ).
 _FIRST_LETTER_NORMALIZE = {
     "ਆ": "ਅ",
@@ -32,13 +34,13 @@ def _is_gurmukhi_letter(cp: int) -> bool:
 
 
 def normalize_first_letter(letter: str) -> str:
-    """Normalize initial letter to BaniDB-compatible first-letter forms."""
+    """Normalize initial letter to ShabadOS-compatible first-letter forms."""
     return _FIRST_LETTER_NORMALIZE.get(letter, letter)
 
 
 def normalize_for_fullword_search(text: str) -> str:
     """
-    Normalize mixed-script transcript into a Gurmukhi phrase for BaniDB type=2 search.
+    Normalize mixed-script transcript into a Gurmukhi phrase for full-word search.
 
     - Devanagari is converted to Gurmukhi via Unicode offset.
     - Gurmukhi is kept as-is.
@@ -98,7 +100,7 @@ def extract_first_letters(text: str) -> str:
     Extract the first Gurmukhi letter of each word.
 
     Input can be Gurmukhi or Devanagari (converted to Gurmukhi).
-    Output is a string of Gurmukhi first-letter codes for BaniDB search.
+    Output is a string of Gurmukhi first-letter codes for ShabadOS first-letter search.
 
     Example:
         "ਸੋਚੈ ਸੋਚਿ ਨ ਹੋਵਈ ਜੇ ਸੋਚੀ ਲਖ ਵਾਰ" → "ਸਸਨਹਜਸਲਵ"

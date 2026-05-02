@@ -5,34 +5,27 @@ The HF repo ships HF Transformers weights; on first load we convert to CTranslat
 int8 format and cache it under `data/surt-small-v3-ct2/`.
 """
 
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from faster_whisper import WhisperModel
 
 from src.config import config
+from src.transcription.base import BaseTranscriptionEngine, TranscriptionSegment
 
 
-@dataclass
-class TranscriptionSegment:
-    start: float
-    end: float
-    text: str
-
-
-class TranscriptionEngine:
-    """Transcribes audio using local faster-whisper models."""
+class FasterWhisperEngine(BaseTranscriptionEngine):
+    """Transcribes audio using local faster-whisper (CTranslate2) models."""
 
     def __init__(self):
-        self._model: WhisperModel | None = None
+        self._model = None
         self._language: str | None = config.whisper.language or None
 
     def load(self):
         """Load (and lazily convert) the fine-tuned Whisper model."""
+        from faster_whisper import WhisperModel
         model_dir = self._ensure_ct2_model()
         print(
-            f"[Whisper] Loading '{config.whisper.hf_model_id}' from {model_dir} "
+            f"[FasterWhisper] Loading '{config.whisper.hf_model_id}' from {model_dir} "
             f"(device={config.whisper.device}, compute={config.whisper.compute_type})..."
         )
         self._model = WhisperModel(
@@ -40,7 +33,7 @@ class TranscriptionEngine:
             device=config.whisper.device,
             compute_type=config.whisper.compute_type,
         )
-        print("[Whisper] Ready.")
+        print("[FasterWhisper] Ready.")
 
     @staticmethod
     def _ensure_ct2_model() -> Path:
@@ -99,10 +92,19 @@ class TranscriptionEngine:
         print("[Whisper] Conversion complete.")
         return model_dir
 
-    def transcribe(self, audio: np.ndarray) -> list[TranscriptionSegment]:
+    def transcribe(
+        self,
+        audio: np.ndarray,
+        initial_prompt: str | None = None,
+    ) -> list[TranscriptionSegment]:
         """
         Transcribe audio chunk (16kHz float32 mono) via faster-whisper.
         Returns list of segments with text.
+
+        ``initial_prompt`` (REA-10 locked-prompt anchoring): when the matcher
+        is locked on a shabad and the toggle is enabled, the orchestrator
+        passes the current pankti's Gurmukhi text. faster-whisper biases the
+        decoder toward similar tokens, lowering WER on continuation.
         """
         if self._model is None:
             raise RuntimeError("Model not loaded. Call load() first.")
@@ -123,15 +125,29 @@ class TranscriptionEngine:
                 "speech_pad_ms": config.whisper.vad_speech_pad_ms,
             },
         }
-        if config.whisper.single_temperature:
+        if initial_prompt:
+            # Cap the prompt at ~80 tokens (~140 Gurmukhi chars) so it doesn't
+            # overflow Whisper's 224-token initial-prompt budget. The prompt
+            # exists to bias the decoder, not to substitute for it.
+            kwargs["initial_prompt"] = initial_prompt[:140]
+        guards = config.whisper.hallucination_guards
+        if config.whisper.single_temperature and not guards:
             kwargs["temperature"] = [0.0]
-        if config.whisper.allow_repetition:
+        if config.whisper.allow_repetition and not guards:
+            # When guards are on, force the strict compression-ratio gate (2.4)
+            # regardless of allow_repetition so hallucinations on noise are dropped.
             kwargs["compression_ratio_threshold"] = 10.0
         if config.whisper.independent_windows:
             kwargs["condition_on_previous_text"] = False
         if config.whisper.cap_decode_length:
             # Hard cap prevents runaway decodes when repetition-rejection is relaxed.
             kwargs["max_new_tokens"] = max(16, int(config.whisper.max_new_tokens_cap))
+        if guards:
+            # Explicit thresholds matching whisper.cpp guard config; full
+            # temperature ladder ensures suspect segments get retried then dropped.
+            kwargs["no_speech_threshold"] = config.whisper.hg_no_speech_thold
+            kwargs["log_prob_threshold"] = config.whisper.hg_logprob_thold
+            kwargs["compression_ratio_threshold"] = config.whisper.hg_entropy_thold
         if self._language:
             kwargs["language"] = self._language
 
@@ -194,23 +210,5 @@ class TranscriptionEngine:
                 return self._model.transcribe(audio, **kwargs)
             raise
 
-    @staticmethod
-    def _normalize(audio: np.ndarray, target_peak: float = 0.7) -> np.ndarray:
-        """Normalize quiet audio for more stable Whisper input."""
-        if audio.size == 0:
-            return audio
-        peak = float(np.max(np.abs(audio)))
-        if peak < 0.005:
-            return audio
-        gain = min(target_peak / peak, 20.0)
-        if gain > 1.2:
-            return np.clip(audio * gain, -1.0, 1.0).astype(np.float32)
-        return audio
-
-    @staticmethod
-    def has_vocal_content(audio: np.ndarray, samplerate: int = 16000) -> bool:
-        """Check if audio has any content worth transcribing."""
-        if audio.size == 0:
-            return False
-        rms = float(np.sqrt(np.mean(audio**2)))
-        return rms > 0.005
+# Back-compat alias for older imports (`TranscriptionEngine`).
+TranscriptionEngine = FasterWhisperEngine

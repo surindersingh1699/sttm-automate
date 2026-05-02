@@ -11,6 +11,24 @@ cache.dat
 *.log
 data/vosk-model-*/
 data/surt-small-v3-ct2/
+data/surt-small-v3-mlx/
+data/surt-small-v3.ggml
+data/surt-small-v3-q*.ggml
+data/surt-small-turbo-baseline-v0-ct2/
+data/surt-small-turbo-baseline-v0-mlx/
+data/surt-small-turbo-baseline-v0*.ggml
+data/_baseline-v0-source/
+data/_whisper_cpp_assets/
+
+# FAISS / vector indexes (large binaries, rebuilt on demand)
+index/
+
+# Eval artifacts (audio cache, run outputs)
+tests/eval/cache/
+tests/eval/runs/
+
+# Local Claude Code agent settings
+.claude/
 .DS_Store
 *.spec
 
@@ -19,3 +37,7 @@ database.sqlite
 database.sqlite-shm
 database.sqlite-wal
 dataset-metadata.json
+
+# Large intermediate dump from STTM Realm — only need the built mapping files
+data/realm_verses.json
+data/gurbani.sqlite

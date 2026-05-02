@@ -4,7 +4,6 @@ import asyncio
 import sys
 
 from src.controller.sttm_http import STTMHttpController
-from src.controller.sttm_playwright import STTMPlaywrightController
 
 
 def main():
@@ -28,11 +27,12 @@ async def run_pipeline_only():
     """Run the pipeline with console output only (no dashboard)."""
     from src.pipeline.orchestrator import PipelineOrchestrator
 
-    # Try HTTP controller first, fall back to Playwright
+    # Try HTTP controller first, fall back to Playwright (lazy import — optional dep)
     controller = STTMHttpController()
     if not await controller.connect():
         print("HTTP controller failed. Trying Playwright...")
         await controller.disconnect()
+        from src.controller.sttm_playwright import STTMPlaywrightController
         controller = STTMPlaywrightController()
 
     pipeline = PipelineOrchestrator(controller=controller)
