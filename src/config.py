@@ -16,6 +16,21 @@ class AudioConfig(BaseModel):
     locked_micro_window_duration: float = 3.0  # minimal window while locked + stable (1 line ≈ 3s recitation)
     locked_very_fast_window_duration: float = 3.5  # locked window for *very* fast recitation (Fix 3 tier)
     search_fast_window_duration: float = 8.0  # shorter search window for very fast speech
+    # Fast-response mode: when MatcherConfig.fast_response_enabled is True the capture
+    # loop wakes every fast_step_duration seconds instead of step_duration.  The Whisper
+    # window length is unchanged — we just look at the (already-buffered) audio twice as
+    # often, halving the wake-up wait without changing decode cost or accuracy floors.
+    fast_step_duration: float = 1.5
+    # Zero-overlap mode (REA-11): when on, the capture loop sleeps exactly the
+    # last-decoded *dynamic* window duration before the next wake-up. Each
+    # second of audio gets transcribed once instead of overlapping under the
+    # default 3 s wake / 10 s window. ~50 % encoder savings; trade-off is
+    # potential word-boundary clipping at chunk edges (matcher's first-letter
+    # retrieval is robust to one missing word in a multi-word query). Default
+    # off to preserve existing capture behavior; user-togglable via dashboard.
+    # Composes with fast_response: when both are on, zero-overlap wins because
+    # its semantics ("hop = window") subsume the fast-response 1.5 s cadence.
+    zero_overlap_window: bool = False
     device: int | None = None  # None = auto-detect: BlackHole > aggregate > default
 
 
@@ -25,15 +40,26 @@ class WhisperConfig(BaseModel):
     # "mlx-whisper"    = Apple MLX (GPU/ANE, macOS Apple Silicon only)
     # "whisper-cpp"    = whisper.cpp via pywhispercpp (cross-platform incl. iOS)
     engine: str = "faster-whisper"
-    hf_model_id: str = "surindersinghssj/surt-small-v3"  # HuggingFace repo (auto-converted to CT2 int8 on first load)
+    # Active model (HuggingFace repo id). User-selectable from the dashboard.
+    # The engine-specific cache paths below derive from this — switching the
+    # active model via apply_model_id() rewrites all four together.
+    hf_model_id: str = "surindersinghssj/surt-small-v3"
+    # Registry of selectable models. Add a new HF repo id here to expose it
+    # in the dashboard's model dropdown. Each entry is auto-converted to the
+    # active engine's cache format on first load (CT2 / MLX / GGML).
+    available_models: list[str] = [
+        "surindersinghssj/surt-small-v3",
+        "surindersinghssj/surt-small-turbo-baseline-v0",
+    ]
     local_model_dir: str = "data/surt-small-v3-ct2"  # where the converted CT2 model lives
     # MLX-specific:
-    mlx_model_dir: str = "data/surt-small-v3-mlx"  # converted MLX weights cache
+    mlx_model_dir: str = "data/surt-small-v3-mlx"  # converted MLX weights cache (Apple Metal)
     mlx_quantize: bool = True  # 4-bit quantize on conversion to shrink + speed up
     mlx_quantize_bits: int = 4
-    # whisper.cpp-specific: GGML file path. Auto-converted from `hf_model_id`
+    # whisper.cpp-specific: GGML file paths. Auto-converted from `hf_model_id`
     # on first load via the vendored upstream converter.
     whisper_cpp_model_path: str = "data/surt-small-v3.ggml"
+    whisper_cpp_q8_model_path: str = "data/surt-small-v3-q8_0.ggml"
     whisper_cpp_threads: int = 4
     device: str = "cpu"
     compute_type: str = "int8"  # int8 for CPU, float16 for GPU
@@ -52,6 +78,34 @@ class WhisperConfig(BaseModel):
     max_new_tokens_cap: int = 128       # tokens cap applied when cap_decode_length=True
     skip_slow_windows: bool = True      # True → drop transcription if RTF exceeds skip_slow_rtf_threshold
     skip_slow_rtf_threshold: float = 2.0  # windows slower than realtime × this are discarded before matching
+    # whisper.cpp hallucination guards — bundles four rejection filters whisper.cpp
+    # exposes but doesn't aggressively apply by default. When on, suspect segments
+    # (low logprob, high entropy/repetition, high no-speech prob) get retried up
+    # the temperature ladder and dropped if no temperature passes.
+    hallucination_guards: bool = True
+    # Kirtan-tuned thresholds: keep no-speech strict (Whisper's no-speech head is
+    # the cleanest instrumental detector), but loosen logprob + entropy a lot —
+    # sung vowels score low-confidence and kirtan refrains look repetitive, both
+    # of which would trip the spoken-speech defaults (-1.0 and 2.4).
+    hg_no_speech_thold: float = 0.9      # very lenient — sustained sung vowels can fire Whisper's no-speech head; only drop if it's REALLY sure
+    hg_logprob_thold: float = -2.5       # very lenient — sung speech has much lower per-token confidence
+    hg_entropy_thold: float = 8.0        # loosened from 2.4 (kirtan refrains are legitimately repetitive)
+    hg_temperature_inc: float = 0.2      # fallback ladder step (0 → no fallback)
+
+    def apply_model_id(self, model_id: str) -> None:
+        """Switch the active model; rewrite all engine-specific cache paths.
+
+        Each engine reads its model location from these fields, so the four
+        paths must move together. Caller is responsible for triggering an
+        engine reload (``pipeline.switch_engine(current_engine)``) afterward
+        so the new weights are actually loaded.
+        """
+        short = model_id.rsplit("/", 1)[-1]
+        self.hf_model_id = model_id
+        self.local_model_dir = f"data/{short}-ct2"
+        self.mlx_model_dir = f"data/{short}-mlx"
+        self.whisper_cpp_model_path = f"data/{short}.ggml"
+        self.whisper_cpp_q8_model_path = f"data/{short}-q8_0.ggml"
 
 
 class MatcherConfig(BaseModel):
@@ -126,24 +180,6 @@ class MatcherConfig(BaseModel):
     # leads raw top-2 by this gap.  Catches confident jumps that neither line
     # individually meets the absolute threshold.
     line_jump_gap_threshold: float = 0.20
-    # When True (default), the high-confidence bypass only fires for non-current lines so
-    # the current-line +0.22 bonus always applies. Set False to restore the original
-    # behaviour (bypass strips all bonuses including delta=0) for A/B comparison.
-    progression_symmetric_bypass: bool = True
-    # When False, the delta=+1 next-line bonus (0.12 + time-pressure ramp) is removed so
-    # the next line must beat the current line on raw score alone. The current-line inertia
-    # bonus is also reduced from 0.22 to 0.05 (pure tiebreaker). Enables pure evidence-
-    # driven advancement — no time-based or positional nudges.
-    next_line_bias_enabled: bool = False
-    # Use char-4-gram overlap on full Unicode Gurmukhi verse text alongside first-letter
-    # scoring inside locked state. Takes max(FL_score, ngram_score) per line so it only
-    # helps, never hurts.
-    ngram_line_scoring: bool = True
-    # When True, line pointer positioning uses normalized word-set overlap instead of
-    # FL/ngram scoring — picks the verse that contains the most transcript words.
-    # Applies to all query lengths within the locked shabad. 2-word sequential match
-    # and the ngram/FL paths are bypassed when this is on.
-    word_match_line_scoring: bool = False
     # Minimum Gurmukhi word count in the transcript before the line pointer is updated.
     # 1-word fragments are too noisy to move the pointer. 2-word fragments are allowed
     # but use normalized full-word matching (not FL/ngram) — only within the current
@@ -213,25 +249,92 @@ class MatcherConfig(BaseModel):
     fast_switch_current_weak_score: float = 0.35  # treat current-line score below this as weak
     fast_switch_current_weak_windows: int = 2  # consecutive weak windows that unlock fast switch
     fast_switch_challenger_windows: int = 2  # challenger windows needed under fast-switch conditions
-    # --- Predictive line tracking ---
-    # Layer 1: time-aware progression bias (always active when LOCKED).
-    # Scales the delta=+1 bonus linearly from 0 → max as the current line ages.
-    predictive_time_bias_max: float = 0.03
-    # Layer 2: per-session dwell-time estimator (toggle).
-    predictive_dwell_enabled: bool = False
-    predictive_dwell_ema_alpha: float = 0.30
-    predictive_dwell_seed_seconds: float = 4.0
-    predictive_dwell_min_seconds: float = 0.8   # ignore dwells outside this range
-    predictive_dwell_max_seconds: float = 12.0
-    # Layer 3: tentative predictive advance (toggle).
-    predictive_advance_enabled: bool = False
-    predictive_advance_threshold: float = 0.88  # time_pressure (0–1.5) that triggers advance
-    predictive_advance_min_confirms: int = 3    # confirmed advances needed before predicting
-    predictive_advance_repeat_score: float = 0.62  # current-line score above this → assume tuk repeat
+    # Fast-response toggle — single switch for "react faster without lowering accuracy floors".
+    # When True the orchestrator uses:
+    #   * audio.fast_step_duration instead of audio.step_duration (capture cadence)
+    #   * fast_min_line_dwell_seconds instead of min_line_dwell_seconds (line move gate)
+    #   * fast_suggest_confirmation_seconds instead of suggest_confirmation_seconds
+    # All accuracy thresholds (auto/instant lock, line override score, etc.) stay the same.
+    fast_response_enabled: bool = False
+    fast_min_line_dwell_seconds: float = 3.0
+    fast_suggest_confirmation_seconds: float = 2.5
+
+
+class StreamingConfig(BaseModel):
+    """Streaming pipeline behavior — how audio is gated, decoded, and deduplicated.
+
+    All fields default to legacy behavior. Flip toggles via the dashboard or
+    edit `.runtime_settings.json["streaming"]` to A/B against the original
+    naive-sliding-window pipeline. See REA-10 for the full design.
+    """
+    # ── Streaming mode ──────────────────────────────────────────────────
+    # naive            — original: wake every step_duration, decode latest window
+    #                     (current default; preserves all behavior pre-REA-10).
+    # vad_segmented    — Silero VAD bounds utterances; Whisper runs once per utterance.
+    #                     Pankti boundaries are natural breath pauses, so each utterance
+    #                     ≈ one pankti. Eliminates window overlap and the dedup it requires.
+    # local_agreement  — accumulating audio buffer; commit only the longest token
+    #                     prefix two consecutive decodes agree on (Macháček 2023).
+    # hybrid           — VAD-bounded utterance buffers + LocalAgreement-2 inside.
+    #                     Production target.
+    streaming_mode: str = "naive"
+
+    # ── VAD ─────────────────────────────────────────────────────────────
+    # Backend selects the underlying detector:
+    #   "kirtan" — spectral voice-band detector (DEFAULT). Tuned for sung
+    #             Gurbani audio. Threshold operates on voice-band energy ratio
+    #             (300–3400 Hz / total). Empirically good on kirtan; Silero
+    #             was confirmed to reject sung Gurbani as non-speech.
+    #   "silero" — silero-vad. Use only for spoken katha-style content.
+    vad_backend: str = "kirtan"
+    # Detection threshold. Semantics depend on backend:
+    #   kirtan: voice-band energy ratio cutoff (0.0–1.0). Tuned on cached
+    #           kirtan eval — 0.65 produced p50=2.85 s utterances and 88 %
+    #           voice ratio (kirtan-shaped). See scripts/tune_vad.py.
+    #   silero: speech-probability cutoff (0.0–1.0).
+    vad_threshold: float = 0.65
+    # Minimum silence run after speech before declaring utterance offset.
+    # 200 ms tolerates mid-pankti breaths without splitting; 400 ms = more
+    # conservative. Tuned default keeps median utterance ≈ pankti length.
+    vad_min_silence_ms: int = 200
+    # Minimum confirmed speech run before declaring utterance onset.
+    # 300 ms suppresses spurious tabla transients while still catching short
+    # tuks and jaaps.
+    vad_min_speech_ms: int = 300
+    # Pad audio around utterance boundaries to avoid cutting off vowel tails.
+    vad_speech_pad_ms: int = 200
+    # Maximum utterance length before forced flush (safety bound for runaway sustains).
+    vad_max_utterance_ms: int = 30000
+
+    # ── LocalAgreement-2 ────────────────────────────────────────────────
+    # Number of consecutive decodes whose prefixes must agree before committing.
+    # 2 = standard whisper-streaming setting; 3+ = more conservative, slower commit.
+    local_agreement_n: int = 2
+    # How often to re-decode the streaming buffer.
+    local_agreement_decode_interval_ms: int = 1500
+    # Drop the streaming buffer once it exceeds this duration (forces a re-anchor).
+    local_agreement_max_buffer_ms: int = 20000
+
+    # ── Dedup strategy ──────────────────────────────────────────────────
+    # text       — current behavior: strip overlapping prefixes from the new
+    #              transcript when they match the tail of the last commit.
+    #              Side effect: drops legitimate repetition (rahau, jaap repetition).
+    # audio_time — only dedup when AUDIO time ranges overlap. Fixes legit repetition.
+    # none       — no dedup at all (raw segments through). Useful for streaming modes
+    #              that already commit at audio boundaries (vad_segmented, local_agreement).
+    dedup_strategy: str = "text"
+
+    # ── Locked-shabad prompt anchoring (REA-10) ─────────────────────────
+    # When the matcher is LOCKED on a shabad, pass the current pankti's
+    # Gurmukhi text to Whisper as ``initial_prompt``. Biases decode toward
+    # the actual shabad text — typically +5–10 WER points. Off by default
+    # because a wrong lock + prompt anchor double-down on the wrong text;
+    # enable once the matcher's lock confidence is trusted.
+    locked_prompt_anchor: bool = False
 
 
 class STTMConfig(BaseModel):
-    ports: list[int] = [8001, 1397, 1469, 1539, 1552, 1574, 1581, 1606, 1644, 1661, 1665, 1675, 1708]
+    ports: list[int] = [8001, 8000, 1397, 1469, 1539, 1552, 1574, 1581, 1606, 1644, 1661, 1665, 1675, 1708]
     connect_timeout: float = 1.0  # seconds per port attempt
     cdp_port: int = 9222  # Chrome DevTools Protocol port for Playwright
     controller_pin: int | None = 8945  # Optional Bani Controller PIN for authenticated control payloads
@@ -248,15 +351,13 @@ class DatabaseConfig(BaseModel):
     local_filename: str = "database.sqlite"  # resolved relative to project root
     hf_dataset_id: str = "surindersinghssj/sttm-gurbani-db"
     hf_filename: str = "database.sqlite"
-    # Search scope — False = all sources (SGGS + Dasam Granth + Vaaran Bhai Gurdas +
-    # Bhai Nand Lal + Sarabloh + Rehitname + …). True = SGGS only.
-    sggs_only: bool = False
 
 
 class AppConfig(BaseModel):
     audio: AudioConfig = AudioConfig()
     whisper: WhisperConfig = WhisperConfig()
     matcher: MatcherConfig = MatcherConfig()
+    streaming: StreamingConfig = StreamingConfig()
     sttm: STTMConfig = STTMConfig()
     dashboard: DashboardConfig = DashboardConfig()
     database: DatabaseConfig = DatabaseConfig()

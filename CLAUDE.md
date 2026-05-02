@@ -64,6 +64,23 @@ If `.venv/` is missing, recreate it:
 .venv/bin/pip install -r requirements.txt
 ```
 
+## Model artifacts (gitignored — regenerate locally)
+
+Large binaries under `data/` and `index/` are excluded from git. None ship in
+the repo; recreate them on a fresh checkout as needed:
+
+| Path | What it is | How to (re)build |
+| --- | --- | --- |
+| `data/surt-small-turbo-baseline-v0-{ct2,mlx}/`, `data/surt-small-turbo-baseline-v0{,-q8_0}.ggml`, `data/_baseline-v0-source/` | All four engine formats of the `surindersinghssj/surt-small-turbo-baseline-v0` model. | `.venv/bin/python scripts/preconvert_baseline_v0.py` (idempotent — skips formats that already exist). |
+| `data/surt-small-v3.ggml` (f16 reference) | f16 ggml of `surt-small-v3` for whisper.cpp. | Convert from the HF model with whisper.cpp's `models/convert-h5-to-ggml.py`. |
+| `data/surt-small-v3-q{4_0,5_1,8_0}.ggml` | Quantized variants used by `scripts/bench_engines.py`. | Build whisper.cpp's `quantize` binary, then `quantize data/surt-small-v3.ggml data/surt-small-v3-q8_0.ggml q8_0` (and `q5_1`, `q4_0`). |
+| `data/surt-small-v3-{ct2,mlx}/` | faster-whisper (CTranslate2) and mlx-whisper conversions. | `ct2-transformers-converter --model surindersinghssj/surt-small-v3 --output_dir data/surt-small-v3-ct2 --quantization int8` for ct2; `python -m mlx_whisper.convert --hf-repo surindersinghssj/surt-small-v3 --mlx-path data/surt-small-v3-mlx -q` for mlx. |
+| `index/*.faiss`, `index/*.pkl` | FAISS indexes for prototype semantic matching (`tests/eval/proto_*.py`). | Built from `database.sqlite` by the proto experiments — not on the production path. |
+| `tests/eval/cache/`, `tests/eval/runs/` | Cached YouTube audio + scorer outputs from past eval runs. | Repopulated automatically by `tests/eval/runner.py`. |
+
+`database.sqlite`, `data/gurbani.sqlite`, and `data/realm_verses.json` are
+auto-downloaded from HF on first run by the app itself (already noted above).
+
 ## Conventions
 
 - Use `async/await` throughout the pipeline

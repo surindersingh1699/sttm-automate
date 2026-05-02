@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
-from src.transcription.transliterate import extract_first_letters
+from src.transcription.transliterate import extract_first_letters, gurmukhi_to_ascii
 
 _DB = Path(__file__).parent.parent.parent / "database.sqlite"
 _SYNTH = 100_000_000
@@ -110,7 +110,7 @@ def _resolve_text_to_ids(text: str) -> tuple[int | None, int | None, int]:
     if not text or not text.strip():
         return None, None, 0
 
-    fl = extract_first_letters(text.strip())
+    fl = gurmukhi_to_ascii(extract_first_letters(text.strip()))
     if len(fl) < 2:
         return None, None, 0
 
@@ -196,6 +196,9 @@ def load_eval_sessions(
 
     print(f"[Dataset] Loading {dataset_name} …")
     ds = load_dataset(dataset_name, split=split)
+    audio_cols = [c for c in ds.column_names if "audio" in c.lower()]
+    if audio_cols:
+        ds = ds.remove_columns(audio_cols)
     print(f"[Dataset] {len(ds)} rows loaded.")
 
     by_video: dict[str, list[dict]] = {}
@@ -298,15 +301,12 @@ def _build_session(
             if sid not in ordered_shabads:
                 ordered_shabads.append(sid)
 
-    if len(ordered_shabads) < 2:
-        # Only one shabad in the session — nothing to drop would leave empty set.
-        # Keep it if the user explicitly passed a video_id filter, else skip.
-        pass
-
     excluded_ids: set[int | None] = set()
-    if len(ordered_shabads) >= 2:
-        excluded_ids.add(ordered_shabads[0])   # first shabad
-        excluded_ids.add(ordered_shabads[-1])  # last shabad
+    if len(ordered_shabads) >= 3:
+        excluded_ids.add(ordered_shabads[0])   # first shabad (intro)
+        excluded_ids.add(ordered_shabads[-1])  # last shabad (outro)
+    elif len(ordered_shabads) == 2:
+        excluded_ids.add(ordered_shabads[0])   # only exclude first (intro)
 
     # --- filter events, replacing excluded vocal rows with None-shabad markers ---
     events: list[GroundTruthEvent] = []

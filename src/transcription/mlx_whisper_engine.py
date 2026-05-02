@@ -87,7 +87,11 @@ class MlxWhisperEngine(BaseTranscriptionEngine):
         print("[MlxWhisper] Conversion complete.")
         return model_dir
 
-    def transcribe(self, audio: np.ndarray) -> list[TranscriptionSegment]:
+    def transcribe(
+        self,
+        audio: np.ndarray,
+        initial_prompt: str | None = None,
+    ) -> list[TranscriptionSegment]:
         if self._model_path is None:
             raise RuntimeError("Model not loaded. Call load() first.")
 
@@ -104,14 +108,23 @@ class MlxWhisperEngine(BaseTranscriptionEngine):
         }
         if self._language:
             kwargs["language"] = self._language
-        if config.whisper.single_temperature:
+        if initial_prompt:
+            kwargs["initial_prompt"] = initial_prompt[:140]
+        guards = config.whisper.hallucination_guards
+        if config.whisper.single_temperature and not guards:
             kwargs["temperature"] = 0.0
-        if config.whisper.allow_repetition:
+        if config.whisper.allow_repetition and not guards:
+            # Guards force the strict compression-ratio gate; allow_repetition is
+            # ignored when guards are on so hallucinations on noise get dropped.
             kwargs["compression_ratio_threshold"] = 10.0
         if config.whisper.independent_windows:
             kwargs["condition_on_previous_text"] = False
-        # mlx-whisper respects word_timestamps/no_speech_threshold defaults;
-        # decoder toggles that don't map are silently ignored (by design).
+        if guards:
+            kwargs["no_speech_threshold"] = config.whisper.hg_no_speech_thold
+            kwargs["logprob_threshold"] = config.whisper.hg_logprob_thold
+            kwargs["compression_ratio_threshold"] = config.whisper.hg_entropy_thold
+        # mlx-whisper respects word_timestamps defaults; toggles it doesn't map
+        # are silently ignored (by design).
 
         try:
             result = mlx_whisper.transcribe(audio.astype(np.float32), **kwargs)

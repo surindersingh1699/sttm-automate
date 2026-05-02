@@ -240,26 +240,6 @@ class ConfidenceScorer:
             return 0.0
         return _ngram_overlap(_char_4grams(normalized), _char_4grams(verse_unicode))
 
-    def score_line_word_overlap(self, transcript_text: str, verse_unicode: str) -> float:
-        """Word-set overlap: fraction of normalized transcript words found in the verse.
-
-        Used by the word_match_line_scoring toggle — picks the line that contains
-        the most transcript words regardless of order. Matras are stripped so
-        "ਨਾਮੁ" and "ਨਾਮਿ" both reduce to the same consonant stem. Returns |q ∩ v| / |q|.
-        """
-        if not transcript_text or not verse_unicode:
-            return 0.0
-        from src.transcription.transliterate import normalize_for_fullword_search
-        q_norm = _strip_matras(normalize_for_fullword_search(transcript_text))
-        v_norm = _strip_matras(normalize_for_fullword_search(verse_unicode))
-        if not q_norm or not v_norm:
-            return 0.0
-        q_words = set(q_norm.split())
-        v_words = set(v_norm.split())
-        if not q_words:
-            return 0.0
-        return len(q_words & v_words) / len(q_words)
-
     def score_line_word_match(self, transcript_text: str, verse_unicode: str) -> float:
         """Sequential normalized word match for short (2-word) queries within the locked shabad.
 

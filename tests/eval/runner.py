@@ -6,9 +6,9 @@ HeadlessSessionDriver  – downloads audio via yt-dlp (cached), feeds at 1×
                          speed into AudioCapture.push_external, uses a
                          MockSTTMController. Suitable for CI / regression gating.
 
-LiveSessionDriver      – Playwright opens YouTube in a visible Chromium window.
-                         Audio is captured via BlackHole loopback so the operator
-                         hears the kirtan and sees STTM Desktop update live.
+MicSessionDriver       – no Playwright. User plays audio through speakers, mic
+                         captures it. Pipeline listens for session.duration_s
+                         and scores the result.
 
 Both emit a JSONL event log via EventLogger and score via scorer.score_session().
 """
@@ -33,7 +33,7 @@ class SessionResult:
     session: SessionDescriptor
     metrics: SessionMetrics
     event_log_path: Path | None
-    mode: Literal["headless", "live"]
+    mode: Literal["headless", "mic"]
     wall_duration_s: float   # actual wall-clock time the run took
 
 
@@ -41,7 +41,7 @@ class SessionResult:
 
 async def _run_with_orchestrator(
     session: SessionDescriptor,
-    mode: Literal["headless", "live"],
+    mode: Literal["headless", "mic"],
     event_log: EventLogger,
     run_id: str,
     blackhole_device: int | None = None,
@@ -64,7 +64,7 @@ async def _run_with_orchestrator(
             audio_device=audio_device,
         )
     else:
-        # Live mode: use real STTMHttpController + BlackHole device for capture
+        # Live/mic mode: use real STTMHttpController + specified audio device
         from src.controller.sttm_http import STTMHttpController
         controller = STTMHttpController()
         orchestrator = PipelineOrchestrator(
@@ -80,7 +80,7 @@ async def _run_with_orchestrator(
         if mode == "headless":
             await _run_headless(session, orchestrator, progress_cb)
         else:
-            await _run_live(session, orchestrator, progress_cb)
+            await _run_mic(session, orchestrator, progress_cb)
     finally:
         try:
             await orchestrator.stop()
@@ -132,9 +132,34 @@ async def _run_headless(session: SessionDescriptor, orchestrator, progress_cb=No
     orchestrator._audio_source = "remote"
     orchestrator.running = True
 
-    # Start orchestrator internal tasks (capture + decode loop)
-    capture_task = asyncio.create_task(orchestrator._capture_tick_task())
-    decode_task = asyncio.create_task(orchestrator._decode_loop())
+    # Start orchestrator internal tasks. Honor streaming_mode (REA-10) — the
+    # naive path uses capture_tick + decode_loop; vad_segmented uses
+    # meter_tick + vad_streaming_loop. Modes that aren't wired yet
+    # (local_agreement, hybrid) fall back to naive — matches start().
+    streaming_mode = getattr(config.streaming, "streaming_mode", "naive")
+    if streaming_mode == "vad_segmented":
+        print(f"[Headless] streaming_mode=vad_segmented")
+        orchestrator_tasks = [
+            asyncio.create_task(orchestrator._meter_tick_task()),
+            asyncio.create_task(orchestrator._vad_streaming_loop()),
+        ]
+    elif streaming_mode == "local_agreement":
+        print(f"[Headless] streaming_mode=local_agreement")
+        orchestrator_tasks = [
+            asyncio.create_task(orchestrator._meter_tick_task()),
+            asyncio.create_task(orchestrator._local_agreement_loop()),
+        ]
+    elif streaming_mode == "hybrid":
+        print(f"[Headless] streaming_mode=hybrid")
+        orchestrator_tasks = [
+            asyncio.create_task(orchestrator._meter_tick_task()),
+            asyncio.create_task(orchestrator._hybrid_streaming_loop()),
+        ]
+    else:
+        orchestrator_tasks = [
+            asyncio.create_task(orchestrator._capture_tick_task()),
+            asyncio.create_task(orchestrator._decode_loop()),
+        ]
 
     # Feed audio at 1× speed
     feed_task = asyncio.create_task(
@@ -160,7 +185,7 @@ async def _run_headless(session: SessionDescriptor, orchestrator, progress_cb=No
     finally:
         stop_event.set()
         orchestrator.running = False
-        for task in (capture_task, decode_task, progress_task):
+        for task in (*orchestrator_tasks, progress_task):
             task.cancel()
             try:
                 await task
@@ -168,47 +193,33 @@ async def _run_headless(session: SessionDescriptor, orchestrator, progress_cb=No
                 pass
 
 
-# ── live run ─────────────────────────────────────────────────────────────────
+# ── mic run ──────────────────────────────────────────────────────────────────
 
-async def _run_live(session: SessionDescriptor, orchestrator, progress_cb=None):
-    """Playwright opens YouTube; BlackHole feeds real audio to the pipeline."""
-    from tests.eval.playback import PlaywrightYouTubeDriver
-
-    driver = PlaywrightYouTubeDriver(
-        video_id=session.video_id,
-        audio_t0=session.audio_t0,
-        headless=False,
+async def _run_mic(session: SessionDescriptor, orchestrator, progress_cb=None):
+    """Mic-only live eval — no Playwright. User plays the video manually.
+    Pipeline listens via mic for session.duration_s and scores the result."""
+    print(
+        f"[Mic] ▶ Play this video NOW and seek to {session.audio_t0:.0f}s:\n"
+        f"        https://www.youtube.com/watch?v={session.video_id}"
+        f"&t={int(session.audio_t0)}s\n"
+        f"[Mic] Recording for {session.duration_s:.0f}s…"
     )
-
-    # start() also starts the audio stream from BlackHole
-    print(f"[Live] Starting pipeline for {session.session_id}…")
     pipeline_task = asyncio.create_task(orchestrator.start())
+    await asyncio.sleep(1)  # let pipeline warm up
 
-    # Let pipeline warm up
-    await asyncio.sleep(1)
+    elapsed = 0.0
+    step = 3.0
+    while elapsed < session.duration_s:
+        await asyncio.sleep(step)
+        elapsed += step
+        if progress_cb:
+            await progress_cb(elapsed, session.duration_s, session.session_id)
 
-    # Open YT
-    await driver.open()
-
-    # Periodically skip ads
-    async def _ad_skipper():
-        for _ in range(int(session.duration_s / 5)):
-            await asyncio.sleep(5)
-            await driver.skip_ads()
-
-    ad_task = asyncio.create_task(_ad_skipper())
-
+    pipeline_task.cancel()
     try:
-        # Wait for the session audio to finish
-        await asyncio.sleep(session.duration_s + 5)  # +5 s buffer
-    finally:
-        ad_task.cancel()
-        pipeline_task.cancel()
-        try:
-            await pipeline_task
-        except (asyncio.CancelledError, Exception):
-            pass
-        await driver.close()
+        await pipeline_task
+    except (asyncio.CancelledError, Exception):
+        pass
 
 
 # ── public API ───────────────────────────────────────────────────────────────
@@ -234,31 +245,20 @@ class HeadlessSessionDriver:
         )
 
 
-class LiveSessionDriver:
-    """Run one session in live mode (Playwright + BlackHole + real STTM)."""
+class MicSessionDriver:
+    """Mic-only eval — no Playwright. Prints a prompt to play the video manually."""
 
-    def __init__(self, run_id: str, blackhole_device: int | None = None):
+    def __init__(self, run_id: str, audio_device: int | None = None):
         self.run_id = run_id
-        self.blackhole_device = blackhole_device
+        self.audio_device = audio_device
 
-    async def run_session(
-        self,
-        session: SessionDescriptor,
-        progress_cb=None,
-    ) -> SessionResult:
-        from src.audio.capture import AudioCapture
-        bh = self.blackhole_device or AudioCapture.find_blackhole_device()
-        if bh is None:
-            raise RuntimeError(
-                "BlackHole audio device not found. "
-                "Install blackhole-2ch and create a Multi-Output Device."
-            )
-        log = EventLogger(
-            out_path=_RUNS_DIR / self.run_id / f"{session.session_id}.jsonl"
-        )
+    async def run_session(self, session: SessionDescriptor, progress_cb=None) -> SessionResult:
+        log = EventLogger(out_path=_RUNS_DIR / self.run_id / f"{session.session_id}.jsonl")
         return await _run_with_orchestrator(
-            session, mode="live",
+            session, mode="mic",
             event_log=log, run_id=self.run_id,
-            blackhole_device=bh,
+            blackhole_device=self.audio_device,
             progress_cb=progress_cb,
         )
+
+

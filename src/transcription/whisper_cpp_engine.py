@@ -29,9 +29,10 @@ _LEADING_GARBAGE = re.compile(
 class WhisperCppEngine(BaseTranscriptionEngine):
     """Transcribes audio using whisper.cpp via pywhispercpp."""
 
-    def __init__(self):
+    def __init__(self, model_path: str | None = None):
         self._model = None
         self._language: str | None = config.whisper.language or None
+        self._model_path_override: str | None = model_path
 
     def load(self):
         try:
@@ -41,7 +42,7 @@ class WhisperCppEngine(BaseTranscriptionEngine):
                 "pywhispercpp not installed. `pip install pywhispercpp`."
             ) from e
 
-        model_path = self._resolve_model_path()
+        model_path = self._resolve_model_path(self._model_path_override)
         print(
             f"[WhisperCpp] Loading {model_path} "
             f"(threads={config.whisper.whisper_cpp_threads}, "
@@ -58,9 +59,9 @@ class WhisperCppEngine(BaseTranscriptionEngine):
         print("[WhisperCpp] Ready.")
 
     @staticmethod
-    def _resolve_model_path() -> Path:
+    def _resolve_model_path(override: str | None = None) -> Path:
         """Return GGML file path; convert HF→GGML on first load if missing."""
-        raw = config.whisper.whisper_cpp_model_path
+        raw = override or config.whisper.whisper_cpp_model_path
         if not raw:
             raise RuntimeError(
                 "whisper.cpp engine requires `config.whisper.whisper_cpp_model_path`."
@@ -86,7 +87,11 @@ class WhisperCppEngine(BaseTranscriptionEngine):
         print("[WhisperCpp] Conversion complete.")
         return p
 
-    def transcribe(self, audio: np.ndarray) -> list[TranscriptionSegment]:
+    def transcribe(
+        self,
+        audio: np.ndarray,
+        initial_prompt: str | None = None,
+    ) -> list[TranscriptionSegment]:
         if self._model is None:
             raise RuntimeError("Model not loaded. Call load() first.")
 
@@ -98,10 +103,22 @@ class WhisperCppEngine(BaseTranscriptionEngine):
         kwargs: dict = {}
         if self._language:
             kwargs["language"] = self._language
+        if initial_prompt:
+            # whisper.cpp uses ``initial_prompt`` (same name as upstream Whisper).
+            kwargs["initial_prompt"] = initial_prompt[:140]
         if config.whisper.single_temperature:
             kwargs["temperature"] = 0.0
         if config.whisper.independent_windows:
             kwargs["no_context"] = True
+        if config.whisper.hallucination_guards:
+            # Whisper.cpp will retry suspect segments up the temperature ladder
+            # and drop them if no temperature passes all thresholds. We do NOT
+            # pass suppress_non_speech_tokens — it over-suppresses on Gurmukhi
+            # audio (Whisper's "non-speech" tokens overlap with sung phonemes).
+            kwargs["no_speech_thold"] = config.whisper.hg_no_speech_thold
+            kwargs["logprob_thold"] = config.whisper.hg_logprob_thold
+            kwargs["entropy_thold"] = config.whisper.hg_entropy_thold
+            kwargs["temperature_inc"] = config.whisper.hg_temperature_inc
 
         try:
             segments = self._model.transcribe(audio, **kwargs)
@@ -124,4 +141,14 @@ class WhisperCppEngine(BaseTranscriptionEngine):
             t0 = float(getattr(seg, "t0", 0)) / 100.0
             t1 = float(getattr(seg, "t1", 0)) / 100.0
             out.append(TranscriptionSegment(start=t0, end=t1, text=text))
+
+        if config.whisper.hallucination_guards and not out:
+            # If guards dropped everything, log it so we can tell guards-vs-noise apart.
+            print(
+                f"[WhisperCpp-guards] empty transcript "
+                f"(audio_s={len(audio) / 16000:.1f}s, "
+                f"no_speech={config.whisper.hg_no_speech_thold}, "
+                f"logprob={config.whisper.hg_logprob_thold}, "
+                f"entropy={config.whisper.hg_entropy_thold})"
+            )
         return out

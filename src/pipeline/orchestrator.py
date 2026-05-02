@@ -7,6 +7,8 @@ from typing import Callable, Awaitable
 
 from src.config import config
 from src.audio.capture import AudioCapture
+from src.audio.vad import StreamingVAD, Utterance
+from src.pipeline.local_agreement import LocalAgreementBuffer
 from src.transcription.factory import create_engine
 from src.transcription.processor import TranscriptionProcessor
 from src.transcription.transliterate import extract_first_letters
@@ -33,6 +35,17 @@ def _is_vowel_only(word: str) -> bool:
     """True when every Gurmukhi character in the word is a standalone vowel or matra."""
     gurmukhi_chars = [ch for ch in word if "\u0A00" <= ch <= "\u0A7F"]
     return bool(gurmukhi_chars) and all(ch in _GURMUKHI_VOWELS for ch in gurmukhi_chars)
+
+
+def _text_to_segments(text: str):
+    """Wrap a plain text string into a single-element ``TranscriptionSegment``
+    list so ``LocalAgreementBuffer.commit_decode`` (which expects segments)
+    can consume both raw Whisper output and post-processed strings."""
+    from src.transcription.engine import TranscriptionSegment
+
+    if not text:
+        return []
+    return [TranscriptionSegment(start=0.0, end=0.0, text=text)]
 
 
 def _is_alaap_output(transcript_text: str) -> bool:
@@ -105,8 +118,9 @@ class PipelineOrchestrator:
         self._broadcast = broadcast or self._noop_broadcast
         self.running = False
         self.paused = False
+        self.mic_muted = False  # When True, local mic stream is stopped and remote audio is dropped.
         self._audio_source = "local"  # "local" or "remote"
-        # Parallel capture ↔ decode handoff.
+        # Parallel capture ↔ decode handoff (naive streaming mode).
         # The capture task wakes every `step_duration` seconds, grabs the newest
         # `window_duration` seconds of audio from the AudioCapture ring, and stashes
         # it here. The decode task awaits `_window_ready`, reads whatever is most
@@ -116,6 +130,9 @@ class PipelineOrchestrator:
         self._latest_window_data: dict | None = None
         self._window_ready = asyncio.Event()
         self._latest_window_lock = asyncio.Lock()
+        # Live VAD instance (REA-10) — only constructed when streaming_mode is
+        # vad_segmented or hybrid; ``flush_context`` resets it.
+        self._streaming_vad: StreamingVAD | None = None
         self._weak_line_windows = 0
         self._silence_windows = 0
         self._after_break_windows = 0
@@ -142,11 +159,10 @@ class PipelineOrchestrator:
         # to suppress fast-switch counting on micro (3 s) windows, which are inherently
         # noisier per-window and must not by themselves trigger a lock change.
         self._last_listening_mode: str = "search"
-        # Predictive line tracking (Layers 2 & 3).
-        self._line_dwell_history: list[float] = []
-        self._ema_dwell_seconds: float = config.matcher.predictive_dwell_seed_seconds
-        self._confirmed_advance_count: int = 0
-        self._predicted_line_idx: int | None = None
+        # REA-11 zero-overlap mode: cache the most recent dynamic window
+        # duration so _active_step_duration() can use it as the next hop.
+        # 0.0 means "no decode yet" → falls through to step_duration default.
+        self._last_window_seconds: float = 0.0
         # Manual navigation override — after the operator jumps to a line, suppress
         # automatic backward movement for this many windows so the pipeline doesn't
         # snap back to wherever the audio was.
@@ -184,23 +200,73 @@ class PipelineOrchestrator:
         if not connected:
             print("[Pipeline] WARNING: STTM not connected. Running in monitor-only mode.")
 
-        print("[Pipeline] Starting audio capture...")
-        audio_ok = self.audio.start()
-        if not audio_ok:
-            print("[Pipeline] No local audio available. Defaulting to remote mic mode.")
-            self._audio_source = "remote"
-            await self._broadcast({"type": "audio_source_updated", "source": "remote"})
+        if self.mic_muted:
+            print("[Pipeline] Mic muted on startup — skipping audio capture.")
+        else:
+            print("[Pipeline] Starting audio capture...")
+            audio_ok = self.audio.start()
+            if not audio_ok:
+                print("[Pipeline] No local audio available. Defaulting to remote mic mode.")
+                self._audio_source = "remote"
+                await self._broadcast({"type": "audio_source_updated", "source": "remote"})
         self.running = True
 
+        # REA-10: streaming-mode dispatch. All four modes wired:
+        #   naive            — original capture-tick + decode-loop
+        #   vad_segmented    — KirtanVAD utterance-bounded decode
+        #   local_agreement  — re-decode growing buffer, commit on agreement
+        #   hybrid           — VAD bounds + LocalAgreement-2 inside utterance
+        mode = getattr(config.streaming, "streaming_mode", "naive")
+        if mode == "vad_segmented":
+            print(
+                f"[Pipeline] streaming_mode=vad_segmented — driving decode from "
+                f"VAD utterance boundaries (backend={config.streaming.vad_backend}, "
+                f"threshold={config.streaming.vad_threshold}, "
+                f"min_silence={config.streaming.vad_min_silence_ms}ms, "
+                f"min_speech={config.streaming.vad_min_speech_ms}ms)"
+            )
+        elif mode == "local_agreement":
+            print(
+                f"[Pipeline] streaming_mode=local_agreement — re-decode "
+                f"buffer every {config.streaming.local_agreement_decode_interval_ms}ms, "
+                f"commit on {config.streaming.local_agreement_n}-way agreement"
+            )
+        elif mode == "hybrid":
+            print(
+                f"[Pipeline] streaming_mode=hybrid — VAD utterance bounds + "
+                f"LocalAgreement-2 mid-utterance commits "
+                f"(decode_interval={config.streaming.local_agreement_decode_interval_ms}ms)"
+            )
+
         print("[Pipeline] Pipeline running. Listening for kirtan...")
-        # Capture ticks on wall-clock time; decode runs at Whisper's pace and always
-        # picks up the freshest snapshot. Running them concurrently is what keeps the
-        # UI live even when the decoder is slower than realtime.
-        capture_task = asyncio.create_task(self._capture_tick_task())
-        decode_task = asyncio.create_task(self._decode_loop())
+        # Streaming-mode-aware task layout. The naive path keeps capture and
+        # decode tasks coupled via _latest_window_data. The vad_segmented and
+        # hybrid paths run the VAD inline with audio capture and use a separate
+        # meter task to keep the dashboard's audio-level indicator live (since
+        # the VAD task only fires per utterance, not per tick).
+        if mode == "vad_segmented":
+            tasks = {
+                asyncio.create_task(self._meter_tick_task()),
+                asyncio.create_task(self._vad_streaming_loop()),
+            }
+        elif mode == "local_agreement":
+            tasks = {
+                asyncio.create_task(self._meter_tick_task()),
+                asyncio.create_task(self._local_agreement_loop()),
+            }
+        elif mode == "hybrid":
+            tasks = {
+                asyncio.create_task(self._meter_tick_task()),
+                asyncio.create_task(self._hybrid_streaming_loop()),
+            }
+        else:
+            tasks = {
+                asyncio.create_task(self._capture_tick_task()),
+                asyncio.create_task(self._decode_loop()),
+            }
         try:
             done, pending = await asyncio.wait(
-                {capture_task, decode_task}, return_when=asyncio.FIRST_COMPLETED
+                tasks, return_when=asyncio.FIRST_COMPLETED
             )
             for task in pending:
                 task.cancel()
@@ -228,6 +294,33 @@ class PipelineOrchestrator:
         """Resume automatic processing."""
         self.paused = False
 
+    def set_mic_muted(self, muted: bool) -> bool:
+        """Mute or unmute the microphone.
+
+        Mute fully releases the OS-level audio device (so the system mic-in-use
+        indicator turns off and other apps can claim it) and drops any remote
+        audio pushed while muted. Unmute restarts local capture if the source
+        is "local". Returns True on success.
+        """
+        muted = bool(muted)
+        if muted == self.mic_muted:
+            return True
+        if muted:
+            self.mic_muted = True
+            self.audio.stop()
+            self.audio.reset_ring()
+            print("[Pipeline] Mic muted.")
+            return True
+        # Unmuting
+        self.mic_muted = False
+        if self._audio_source == "local":
+            if not self.audio.start():
+                print("[Pipeline] Could not restart local audio on unmute.")
+                return False
+        self.audio.reset_ring()
+        print("[Pipeline] Mic unmuted.")
+        return True
+
     def set_audio_source(self, source: str):
         """Switch between 'local' (server mic) and 'remote' (browser mic)."""
         if source not in ("local", "remote"):
@@ -238,7 +331,10 @@ class PipelineOrchestrator:
         if source == "remote":
             self.audio.stop()
         elif source == "local":
-            if not self.audio.start():
+            if self.mic_muted:
+                # Honour mute — don't reopen the device; flip will take effect on unmute.
+                pass
+            elif not self.audio.start():
                 print("[Pipeline] No local audio hardware. Staying on remote mic.")
                 self._audio_source = "remote"
                 return
@@ -273,7 +369,7 @@ class PipelineOrchestrator:
         self.audio.stop()
         self.audio = AudioCapture(device=device_index)
         config.audio.device = device_index
-        if self._audio_source == "local":
+        if self._audio_source == "local" and not self.mic_muted:
             if not self.audio.start():
                 print(f"[Pipeline] Could not start audio device {device_index}.")
                 return False
@@ -300,6 +396,8 @@ class PipelineOrchestrator:
         Remote audio shares the same ring as the local mic — the decode path
         never has to branch on source, and old samples roll off naturally.
         """
+        if self.mic_muted:
+            return
         self.audio.push_external(audio_data)
 
     async def manual_select(self, shabad_id: int):
@@ -346,8 +444,6 @@ class PipelineOrchestrator:
         self._recent_line_scores.clear()
         self._alap_detour_wins.clear()
         self._current_weak_windows = 0
-        self._confirmed_advance_count = 0
-        self._predicted_line_idx = None
         self._suggest_first_seen.clear()
         self._challenger_first_seen.clear()
         self._alaap_window_count = 0
@@ -379,15 +475,14 @@ class PipelineOrchestrator:
         self._alap_detour_wins.clear()
         self._current_weak_windows = 0
         self.tracker.clear_short_term_memory()
-        self._line_dwell_history.clear()
-        self._ema_dwell_seconds = config.matcher.predictive_dwell_seed_seconds
-        self._confirmed_advance_count = 0
-        self._predicted_line_idx = None
         self._suggest_first_seen.clear()
         self._challenger_first_seen.clear()
         self._alaap_window_count = 0
         self._in_transition_mode = False
         self._transition_alaap_seconds = 0.0
+        # Reset VAD state so partial-utterance audio doesn't leak across the flush.
+        if self._streaming_vad is not None:
+            self._streaming_vad.reset()
         print("[Pipeline] Context flushed — starting from fresh audio.")
         await self._broadcast({
             "type": "context_flushed",
@@ -457,6 +552,30 @@ class PipelineOrchestrator:
                 "silence_autolock_min_score": 0.75,
                 "candidate_lock_miss_windows": 5,
             },
+            # Gurudwara — tighter than conservative on every threshold.
+            # Live PA reverb, sangat noise, and the public visibility of false
+            # locks all argue for "rather wait than lock wrong". Pair with the
+            # streaming/VAD overrides documented in REA-10 ticket.
+            "gurudwara": {
+                "auto_threshold": 0.85,
+                "instant_lock_threshold": 0.92,
+                "min_raw_lock_score": 0.78,
+                "word_overlap_auto_min": 2,
+                "word_overlap_evidence_min": 2,
+                "word_overlap_instant_min": 2,
+                "instant_challenger_switch_score": 0.95,
+                "instant_challenger_switch_margin": 0.16,
+                "word_overlap_instant_challenger_min": 2,
+                "suggest_threshold": 0.70,
+                "challenger_margin": 0.16,
+                "challenger_windows": 5,
+                "candidate_lock_windows": 3,
+                "weak_line_recovery_windows": 4,
+                "recovery_challenger_score": 0.78,
+                "local_line_follow_threshold": 0.50,
+                "silence_autolock_min_score": 0.92,
+                "candidate_lock_miss_windows": 3,
+            },
         }
         selected = profiles.get(mode, profiles["balanced"])
         config.matcher.auto_threshold = selected["auto_threshold"]
@@ -488,11 +607,24 @@ class PipelineOrchestrator:
     def confidence_mode(self) -> str:
         return self._confidence_mode
 
-    def reset_predictive_dwell(self):
-        """Clear dwell history and reset EMA when Layer 2 is toggled off."""
-        self._line_dwell_history.clear()
-        self._ema_dwell_seconds = config.matcher.predictive_dwell_seed_seconds
-        self._confirmed_advance_count = 0
+    def _build_locked_prompt(self) -> str | None:
+        """Return Gurmukhi prompt text for the current pankti, or None.
+
+        Used when ``config.streaming.locked_prompt_anchor`` is enabled. We
+        prefer the current line (most accurate "what's about to be sung")
+        but fall back to the first line if the tracker is between lines.
+        Returns None when the pipeline is not locked, so the engine reverts
+        to its default no-prompt behavior.
+        """
+        current = self.tracker.current
+        if current is None or self.tracker.state != PipelineState.LOCKED:
+            return None
+        if not current.verses:
+            return None
+        line_idx = max(0, min(current.current_line, len(current.verses) - 1))
+        verse = current.verses[line_idx]
+        text = (verse.unicode or "").strip()
+        return text or None
 
     async def recall_shabad(self, shabad_id: int):
         """Recall a shabad from history."""
@@ -520,8 +652,9 @@ class PipelineOrchestrator:
         waits on Whisper. This is what keeps the dashboard's audio level and
         vocal-break detection live even when decode is behind.
         """
-        step = max(0.1, float(config.audio.step_duration))
         while self.running:
+            # Re-read each iteration so the fast-response toggle takes effect live.
+            step = max(0.1, float(self._active_step_duration()))
             try:
                 fresh_chunk = self.audio.latest_window(step)
                 window = self.audio.latest_window(config.audio.window_duration)
@@ -531,6 +664,9 @@ class PipelineOrchestrator:
                 self._update_vocal_break_state(has_vocals)
 
                 audio_for_stt, listening_mode, window_seconds = self._select_transcription_audio(window)
+                # Cache for zero-overlap mode: next _active_step_duration() will
+                # return this value so the next wake equals what we just decoded.
+                self._last_window_seconds = float(window_seconds)
 
                 await self._broadcast({
                     "type": "audio_level",
@@ -562,6 +698,10 @@ class PipelineOrchestrator:
         `step_duration`, the capture task has already overwritten the window slot
         with newer audio — we pick up that newer snapshot on the next iteration
         and skip the intermediate ones. This prevents backlog accumulation.
+
+        Body delegated to ``_process_one_audio_window`` so the vad_segmented
+        and (future) local_agreement modes share the same matcher pipeline
+        without duplicating the state machine.
         """
         import time as _time
 
@@ -574,202 +714,718 @@ class PipelineOrchestrator:
                     self._window_ready.clear()
                 if window_data is None:
                     continue
+                await self._process_one_audio_window(
+                    audio=window_data["audio"],
+                    listening_mode=window_data["listening_mode"],
+                    window_seconds=window_data["window_seconds"],
+                    has_vocals=window_data["has_vocals"],
+                    chunk_rms=window_data["chunk_rms"],
+                    now_mono=_time.monotonic(),
+                )
+            except Exception as e:
+                print(f"[Pipeline] Error in decode loop: {e}")
+                await self._broadcast({"type": "error", "message": str(e)})
+                await asyncio.sleep(1)
 
-                self._window_index += 1
-                # Stale-memory reset: if this window arrives too long after the last
-                # one (ASR lag, paused pipeline, etc.) the suggest/challenger timestamps
-                # are from a different audio context and must be discarded.
-                import time as _time_now
-                _now_mono = _time_now.monotonic()
-                if (
-                    self._last_window_timestamp > 0
-                    and (_now_mono - self._last_window_timestamp)
-                    > config.matcher.stale_memory_threshold_seconds
-                ):
-                    self._suggest_first_seen.clear()
-                    self._challenger_first_seen.clear()
-                    print(
-                        f"  [STALE RESET] gap={_now_mono - self._last_window_timestamp:.1f}s "
-                        f"> {config.matcher.stale_memory_threshold_seconds:.0f}s — "
-                        "suggest/challenger memory cleared"
+    # ──────────────────────────────────────────────────────────────────
+    # vad_segmented streaming mode (REA-10 Phase 2)
+    # ──────────────────────────────────────────────────────────────────
+
+    def _make_streaming_vad(self) -> StreamingVAD:
+        """Construct a fresh StreamingVAD wired to the current config knobs."""
+        return StreamingVAD(
+            backend=config.streaming.vad_backend,
+            threshold=float(config.streaming.vad_threshold),
+            min_silence_ms=int(config.streaming.vad_min_silence_ms),
+            min_speech_ms=int(config.streaming.vad_min_speech_ms),
+            speech_pad_ms=int(config.streaming.vad_speech_pad_ms),
+            max_utterance_ms=int(config.streaming.vad_max_utterance_ms),
+        )
+
+    async def _meter_tick_task(self):
+        """Lightweight ticker that keeps the dashboard's audio-level meter +
+        vocal-break detection live in vad_segmented mode.
+
+        Runs at a fixed cadence (independent of utterance boundaries) and
+        broadcasts ``audio_level`` events. Cheap — only RMS + the existing
+        ``has_vocal_content`` gate, no Whisper. Without this, the dashboard's
+        audio bar would only update once per VAD utterance (1–8 s gaps).
+        """
+        meter_period_s = 0.5
+        while self.running:
+            try:
+                fresh = self.audio.latest_window(meter_period_s)
+                import numpy as _np
+                chunk_rms = float(_np.sqrt(_np.mean(fresh ** 2))) if fresh.size else 0.0
+                # has_vocal_content is the project's existing kirtan-friendly
+                # presence detector — a simple RMS gate. We keep using it
+                # alongside VAD to drive vocal-break state; VAD itself only
+                # tells us about utterance boundaries.
+                has_vocals = bool(self.transcriber.has_vocal_content(fresh))
+                self._update_vocal_break_state(has_vocals)
+                await self._broadcast({
+                    "type": "audio_level",
+                    "rms": round(chunk_rms, 4),
+                    "has_vocals": has_vocals,
+                    "speech_rate_lps": round(self._speech_rate_lps, 2),
+                    "listening_mode": "utterance",
+                    "window_seconds": 0.0,
+                })
+            except Exception as e:
+                print(f"[Pipeline] Meter tick error: {e}")
+            await asyncio.sleep(meter_period_s)
+
+    async def _vad_streaming_loop(self):
+        """Drive Whisper from VAD utterance boundaries, not a fixed clock.
+
+        Polls the audio capture ring at a small step, feeds new samples into
+        StreamingVAD, and runs Whisper exactly once per VAD-bounded utterance.
+        Each second of audio is decoded ~once instead of ~3× — the headline
+        CPU win in REA-10.
+
+        Mic-mute and source-switch are honored via the audio ring (if the ring
+        is empty/silent, VAD never fires). Pause is honored by checking the
+        flag at utterance dispatch time. ``flush_context`` resets the VAD
+        state so we don't carry stale partial-utterance buffers across an
+        operator-initiated reset.
+        """
+        import time as _time
+        import numpy as _np
+
+        vad = self._make_streaming_vad()
+        self._streaming_vad = vad
+        # Poll cadence — tight enough that audio doesn't backlog in the ring,
+        # loose enough that the asyncio loop has slack for the meter task and
+        # for Whisper inference. 100 ms is a comfortable middle.
+        poll_period_s = 0.1
+        last_seen_samples = self.audio.samples_written()
+
+        while self.running:
+            try:
+                # Pull only the audio that has arrived since our last poll.
+                # We can't ask the ring for "samples since N" directly — it
+                # only exposes the latest N seconds — so we read at our poll
+                # cadence and let any small overlap be re-fed to VAD harmlessly.
+                # Silero / KirtanVAD score frames independently; redundant
+                # frames just produce the same prob and don't open a second
+                # utterance.
+                cur_samples = self.audio.samples_written()
+                samples_delta = max(0, cur_samples - last_seen_samples)
+                if samples_delta == 0:
+                    await asyncio.sleep(poll_period_s)
+                    continue
+                # Cap the read at one poll-period of audio so we never try to
+                # process more than ~poll_period_s + ring_size of samples.
+                read_seconds = min(
+                    samples_delta / float(config.audio.samplerate),
+                    poll_period_s * 4,
+                )
+                fresh = self.audio.latest_window(read_seconds)
+                last_seen_samples = cur_samples
+
+                if self.paused or fresh.size == 0:
+                    await asyncio.sleep(poll_period_s)
+                    continue
+
+                # Feed VAD; collect any utterances that closed during this poll.
+                utterances = await asyncio.to_thread(vad.feed, fresh)
+                for utt in utterances:
+                    # Skip suspiciously-short utterances — VAD min_speech_ms
+                    # already filters most, but a forced flush at utterance-
+                    # boundary can produce a short tail. We don't want to
+                    # spend a Whisper call on 200 ms of audio.
+                    if utt.duration_s < 0.4:
+                        continue
+                    chunk_rms = float(_np.sqrt(_np.mean(utt.audio ** 2)))
+                    await self._process_one_audio_window(
+                        audio=utt.audio,
+                        listening_mode="utterance",
+                        window_seconds=float(utt.duration_s),
+                        has_vocals=True,  # by construction — VAD said so
+                        chunk_rms=chunk_rms,
+                        now_mono=_time.monotonic(),
                     )
-                self._last_window_timestamp = _now_mono
-                audio_for_stt = window_data["audio"]
-                listening_mode = window_data["listening_mode"]
-                self._last_listening_mode = listening_mode
-                window_seconds = window_data["window_seconds"]
-                chunk_rms = window_data["chunk_rms"]
-                has_vocals = window_data["has_vocals"]
+            except Exception as e:
+                print(f"[Pipeline] VAD streaming loop error: {e}")
+                await self._broadcast({"type": "error", "message": str(e)})
+                await asyncio.sleep(1)
+            await asyncio.sleep(poll_period_s)
+
+    # ──────────────────────────────────────────────────────────────────
+    # local_agreement streaming mode (REA-10 Phase 3)
+    # ──────────────────────────────────────────────────────────────────
+
+    async def _local_agreement_loop(self):
+        """LocalAgreement-2 (Macháček et al. 2023): re-decode a growing audio
+        buffer every ``decode_interval_ms``, commit only the longest text
+        prefix that two consecutive decodes agree on. The committed text
+        runs through the matcher pipeline; the rest stays in the buffer
+        until the next decode either confirms it (→ agreement → commit) or
+        revises it.
+
+        Trade vs. naive: similar steady-state CPU but **lower flicker** —
+        nothing reaches the matcher until it has been confirmed by two
+        decodes in a row. Trade vs. vad_segmented: higher CPU (re-decodes
+        same audio multiple times), lower latency (commits land before any
+        VAD offset would).
+        """
+        import time as _time
+        import numpy as _np
+
+        buf = LocalAgreementBuffer(
+            agreement_n=int(config.streaming.local_agreement_n),
+            max_buffer_ms=int(config.streaming.local_agreement_max_buffer_ms),
+        )
+        self._local_agreement_buf = buf
+        decode_interval_s = max(
+            0.5, float(config.streaming.local_agreement_decode_interval_ms) / 1000.0
+        )
+        # Minimum buffer size before we even try to decode — Whisper short
+        # clips waste compute and produce nothing useful.
+        min_decode_samples = int(0.6 * config.audio.samplerate)
+        last_decode_t = _time.monotonic() - decode_interval_s
+        last_seen_samples = self.audio.samples_written()
+
+        print(
+            f"[Pipeline] LocalAgreement-2 active: agreement_n="
+            f"{buf.agreement_n}, decode_interval={decode_interval_s:.2f}s, "
+            f"max_buffer={config.streaming.local_agreement_max_buffer_ms}ms"
+        )
+
+        while self.running:
+            try:
+                # Pull whatever audio has arrived since our last poll into the
+                # LocalAgreement buffer. We don't dedupe at the byte level —
+                # short overlaps (a few ms) just get re-fed and don't change
+                # the agreement state.
+                cur = self.audio.samples_written()
+                samples_delta = max(0, cur - last_seen_samples)
+                if samples_delta > 0:
+                    read_seconds = min(
+                        samples_delta / float(config.audio.samplerate),
+                        decode_interval_s * 2,
+                    )
+                    fresh = self.audio.latest_window(read_seconds)
+                    if fresh.size:
+                        buf.append(fresh)
+                    last_seen_samples = cur
+
+                now = _time.monotonic()
+                if now - last_decode_t < decode_interval_s:
+                    await asyncio.sleep(0.05)
+                    continue
+                last_decode_t = now
 
                 if self.paused:
-                    await self._broadcast({"type": "paused"})
                     await asyncio.sleep(0.1)
                     continue
 
-                # Skip transcription if no vocal content (just music/silence)
-                if not has_vocals:
-                    self._prev_first_letters = ""
-                    self._speech_rate_lps *= 0.9
-                    await self._try_silence_autolock()
-                    await self._broadcast({
-                        "type": "transcription",
-                        "text": "",
-                        "first_letters": "",
-                        "status": "music_only",
-                    })
+                if buf.buffer_samples() < min_decode_samples:
+                    await asyncio.sleep(0.05)
                     continue
 
-                # 2. Transcribe
-                _t0 = _time.monotonic()
-                print(f"  [DEBUG] Starting Whisper transcription ({window_seconds:.1f}s audio)...")
-                segments = await asyncio.to_thread(
-                    self.transcriber.transcribe, audio_for_stt
-                )
-                _elapsed = _time.monotonic() - _t0
-                text = self.processor.process(segments)
-                print(f"  [DEBUG] Whisper done in {_elapsed:.1f}s → '{text[:80]}'" if text else f"  [DEBUG] Whisper done in {_elapsed:.1f}s → (empty)")
+                audio_for_stt = buf.working_audio()
+                window_seconds = float(audio_for_stt.size) / float(config.audio.samplerate)
 
-                # Drop windows where decode took too long (protects lock state from
-                # junk output of runaway decodes). Transparent to UI via status flag.
-                _rtf_value = _elapsed / max(window_seconds, 0.001)
-                if (
-                    config.whisper.skip_slow_windows
-                    and _rtf_value > config.whisper.skip_slow_rtf_threshold
-                ):
-                    self._prev_first_letters = ""
-                    print(
-                        f"  [SLOW-DROP] RTF={_rtf_value:.2f} > "
-                        f"{config.whisper.skip_slow_rtf_threshold:.1f} — "
-                        f"dropping window to preserve lock"
-                    )
+                initial_prompt = None
+                if config.streaming.locked_prompt_anchor:
+                    initial_prompt = self._build_locked_prompt()
+
+                _t0 = _time.monotonic()
+                segments = await asyncio.to_thread(
+                    self.transcriber.transcribe, audio_for_stt, initial_prompt
+                )
+                elapsed = _time.monotonic() - _t0
+
+                # Run the segments through the regular dedup processor — the
+                # 'none' or 'audio_time' strategy works best here; 'text' would
+                # double-strip what LocalAgreement already filters.
+                window_audio_start = now - window_seconds
+                processed_text = self.processor.process(
+                    segments, audio_window_start=window_audio_start
+                )
+
+                # LocalAgreement-2 commit. Wrap the processed text into a
+                # synthetic single-segment so commit_decode's text-LCP path
+                # has stable input regardless of how many raw Whisper segments
+                # came back.
+                commit = buf.commit_decode(_text_to_segments(processed_text))
+
+                # Anchor before the next iteration if buffer is now too big.
+                buf.maybe_anchor()
+
+                if not commit.new_text:
+                    # Not yet two-way agreement, or no new text. Broadcast the
+                    # in-flight (uncommitted) preview so the dashboard isn't dead.
                     await self._broadcast({
                         "type": "transcription",
-                        "text": "",
+                        "text": processed_text,
                         "first_letters": "",
-                        "status": "slow_window_dropped",
-                        "transcribe_ms": int(_elapsed * 1000),
-                        "rtf": round(_rtf_value, 3),
+                        "status": "local_agreement_pending",
+                        "transcribe_ms": int(elapsed * 1000),
+                        "listening_mode": "local_agreement",
                         "window_seconds": round(window_seconds, 2),
                         "pipeline_state": self.tracker.state.value,
                     })
                     continue
 
-                # 3. Extract first letters
-                first_letters = extract_first_letters(text)
-                instantaneous_lps = len(first_letters) / max(window_seconds, 0.1)
-                alpha = max(0.01, min(0.99, config.matcher.speech_rate_ema_alpha))
-                self._speech_rate_lps = (
-                    (1.0 - alpha) * self._speech_rate_lps
-                    + alpha * instantaneous_lps
-                )
-
-                # 4. Broadcast transcription (with realtime model speed).
-                # Skip speed fields when inference short-circuited (<20ms = no real work),
-                # otherwise the UI pill reads 0 ms / 0× on silence-suppressed windows.
-                msg = {
-                    "type": "transcription",
-                    "text": text,
-                    "first_letters": first_letters,
-                    "speech_rate_lps": round(self._speech_rate_lps, 2),
-                    "pipeline_state": self.tracker.state.value,
-                    "listening_mode": listening_mode,
-                    "window_seconds": round(window_seconds, 2),
-                }
-                if _elapsed >= 0.02:
-                    msg["transcribe_ms"] = int(_elapsed * 1000)
-                    msg["rtf"] = round(_elapsed / max(window_seconds, 0.001), 3)
-                await self._broadcast(msg)
-
-                # 6a. Alaap detection (Change 7): detect melismatic/non-lexical windows.
-                # When enabled, freeze line pointer and skip challenger logic for
-                # windows where ASR output looks like alaap rather than lyrics.
-                _is_alaap = (
-                    config.matcher.alaap_detection_enabled
-                    and _is_alaap_output(text)
-                )
-                if _is_alaap:
-                    self._alaap_window_count += 1
-                    self._transition_alaap_seconds += max(window_seconds, float(config.audio.step_duration))
-                else:
-                    self._alaap_window_count = 0
-
-                # 6b. Transition mode (Change 8): enter when 2+ signals suggest the
-                # shabad is about to change, relaxing challenger/override thresholds.
-                if config.matcher.transition_mode_enabled:
-                    self._update_transition_mode(window_seconds)
-
-                # When alaap is confirmed (N consecutive windows) and we're LOCKED:
-                # broadcast the freeze and skip matching for this window.
-                _alaap_freeze = (
-                    _is_alaap
-                    and self._alaap_window_count >= config.matcher.alaap_consecutive_windows
-                    and self.tracker.state.value == "locked"
-                )
-                if _alaap_freeze:
-                    await self._broadcast({
-                        "type": "alaap_freeze",
-                        "windows": self._alaap_window_count,
-                        "transcript": text,
-                    })
-                    self._prev_first_letters = first_letters
-                    continue
-
-                # 6. Dispatch to state handler
-                if self.tracker.state in (
-                    PipelineState.SEARCHING,
-                    PipelineState.CANDIDATE_LOCK,
+                # Stale-memory reset, mirrored from _process_one_audio_window
+                # so the matcher's suggest/challenger memory doesn't outlive
+                # an idle gap between commits.
+                if (
+                    self._last_window_timestamp > 0
+                    and (now - self._last_window_timestamp)
+                    > config.matcher.stale_memory_threshold_seconds
                 ):
-                    if len(first_letters) < config.matcher.min_search_letters:
-                        if self.tracker.state == PipelineState.CANDIDATE_LOCK:
-                            self._candidate_lock_misses += 1
-                            if self._candidate_lock_misses >= config.matcher.candidate_lock_miss_windows:
-                                self.tracker.clear_candidate_lock()
-                                self._candidate_lock_misses = 0
-                        continue
-                    await self._handle_searching(
-                        first_letters,
-                        start_mode=self._after_break_windows > 0,
-                        transcript_text=text,
-                    )
-                    if self._after_break_windows > 0:
-                        self._after_break_windows -= 1
-                else:
-                    stitched_letters = f"{self._prev_first_letters}{first_letters}"
-                    if max(len(first_letters), len(stitched_letters)) < config.matcher.min_search_letters:
-                        self.tracker.mark_unstable()
-                        self._prev_first_letters = first_letters
-                        continue
-                    await self._handle_locked(
-                        first_letters,
-                        self._prev_first_letters,
-                        transcript_text=text,
-                    )
-                    if self._after_break_windows > 0:
-                        self._after_break_windows -= 1
+                    self._suggest_first_seen.clear()
+                    self._challenger_first_seen.clear()
+                self._last_window_timestamp = now
+                self._window_index += 1
+                self._last_listening_mode = "local_agreement"
 
-                self._prev_first_letters = first_letters
-
-                # 7. Broadcast current state (include verses when locked)
-                current = self.tracker.current
-                state_msg = {
-                    "type": "state",
-                    "pipeline_state": self.tracker.state.value,
-                    "current": current.to_dict() if current else None,
-                    "history": self.tracker.get_history_list(),
-                    "confidence_mode": self._confidence_mode,
-                    "hypotheses": self.tracker.get_hypotheses(),
-                }
-                if current and current.verses:
-                    state_msg["verses"] = [
-                        {"unicode": v.unicode, "english": v.english}
-                        for v in current.verses
-                    ]
-                await self._broadcast(state_msg)
+                await self._process_decoded_text(
+                    text=commit.new_text,
+                    listening_mode="local_agreement",
+                    window_seconds=decode_interval_s,
+                    elapsed_decode_s=elapsed,
+                )
 
             except Exception as e:
-                print(f"[Pipeline] Error in loop: {e}")
+                print(f"[Pipeline] LocalAgreement loop error: {e}")
                 await self._broadcast({"type": "error", "message": str(e)})
                 await asyncio.sleep(1)
+
+    # ──────────────────────────────────────────────────────────────────
+    # hybrid streaming mode (REA-10 Phase 3) — VAD bounds + LocalAgreement-2
+    # ──────────────────────────────────────────────────────────────────
+
+    async def _hybrid_streaming_loop(self):
+        """Best-of-both: VAD onset starts a fresh LocalAgreement-2 buffer,
+        intra-utterance decodes commit agreed prefix to the matcher, VAD
+        offset flushes anything still in flight.
+
+        Properties:
+        * Boundaries are clean (driven by VAD onset/offset)
+        * Latency is low (LocalAgreement commits land before VAD offset)
+        * Buffer is bounded (per-utterance, max_utterance_ms cap)
+
+        This is the production target for live kirtan — naive and
+        vad_segmented are easier to reason about, but hybrid pays back the
+        extra complexity in dashboard responsiveness during long utterances.
+        """
+        import time as _time
+        import numpy as _np
+
+        vad = self._make_streaming_vad()
+        self._streaming_vad = vad
+        decode_interval_s = max(
+            0.5, float(config.streaming.local_agreement_decode_interval_ms) / 1000.0
+        )
+        # Per-utterance LocalAgreement state. None when VAD says we're idle.
+        utt_buf: LocalAgreementBuffer | None = None
+        last_intra_decode_t = 0.0
+        last_seen_samples = self.audio.samples_written()
+        poll_period_s = 0.1
+
+        print(
+            f"[Pipeline] Hybrid (VAD + LocalAgreement-2) active: backend="
+            f"{config.streaming.vad_backend}, threshold={config.streaming.vad_threshold}, "
+            f"decode_interval={decode_interval_s:.2f}s"
+        )
+
+        while self.running:
+            try:
+                cur = self.audio.samples_written()
+                samples_delta = max(0, cur - last_seen_samples)
+                if samples_delta == 0:
+                    await asyncio.sleep(poll_period_s)
+                    continue
+                read_seconds = min(
+                    samples_delta / float(config.audio.samplerate),
+                    poll_period_s * 4,
+                )
+                fresh = self.audio.latest_window(read_seconds)
+                last_seen_samples = cur
+                if self.paused or fresh.size == 0:
+                    await asyncio.sleep(poll_period_s)
+                    continue
+
+                # Run VAD on the fresh chunk. Closed utterances (offsets) are
+                # returned; in-flight utterance is accessible via peek_partial.
+                closed = await asyncio.to_thread(vad.feed, fresh)
+
+                # Mid-utterance LocalAgreement: while VAD says we're inside an
+                # utterance, periodically decode the partial buffer and emit
+                # any newly-agreed text.
+                in_utt = vad.is_in_utterance()
+                if in_utt:
+                    if utt_buf is None:
+                        utt_buf = LocalAgreementBuffer(
+                            agreement_n=int(config.streaming.local_agreement_n),
+                            max_buffer_ms=int(config.streaming.vad_max_utterance_ms),
+                        )
+                        last_intra_decode_t = _time.monotonic()
+
+                    now = _time.monotonic()
+                    if now - last_intra_decode_t >= decode_interval_s:
+                        last_intra_decode_t = now
+                        partial_audio = vad.peek_partial()
+                        # Only re-decode if there's more audio than the last commit covered.
+                        if partial_audio.size > utt_buf.buffer_samples():
+                            # Re-base buffer to current peek_partial state.
+                            utt_buf._audio = partial_audio  # noqa: SLF001 — module-internal
+                            await self._maybe_emit_local_agreement(
+                                utt_buf, listening_mode="hybrid_partial",
+                                decode_interval_s=decode_interval_s,
+                            )
+
+                # Process VAD-closed utterances. For each, do one final
+                # LocalAgreement decode (catches any text the partial decodes
+                # missed) and clear the per-utterance state.
+                for utt in closed:
+                    if utt.duration_s < 0.4:
+                        utt_buf = None
+                        continue
+                    if utt_buf is None:
+                        utt_buf = LocalAgreementBuffer(
+                            agreement_n=int(config.streaming.local_agreement_n),
+                            max_buffer_ms=int(config.streaming.vad_max_utterance_ms),
+                        )
+                    utt_buf._audio = utt.audio  # noqa: SLF001
+                    # Force enough history for agreement on the closing decode.
+                    while len(utt_buf._history) < utt_buf.agreement_n - 1:  # noqa: SLF001
+                        utt_buf._history.append("")  # noqa: SLF001
+                    await self._maybe_emit_local_agreement(
+                        utt_buf, listening_mode="hybrid_final",
+                        decode_interval_s=float(utt.duration_s),
+                    )
+                    utt_buf = None
+
+                if not in_utt and utt_buf is not None:
+                    # Defensive: VAD says idle but we have a stale buffer —
+                    # discard rather than carry over to the next utterance.
+                    utt_buf = None
+
+            except Exception as e:
+                print(f"[Pipeline] Hybrid loop error: {e}")
+                await self._broadcast({"type": "error", "message": str(e)})
+                await asyncio.sleep(1)
+            await asyncio.sleep(poll_period_s)
+
+    async def _maybe_emit_local_agreement(
+        self,
+        buf: LocalAgreementBuffer,
+        listening_mode: str,
+        decode_interval_s: float,
+    ):
+        """Decode the buffer's working audio, run LocalAgreement, emit any
+        newly-agreed text through the matcher pipeline. Shared between
+        ``_local_agreement_loop`` and ``_hybrid_streaming_loop``.
+        """
+        import time as _time
+
+        audio_for_stt = buf.working_audio()
+        if audio_for_stt.size < int(0.5 * config.audio.samplerate):
+            return
+        window_seconds = float(audio_for_stt.size) / float(config.audio.samplerate)
+        initial_prompt = (
+            self._build_locked_prompt()
+            if config.streaming.locked_prompt_anchor
+            else None
+        )
+        _t0 = _time.monotonic()
+        segments = await asyncio.to_thread(
+            self.transcriber.transcribe, audio_for_stt, initial_prompt
+        )
+        elapsed = _time.monotonic() - _t0
+
+        now_mono = _time.monotonic()
+        window_audio_start = now_mono - window_seconds
+        processed_text = self.processor.process(
+            segments, audio_window_start=window_audio_start
+        )
+
+        commit = buf.commit_decode(_text_to_segments(processed_text))
+        buf.maybe_anchor()
+        if not commit.new_text:
+            await self._broadcast({
+                "type": "transcription",
+                "text": processed_text,
+                "first_letters": "",
+                "status": f"{listening_mode}_pending",
+                "transcribe_ms": int(elapsed * 1000),
+                "listening_mode": listening_mode,
+                "window_seconds": round(window_seconds, 2),
+                "pipeline_state": self.tracker.state.value,
+            })
+            return
+
+        if (
+            self._last_window_timestamp > 0
+            and (now_mono - self._last_window_timestamp)
+            > config.matcher.stale_memory_threshold_seconds
+        ):
+            self._suggest_first_seen.clear()
+            self._challenger_first_seen.clear()
+        self._last_window_timestamp = now_mono
+        self._window_index += 1
+        self._last_listening_mode = listening_mode
+
+        await self._process_decoded_text(
+            text=commit.new_text,
+            listening_mode=listening_mode,
+            window_seconds=decode_interval_s,
+            elapsed_decode_s=elapsed,
+        )
+
+    async def _process_one_audio_window(
+        self,
+        audio,
+        listening_mode: str,
+        window_seconds: float,
+        has_vocals: bool,
+        chunk_rms: float,
+        now_mono: float,
+    ):
+        """Transcribe one chunk of audio and run it through the matcher.
+
+        Shared between every streaming mode (naive sliding-window, VAD-segmented
+        utterance, future LocalAgreement-2). The naive path's decode loop and
+        the new ``_vad_streaming_loop`` both call this — keeping the lock state
+        machine, alaap detection, transition mode, and broadcasts in one place.
+
+        Parameters mirror the ``_latest_window_data`` shape so the naive caller
+        can pass the dict through verbatim. ``listening_mode`` is a label for
+        the dashboard: 'search' / 'locked' / 'micro' / 'recovery' for naive,
+        'utterance' for VAD-segmented.
+        """
+        import time as _time
+
+        self._window_index += 1
+        # Stale-memory reset: if this window arrives too long after the last
+        # one (ASR lag, paused pipeline, etc.) the suggest/challenger timestamps
+        # are from a different audio context and must be discarded.
+        if (
+            self._last_window_timestamp > 0
+            and (now_mono - self._last_window_timestamp)
+            > config.matcher.stale_memory_threshold_seconds
+        ):
+            self._suggest_first_seen.clear()
+            self._challenger_first_seen.clear()
+            print(
+                f"  [STALE RESET] gap={now_mono - self._last_window_timestamp:.1f}s "
+                f"> {config.matcher.stale_memory_threshold_seconds:.0f}s — "
+                "suggest/challenger memory cleared"
+            )
+        self._last_window_timestamp = now_mono
+        self._last_listening_mode = listening_mode
+        audio_for_stt = audio
+
+        if self.paused:
+            await self._broadcast({"type": "paused"})
+            await asyncio.sleep(0.1)
+            return
+
+        # Skip transcription if no vocal content (just music/silence)
+        if not has_vocals:
+            self._prev_first_letters = ""
+            self._speech_rate_lps *= 0.9
+            await self._try_silence_autolock()
+            await self._broadcast({
+                "type": "transcription",
+                "text": "",
+                "first_letters": "",
+                "status": "music_only",
+            })
+            return
+
+        # 2. Transcribe
+        # Optional locked-shabad prompt anchoring: when enabled and the
+        # matcher is locked, pass the current pankti's Gurmukhi text to
+        # Whisper as initial_prompt — biases the decoder toward the
+        # actual shabad text. Off by default; enable per-session via
+        # the dashboard.
+        initial_prompt = None
+        if config.streaming.locked_prompt_anchor:
+            initial_prompt = self._build_locked_prompt()
+        # Pass the absolute audio-window timestamp through the processor
+        # so audio_time dedup can distinguish window-overlap from legit
+        # repetition (REA-10).
+        window_audio_start = now_mono - window_seconds
+        _t0 = _time.monotonic()
+        print(f"  [DEBUG] Starting Whisper transcription ({window_seconds:.1f}s audio, mode={listening_mode})...")
+        segments = await asyncio.to_thread(
+            self.transcriber.transcribe, audio_for_stt, initial_prompt
+        )
+        _elapsed = _time.monotonic() - _t0
+        text = self.processor.process(segments, audio_window_start=window_audio_start)
+        print(f"  [DEBUG] Whisper done in {_elapsed:.1f}s → '{text[:80]}'" if text else f"  [DEBUG] Whisper done in {_elapsed:.1f}s → (empty)")
+
+        # Drop windows where decode took too long (protects lock state from
+        # junk output of runaway decodes). Transparent to UI via status flag.
+        _rtf_value = _elapsed / max(window_seconds, 0.001)
+        if (
+            config.whisper.skip_slow_windows
+            and _rtf_value > config.whisper.skip_slow_rtf_threshold
+        ):
+            self._prev_first_letters = ""
+            print(
+                f"  [SLOW-DROP] RTF={_rtf_value:.2f} > "
+                f"{config.whisper.skip_slow_rtf_threshold:.1f} — "
+                f"dropping window to preserve lock"
+            )
+            await self._broadcast({
+                "type": "transcription",
+                "text": "",
+                "first_letters": "",
+                "status": "slow_window_dropped",
+                "transcribe_ms": int(_elapsed * 1000),
+                "rtf": round(_rtf_value, 3),
+                "window_seconds": round(window_seconds, 2),
+                "pipeline_state": self.tracker.state.value,
+            })
+            return
+
+        # Hand off to the post-decode helper. Splitting at this point lets
+        # local_agreement / hybrid feed text-only commits (no fresh segments
+        # of their own) through the same matcher pipeline.
+        await self._process_decoded_text(
+            text=text,
+            listening_mode=listening_mode,
+            window_seconds=window_seconds,
+            elapsed_decode_s=_elapsed,
+        )
+
+    async def _process_decoded_text(
+        self,
+        text: str,
+        listening_mode: str,
+        window_seconds: float,
+        elapsed_decode_s: float = 0.0,
+    ):
+        """Run already-transcribed text through the matcher pipeline.
+
+        Shared by the audio-window path (called from
+        ``_process_one_audio_window`` after Whisper) AND the LocalAgreement /
+        hybrid streaming modes (which hand off newly-agreed text without a
+        per-call audio window).
+
+        ``window_seconds`` is the speech-rate / dwell-counter denominator —
+        for naive windowed mode it's the actual window length; for streaming
+        modes it's the approximate audio duration represented by the new
+        text (decode interval, or VAD utterance length).
+        """
+        # 3. Extract first letters
+        first_letters = extract_first_letters(text)
+        instantaneous_lps = len(first_letters) / max(window_seconds, 0.1)
+        alpha = max(0.01, min(0.99, config.matcher.speech_rate_ema_alpha))
+        self._speech_rate_lps = (
+            (1.0 - alpha) * self._speech_rate_lps
+            + alpha * instantaneous_lps
+        )
+
+        # 4. Broadcast transcription (with realtime model speed).
+        # Skip speed fields when inference short-circuited (<20ms = no real work),
+        # otherwise the UI pill reads 0 ms / 0× on silence-suppressed windows.
+        msg = {
+            "type": "transcription",
+            "text": text,
+            "first_letters": first_letters,
+            "speech_rate_lps": round(self._speech_rate_lps, 2),
+            "pipeline_state": self.tracker.state.value,
+            "listening_mode": listening_mode,
+            "window_seconds": round(window_seconds, 2),
+        }
+        if elapsed_decode_s >= 0.02:
+            msg["transcribe_ms"] = int(elapsed_decode_s * 1000)
+            msg["rtf"] = round(elapsed_decode_s / max(window_seconds, 0.001), 3)
+        await self._broadcast(msg)
+
+        # 6a. Alaap detection (Change 7): detect melismatic/non-lexical windows.
+        # When enabled, freeze line pointer and skip challenger logic for
+        # windows where ASR output looks like alaap rather than lyrics.
+        _is_alaap = (
+            config.matcher.alaap_detection_enabled
+            and _is_alaap_output(text)
+        )
+        if _is_alaap:
+            self._alaap_window_count += 1
+            self._transition_alaap_seconds += max(window_seconds, float(config.audio.step_duration))
+        else:
+            self._alaap_window_count = 0
+
+        # 6b. Transition mode (Change 8): enter when 2+ signals suggest the
+        # shabad is about to change, relaxing challenger/override thresholds.
+        if config.matcher.transition_mode_enabled:
+            self._update_transition_mode(window_seconds)
+
+        # When alaap is confirmed (N consecutive windows) and we're LOCKED:
+        # broadcast the freeze and skip matching for this window.
+        _alaap_freeze = (
+            _is_alaap
+            and self._alaap_window_count >= config.matcher.alaap_consecutive_windows
+            and self.tracker.state.value == "locked"
+        )
+        if _alaap_freeze:
+            await self._broadcast({
+                "type": "alaap_freeze",
+                "windows": self._alaap_window_count,
+                "transcript": text,
+            })
+            self._prev_first_letters = first_letters
+            return
+
+        # 6. Dispatch to state handler
+        if self.tracker.state in (
+            PipelineState.SEARCHING,
+            PipelineState.CANDIDATE_LOCK,
+        ):
+            if len(first_letters) < config.matcher.min_search_letters:
+                if self.tracker.state == PipelineState.CANDIDATE_LOCK:
+                    self._candidate_lock_misses += 1
+                    if self._candidate_lock_misses >= config.matcher.candidate_lock_miss_windows:
+                        self.tracker.clear_candidate_lock()
+                        self._candidate_lock_misses = 0
+                return
+            await self._handle_searching(
+                first_letters,
+                start_mode=self._after_break_windows > 0,
+                transcript_text=text,
+            )
+            if self._after_break_windows > 0:
+                self._after_break_windows -= 1
+        else:
+            stitched_letters = f"{self._prev_first_letters}{first_letters}"
+            if max(len(first_letters), len(stitched_letters)) < config.matcher.min_search_letters:
+                self.tracker.mark_unstable()
+                self._prev_first_letters = first_letters
+                return
+            await self._handle_locked(
+                first_letters,
+                self._prev_first_letters,
+                transcript_text=text,
+            )
+            if self._after_break_windows > 0:
+                self._after_break_windows -= 1
+
+        self._prev_first_letters = first_letters
+
+        # 7. Broadcast current state (include verses when locked)
+        current = self.tracker.current
+        state_msg = {
+            "type": "state",
+            "pipeline_state": self.tracker.state.value,
+            "current": current.to_dict() if current else None,
+            "history": self.tracker.get_history_list(),
+            "confidence_mode": self._confidence_mode,
+            "hypotheses": self.tracker.get_hypotheses(),
+        }
+        if current and current.verses:
+            state_msg["verses"] = [
+                {"unicode": v.unicode, "english": v.english}
+                for v in current.verses
+            ]
+        await self._broadcast(state_msg)
 
     async def _handle_searching(
         self,
@@ -874,7 +1530,7 @@ class PipelineOrchestrator:
                 if top_id not in self._suggest_first_seen:
                     self._suggest_first_seen[top_id] = _now
                 elapsed = _now - self._suggest_first_seen[top_id]
-                if elapsed >= config.matcher.suggest_confirmation_seconds:
+                if elapsed >= self._active_suggest_confirmation_s():
                     lockable = True
             elif lockable:
                 self._suggest_first_seen.clear()
@@ -939,16 +1595,6 @@ class PipelineOrchestrator:
         elif current.current_line < 0:
             current.current_line = 0
 
-        # Layer 1 + 2: fraction of the current line's estimated duration that has elapsed.
-        # Passed to _apply_progression_bias so the delta=+1 bonus grows as the line ages.
-        _elapsed_on_line = (datetime.now() - current.line_updated_at).total_seconds()
-        if config.matcher.predictive_dwell_enabled and self._ema_dwell_seconds > 0:
-            _dwell_est = self._ema_dwell_seconds
-        else:
-            _cur_fl_len = len(current.verses[current.current_line].first_letters)
-            _dwell_est = _cur_fl_len / max(self._speech_rate_lps, 0.3)
-        _time_pressure = min(1.5, _elapsed_on_line / max(_dwell_est, 0.5))
-
         _word_count = len(transcript_text.split()) if transcript_text else 0
 
         # First pass: fresh window only. This is the happy path — when the lock is
@@ -969,15 +1615,13 @@ class PipelineOrchestrator:
                 current_scores.append(0.0)
                 raw_line_scores.append(0.0)
                 continue
-            if config.matcher.word_match_line_scoring and transcript_text:
-                raw_current = self.scorer.score_line_word_overlap(transcript_text, verse.unicode)
-            elif transcript_text and _word_count == 2:
+            if transcript_text and _word_count == 2:
                 raw_current = self.scorer.score_line_word_match(transcript_text, verse.unicode)
-            elif config.matcher.ngram_line_scoring and transcript_text and len(first_letters) <= 3:
+            elif transcript_text and len(first_letters) <= 3:
                 raw_current = self.scorer.score_line_ngram(transcript_text, verse.unicode)
             else:
                 raw_current = self.scorer.score_line(first_letters, verse.first_letters)
-                if config.matcher.ngram_line_scoring and transcript_text:
+                if transcript_text:
                     raw_current = max(raw_current, self.scorer.score_line_ngram(transcript_text, verse.unicode))
             # Change 6: Smith-Waterman word alignment — takes max so it only helps.
             if config.matcher.sw_line_scoring_enabled and transcript_text and _word_count >= 2:
@@ -991,7 +1635,7 @@ class PipelineOrchestrator:
             elif raw_current > second_best_raw_score:
                 second_best_raw_score = raw_current
 
-            current_score = self._apply_progression_bias(i, current.current_line, raw_current, _time_pressure)
+            current_score = self._apply_progression_bias(i, current.current_line, raw_current)
             current_scores.append(current_score)
             if current_score > best_current_score:
                 best_current_score = current_score
@@ -1063,11 +1707,11 @@ class PipelineOrchestrator:
                 line_best_combined = current_scores[i]
                 line_best_label = "current"
                 for label, query_letters in combined_variants:
-                    if config.matcher.ngram_line_scoring and transcript_text and len(query_letters) <= 3:
+                    if transcript_text and len(query_letters) <= 3:
                         raw_score = self.scorer.score_line_ngram(transcript_text, verse.unicode)
                     else:
                         raw_score = self.scorer.score_line(query_letters, verse.first_letters)
-                    candidate_score = self._apply_progression_bias(i, current.current_line, raw_score, _time_pressure)
+                    candidate_score = self._apply_progression_bias(i, current.current_line, raw_score)
                     if candidate_score > line_best_combined:
                         line_best_combined = candidate_score
                         line_best_label = label
@@ -1075,13 +1719,13 @@ class PipelineOrchestrator:
                 if pair_align_enabled and i + 1 < len(current.verses):
                     paired_letters = f"{verse.first_letters}{current.verses[i + 1].first_letters}"
                     raw_pair = self.scorer.score_line(first_letters, paired_letters)
-                    pair_score = self._apply_progression_bias(i, current.current_line, raw_pair, _time_pressure)
+                    pair_score = self._apply_progression_bias(i, current.current_line, raw_pair)
                     if pair_score > line_best_combined:
                         line_best_combined = pair_score
                         line_best_label = "pair_i"
                     for label, query_letters in combined_variants:
                         raw_stitch = self.scorer.score_line(query_letters, paired_letters)
-                        stitch_score = self._apply_progression_bias(i, current.current_line, raw_stitch, _time_pressure)
+                        stitch_score = self._apply_progression_bias(i, current.current_line, raw_stitch)
                         if stitch_score > line_best_combined:
                             line_best_combined = stitch_score
                             line_best_label = f"pair_i+{label}"
@@ -1093,13 +1737,13 @@ class PipelineOrchestrator:
                         f"{current.verses[i + 2].first_letters}"
                     )
                     raw_triple = self.scorer.score_line(first_letters, triple_letters)
-                    triple_score = self._apply_progression_bias(i, current.current_line, raw_triple, _time_pressure)
+                    triple_score = self._apply_progression_bias(i, current.current_line, raw_triple)
                     if triple_score > line_best_combined:
                         line_best_combined = triple_score
                         line_best_label = "triple_i"
                     for label, query_letters in combined_variants:
                         raw_stitch3 = self.scorer.score_line(query_letters, triple_letters)
-                        stitch3_score = self._apply_progression_bias(i, current.current_line, raw_stitch3, _time_pressure)
+                        stitch3_score = self._apply_progression_bias(i, current.current_line, raw_stitch3)
                         if stitch3_score > line_best_combined:
                             line_best_combined = stitch3_score
                             line_best_label = f"triple_i+{label}"
@@ -1117,27 +1761,6 @@ class PipelineOrchestrator:
                 best_line_idx = best_combined_idx
                 best_line_score = best_combined_score
                 best_line_variant = best_combined_label
-
-        # Layer 3: confirm or rollback a tentative advance issued in the previous window.
-        # Must happen after best_line_idx is finalised but before we touch the tracker.
-        prediction_confirmed_this_window = False
-        if self._predicted_line_idx is not None:
-            if best_line_idx >= self._predicted_line_idx:
-                # Audio confirms the prediction — snap tracker to predicted line and
-                # reset the dwell clock so the next prediction starts from now.
-                self.tracker.set_line(self._predicted_line_idx)
-                if self.tracker.current:
-                    self.tracker.current.line_updated_at = datetime.now()
-                prediction_confirmed_this_window = True
-                print(f"  [PREDICT CONFIRM] line {self._predicted_line_idx}")
-            else:
-                # Audio disagrees — revert the STTM display step we took early.
-                await self.controller.navigate_line("prev")
-                print(
-                    f"  [PREDICT ROLLBACK] audio best={best_line_idx} "
-                    f"< predicted={self._predicted_line_idx}"
-                )
-            self._predicted_line_idx = None
 
         # Fallback: follow nearby lines at lower confidence to avoid getting stuck.
         # This keeps movement local and avoids large random jumps.
@@ -1280,43 +1903,25 @@ class PipelineOrchestrator:
                     dwell = (
                         datetime.now() - current.line_updated_at
                     ).total_seconds()
+                    active_dwell = self._active_min_line_dwell_seconds()
                     if (
-                        dwell < config.matcher.min_line_dwell_seconds
+                        dwell < active_dwell
                         and target_score < config.matcher.line_advance_override_score
                     ):
                         print(
                             f"  [DWELL HOLD] line {old_line}→{target_idx} "
-                            f"(dwell={dwell:.2f}s < {config.matcher.min_line_dwell_seconds:.1f}s, "
+                            f"(dwell={dwell:.2f}s < {active_dwell:.1f}s, "
                             f"score={target_score:.2f} < {config.matcher.line_advance_override_score:.2f})"
                         )
                         target_idx = old_line
                         target_score = current_scores[old_line]
 
-            # Layer 2: record the dwell on this line before update_line resets the clock.
-            # `dwell` is already computed by the dwell-gate block above when target_idx > old_line.
-            if config.matcher.predictive_dwell_enabled and target_idx > old_line:
-                _dwell_obs = (datetime.now() - current.line_updated_at).total_seconds()
-                if (
-                    config.matcher.predictive_dwell_min_seconds
-                    < _dwell_obs
-                    < config.matcher.predictive_dwell_max_seconds
-                ):
-                    self._line_dwell_history.append(_dwell_obs)
-                    if len(self._line_dwell_history) > 5:
-                        self._line_dwell_history.pop(0)
-                    _alpha = config.matcher.predictive_dwell_ema_alpha
-                    self._ema_dwell_seconds = (
-                        _alpha * _dwell_obs + (1.0 - _alpha) * self._ema_dwell_seconds
-                    )
-                self._confirmed_advance_count += 1
             self.tracker.update_line(target_idx, target_score)
             self._just_locked = False
             # Keep STTM line in sync in both directions to avoid drift.
-            # Layer 3: subtract the one step already taken by a confirmed prediction.
             delta = target_idx - old_line
             if delta > 0:
-                _nav_steps = delta - (1 if prediction_confirmed_this_window else 0)
-                for _ in range(max(0, _nav_steps)):
+                for _ in range(delta):
                     await self.controller.navigate_line("next")
             elif delta < 0:
                 for _ in range(abs(delta)):
@@ -1405,57 +2010,6 @@ class PipelineOrchestrator:
             best_line_score=best_line_score,
             reason=reason,
         )
-
-        # Layer 3: schedule a tentative advance when timing says the current line is
-        # nearly done. STTM moves one step early; the next window confirms or rolls back.
-        if (
-            config.matcher.predictive_advance_enabled
-            and self._predicted_line_idx is None
-            and not prediction_confirmed_this_window
-            and self._confirmed_advance_count >= config.matcher.predictive_advance_min_confirms
-            and self.tracker.state == PipelineState.LOCKED
-        ):
-            _cur_now = self.tracker.current
-            if _cur_now and _cur_now.verses:
-                _next_pred = _cur_now.current_line + 1
-                if _next_pred < len(_cur_now.verses):
-                    _elapsed_pred = (
-                        datetime.now() - _cur_now.line_updated_at
-                    ).total_seconds()
-                    if config.matcher.predictive_dwell_enabled:
-                        _dwell_pred = self._ema_dwell_seconds
-                    else:
-                        _fl = len(_cur_now.verses[_cur_now.current_line].first_letters)
-                        _dwell_pred = _fl / max(self._speech_rate_lps, 0.3)
-                    _tp_pred = min(1.5, _elapsed_pred / max(_dwell_pred, 0.5))
-                    _cur_score_pred = (
-                        line_scores[_cur_now.current_line]
-                        if _cur_now.current_line < len(line_scores)
-                        else 0.0
-                    )
-                    _is_repeating = (
-                        _tp_pred > 1.05
-                        and _cur_score_pred > config.matcher.predictive_advance_repeat_score
-                    )
-                    _too_uncertain = _cur_score_pred < 0.15
-                    if (
-                        _tp_pred >= config.matcher.predictive_advance_threshold
-                        and not _is_repeating
-                        and not _too_uncertain
-                        and _elapsed_pred >= config.matcher.min_line_dwell_seconds
-                    ):
-                        self._predicted_line_idx = _next_pred
-                        await self.controller.navigate_line("next")
-                        print(
-                            f"  [PREDICT] tentative advance → line {_next_pred} "
-                            f"(tp={_tp_pred:.2f}, dwell_est={_dwell_pred:.1f}s)"
-                        )
-                        await self._broadcast({
-                            "type": "predictive_advance",
-                            "predicted_line_idx": _next_pred,
-                            "time_pressure": round(_tp_pred, 2),
-                            "dwell_estimate_s": round(_dwell_pred, 2),
-                        })
 
     async def _scan_challenger(
         self,
@@ -1722,12 +2276,34 @@ class PipelineOrchestrator:
             # timer in Change 1 handle promotion after sustained evidence.
             if action == "auto" and dense_dominant and retrieval_sources == ["ngram4"]:
                 action = "suggest"
+            # Pick the best-matching line within this candidate so the snap in
+            # _lock_shabad_from_top can land on the right verse instead of the
+            # raag heading. We already have the per-line first-letters cached on
+            # the candidate (space-separated, recitation order).
+            line_idx = 0
+            if first_letters and candidate.full_first_letters:
+                line_fls = candidate.full_first_letters.split(" ")
+                if len(line_fls) > 1:
+                    # Score every line, then pick best — but apply a small penalty to
+                    # line 0 (raag heading) so it only wins when it truly is the best
+                    # match. Without this, ambiguous short queries tie across lines and
+                    # line 0 wins the default tiebreak, leaving STTM stuck on the heading.
+                    best_line_score = -1.0
+                    for idx, line_fl in enumerate(line_fls):
+                        if not line_fl:
+                            continue
+                        line_score = self.scorer.score_line(first_letters, line_fl)
+                        if idx == 0 and config.matcher.penalize_heading_line:
+                            line_score -= 0.15
+                        if line_score > best_line_score:
+                            best_line_score = line_score
+                            line_idx = idx
             scored.append({
                 "shabad_id": candidate.shabad_id,
                 "gurmukhi": candidate.gurmukhi,
                 "unicode": candidate.unicode,
                 "english": candidate.english,
-                "line_idx": 0,
+                "line_idx": line_idx,
                 "score": round(score, 3),
                 "word_overlap": word_overlap,
                 "retrieval_sources": retrieval_sources,
@@ -1740,66 +2316,30 @@ class PipelineOrchestrator:
         return scored
 
     def _apply_progression_bias(
-        self, index: int, current_line: int, raw_score: float, time_pressure: float = 0.0
+        self, index: int, current_line: int, raw_score: float
     ) -> float:
         """
-        Prefer expected recitation flow: current, next, next+1.
-        Penalize far jumps unless raw confidence is already very high.
-        `time_pressure` (Layer 1): scales the delta=+1 bonus up as the current
-        line ages past its estimated duration (0 = just started, 1.0 = expected end).
+        Pure raw-score comparison with a small current-line tiebreaker.
 
-        progression_symmetric_bypass=True (default): bypass only fires for non-current
-        lines, so the +0.22 current-line bonus is never stripped. Without this, a
-        confident current line (raw ≥ bypass) returned its raw score while a mediocre
-        next line (raw < bypass) still received its +0.12 bias and won. Set False to
-        restore the original (asymmetric) behaviour for A/B comparison.
+        Confident-jump bypass: a line clearing
+        `progression_confident_jump_threshold` returns its raw score, so a
+        clearly better match elsewhere in the shabad wins without competing
+        against the current-line tiebreaker.
         """
-        # Change 9: confident-jump bypass — ANY line clearing the threshold returns
-        # its raw score, ignoring delta-based bonuses entirely.  This lets a clearly
-        # better match elsewhere in the shabad win without competing against the
-        # current line's inertia bonus.
         if raw_score >= config.matcher.progression_confident_jump_threshold:
             return raw_score
-        # Legacy asymmetric mode: bypass fires before any delta check, stripping the
-        # current-line bonus. Preserved behind a toggle for A/B comparison.
-        if not config.matcher.progression_symmetric_bypass:
-            if raw_score >= config.matcher.progression_high_confidence_bypass:
-                return raw_score
 
         delta = index - current_line
-
-        # next_line_bias_enabled=False: pure raw-score comparison with a tiny tiebreaker
-        # on the current line. No time-pressure ramp, no forward positional nudge.
-        if not config.matcher.next_line_bias_enabled:
-            if delta == 0:
-                bonus = 0.05  # tiebreaker only — stay here when scores are equal
-            elif raw_score >= config.matcher.progression_high_confidence_bypass:
-                return raw_score
-            elif delta < 0:
-                bonus = -0.04 * min(abs(delta), 3)
-            elif delta >= 4:
-                bonus = -0.08
-            else:
-                bonus = -0.02 * abs(delta)  # delta=1 → -0.02, delta=2 → -0.04, delta=3 → -0.06
-            return min(1.0, max(0.0, raw_score + bonus))
-
-        # next_line_bias_enabled=True (legacy): delta=0 gets +0.22 inertia, delta=+1 gets
-        # a base 0.12 forward nudge that grows with time pressure.
-        bonus = 0.0
         if delta == 0:
-            bonus = 0.22
+            bonus = 0.05  # tiebreaker only — stay here when scores are equal
         elif raw_score >= config.matcher.progression_high_confidence_bypass:
             return raw_score
-        elif delta == 1:
-            bonus = 0.12 + config.matcher.predictive_time_bias_max * min(1.0, time_pressure)
-        elif delta == 2:
-            bonus = 0.08
         elif delta < 0:
             bonus = -0.04 * min(abs(delta), 3)
         elif delta >= 4:
             bonus = -0.08
         else:
-            bonus = -0.02 * abs(delta)
+            bonus = -0.02 * abs(delta)  # delta=1 → -0.02, 2 → -0.04, 3 → -0.06
         return min(1.0, max(0.0, raw_score + bonus))
 
     async def _try_silence_autolock(self):
@@ -1939,8 +2479,6 @@ class PipelineOrchestrator:
                 for v in verses
             ],
         })
-        self._confirmed_advance_count = 0
-        self._predicted_line_idx = None
         self._silence_autolock_candidate = None
         self._silence_autolock_ttl = 0
         self._suggest_first_seen.clear()
@@ -2020,6 +2558,36 @@ class PipelineOrchestrator:
         if self._in_transition_mode:
             return config.matcher.transition_challenger_confirmation_s
         return config.matcher.challenger_confirmation_seconds
+
+    def _active_step_duration(self) -> float:
+        """Capture-tick cadence — controls how long we sleep between wakes.
+
+        Priority order:
+        1. Zero-overlap mode: hop = the most-recently-decoded dynamic window
+           seconds, so each second of audio is transcribed exactly once.
+           Falls back to step_duration on the very first tick (before any
+           window has been decoded).
+        2. Fast-response mode: shrinks the search-state cadence to 1.5 s
+           without changing accuracy thresholds.
+        3. Default: config.audio.step_duration (3 s).
+        """
+        if config.audio.zero_overlap_window and self._last_window_seconds > 0.0:
+            return float(self._last_window_seconds)
+        if config.matcher.fast_response_enabled:
+            return config.audio.fast_step_duration
+        return config.audio.step_duration
+
+    def _active_min_line_dwell_seconds(self) -> float:
+        """Minimum dwell on the current line before a forward pointer move (override score still bypasses)."""
+        if config.matcher.fast_response_enabled:
+            return config.matcher.fast_min_line_dwell_seconds
+        return config.matcher.min_line_dwell_seconds
+
+    def _active_suggest_confirmation_s(self) -> float:
+        """Tiered-lock confirmation — how long a 0.60–0.74 candidate must stay top before promotion."""
+        if config.matcher.fast_response_enabled:
+            return config.matcher.fast_suggest_confirmation_seconds
+        return config.matcher.suggest_confirmation_seconds
 
     def _active_override_threshold(self) -> float:
         if self._in_transition_mode:

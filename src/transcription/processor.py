@@ -1,7 +1,21 @@
-"""Post-processing for transcription output: cleanup, filtering, and deduplication."""
+"""Post-processing for transcription output: cleanup, filtering, and deduplication.
+
+Cross-window dedup is delegated to a strategy object (see ``src/pipeline/dedup``)
+so the legitimate-repetition bug (rahau, ਵਾਹਿਗੁਰੂ jaaps, sangat echo) can be
+fixed by switching to ``audio_time`` without otherwise changing the post-
+processing pipeline. The strategy is read each call from
+``config.streaming.dedup_strategy`` so the dashboard toggle takes effect live.
+"""
 
 import re
 
+from src.config import config
+from src.pipeline.dedup import (
+    AudioTimeDedup,
+    DedupStrategy,
+    NoOpDedup,
+    TextDedup,
+)
 from src.transcription.engine import TranscriptionSegment
 
 
@@ -53,47 +67,80 @@ def _is_valid_text(text: str) -> bool:
 
 
 class TranscriptionProcessor:
-    """Cleans up, filters, and deduplicates transcription segments."""
+    """Cleans up, filters, and deduplicates transcription segments.
 
-    def __init__(self):
+    Cross-window dedup is pluggable — strategies live in ``src/pipeline/dedup``
+    and are selected by ``config.streaming.dedup_strategy``. The processor
+    holds one instance per strategy and re-reads the config on every call so a
+    dashboard toggle flip applies live.
+    """
+
+    def __init__(self) -> None:
         self._last_text: str = ""
         self._repeat_count: int = 0
+        # Hold one stateful strategy per kind so flipping the toggle doesn't
+        # blow away in-flight context. Switching from text → audio_time →
+        # text re-uses the same TextDedup instance and resumes where it left
+        # off, which keeps overlap-stripping continuous in the common case.
+        self._strategies: dict[str, DedupStrategy] = {
+            "text": TextDedup(),
+            "audio_time": AudioTimeDedup(),
+            "none": NoOpDedup(),
+        }
 
-    def process(self, segments: list[TranscriptionSegment]) -> str:
-        """
-        Combine segments into a single text string.
-        Filters garbage, deduplicates overlap, and detects repetition.
+    def _strategy(self) -> DedupStrategy:
+        name = config.streaming.dedup_strategy
+        return self._strategies.get(name, self._strategies["text"])
+
+    def process(
+        self,
+        segments: list[TranscriptionSegment],
+        audio_window_start: float | None = None,
+    ) -> str:
+        """Combine segments → single text. Filters garbage, dedups, detects repetition.
+
+        ``audio_window_start`` is the absolute (monotonic) audio time at the
+        start of this decode window. Required for ``audio_time`` dedup; ignored
+        by ``text`` and ``none`` strategies. The orchestrator passes
+        ``time.monotonic()`` (or equivalent) at the moment audio was snapshotted.
         """
         if not segments:
             return ""
 
-        # Filter out garbage segments
         valid_segments = [seg for seg in segments if _is_valid_text(seg.text)]
         if not valid_segments:
             return ""
 
         combined = " ".join(seg.text for seg in valid_segments)
 
-        # De-stutter: remove repeated words (Google often repeats words in singing)
+        # De-stutter within a single window — Whisper repeats words in singing.
+        # This is intra-window cleanup, not cross-window dedup, so it always runs.
         combined = self._remove_repeated_words(combined)
 
-        # Remove repeated text from overlap with previous window
-        if self._last_text and combined.startswith(self._last_text[:20]):
-            overlap_len = min(len(self._last_text), len(combined) // 2)
-            for i in range(overlap_len, 0, -1):
-                if combined.startswith(self._last_text[-i:]):
-                    combined = combined[i:].strip()
-                    break
+        # Cross-window dedup — strategy chosen by config (live-readable).
+        if audio_window_start is not None and valid_segments:
+            seg_start = audio_window_start + min(s.start for s in valid_segments)
+            seg_end = audio_window_start + max(s.end for s in valid_segments)
+        else:
+            seg_start = None
+            seg_end = None
+        combined = self._strategy().dedup(combined, seg_start, seg_end)
 
-        # Detect exact repetition (Whisper hallucination)
-        if combined == self._last_text:
+        # Hallucination guard — orthogonal to dedup. If the SAME text comes
+        # through 3 consecutive windows, suppress it. This catches Whisper
+        # locking onto a phrase and looping it, regardless of dedup mode.
+        # Note: with audio_time dedup this stays correct because the strategy
+        # has already preserved legit repetition; what reaches here as 3×
+        # identical strings is still a hallucination signal.
+        if combined and combined == self._last_text:
             self._repeat_count += 1
             if self._repeat_count >= 3:
-                return ""  # suppress repeated hallucinations
+                return ""
         else:
             self._repeat_count = 0
 
-        self._last_text = combined
+        if combined:
+            self._last_text = combined
         return combined
 
     @staticmethod
@@ -108,7 +155,9 @@ class TranscriptionProcessor:
                 deduped.append(word)
         return " ".join(deduped)
 
-    def reset(self):
+    def reset(self) -> None:
         """Reset state for a new session."""
         self._last_text = ""
         self._repeat_count = 0
+        for strategy in self._strategies.values():
+            strategy.reset()

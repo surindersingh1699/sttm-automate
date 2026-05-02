@@ -24,7 +24,7 @@ from src.transcription.transliterate import gurmukhi_to_ascii, normalize_first_l
 
 _PROJECT_ROOT = Path(__file__).parent.parent.parent
 _ENGLISH_TRANSLATION_SOURCE = 1  # Dr. Sant Singh Khalsa
-_SOURCE_SGGS = 1  # shabads.source_id for Sri Guru Granth Sahib (used by sggs_only toggle)
+_SOURCE_SGGS = 1  # shabads.source_id for Sri Guru Granth Sahib (used for source labelling)
 
 # `shabads.sttm_id` is NULL for Dasam Granth (5470 rows) and Uggardanti (9 rows).
 # Without a synthetic fallback every such candidate collapses to shabad_id=None,
@@ -33,11 +33,6 @@ _SOURCE_SGGS = 1  # shabads.source_id for Sri Guru Granth Sahib (used by sggs_on
 # range (max ~30k). Anything above SYNTHETIC_ID_OFFSET is a non-SGGS fallback.
 SYNTHETIC_ID_OFFSET = 100_000_000
 _SHABAD_ID_EXPR = f"COALESCE(s.sttm_id, s.order_id + {SYNTHETIC_ID_OFFSET})"
-
-
-def _scope_clause() -> str:
-    """Return an ``AND`` clause restricting rows to SGGS when the toggle is on."""
-    return f" AND s.source_id = {_SOURCE_SGGS}" if config.database.sggs_only else ""
 
 
 def _resolve_db_path() -> Path:
@@ -528,12 +523,7 @@ class OfflineShabadSearcher:
         return self._row_to_candidate(row, signal="id")
 
     def fetch_all_verses(self, shabad_id: int) -> list[ShabadVerse]:
-        """Fetch all verses of a shabad for line-level tracking.
-
-        Skips the sggs_only scope — we always honor an explicit shabad_id lookup,
-        so the user can still navigate a Dasam/Bhai Gurdas shabad that was manually
-        selected even while SGGS-only is on for search.
-        """
+        """Fetch all verses of a shabad for line-level tracking."""
         rows = self._conn.execute(
             _LINE_SELECT + f" AND {_SHABAD_ID_EXPR} = ? ORDER BY l.order_id",
             (shabad_id,),
@@ -574,8 +564,7 @@ class OfflineShabadSearcher:
         """ASCII first-letter prefix match."""
         rows = self._conn.execute(
             _LINE_SELECT
-            + _scope_clause()
-            + """
+            +"""
             AND l.first_letters LIKE ? || '%'
             GROUP BY s.sttm_id
             ORDER BY l.order_id
@@ -589,8 +578,7 @@ class OfflineShabadSearcher:
         """ASCII first-letter contains match (broader)."""
         rows = self._conn.execute(
             _LINE_SELECT
-            + _scope_clause()
-            + """
+            +"""
             AND l.first_letters LIKE '%' || ? || '%'
             GROUP BY s.sttm_id
             ORDER BY l.order_id
@@ -628,11 +616,6 @@ class OfflineShabadSearcher:
 
             # Self-join lines so each row pairs with its next-order sibling in
             # the same shabad. Match head against line-N, tail against line-N+1.
-            scope = (
-                f"AND s.source_id = {_SOURCE_SGGS}"
-                if config.database.sggs_only
-                else ""
-            )
             rows = self._conn.execute(
                 f"""
                 SELECT
@@ -655,7 +638,6 @@ class OfflineShabadSearcher:
                     AND l2.order_id = l1.order_id + 1
                 WHERE l1.first_letters LIKE ? || '%'
                   AND l2.first_letters LIKE ? || '%'
-                  {scope}
                 GROUP BY s.sttm_id
                 ORDER BY l1.order_id
                 LIMIT ?
@@ -697,12 +679,6 @@ class OfflineShabadSearcher:
                 if a >= 3 and (b - a) >= 3 and (len(ascii_query) - b) >= 3:
                     split_pairs.add((a, b))
 
-        scope = (
-            f"AND s.source_id = {_SOURCE_SGGS}"
-            if config.database.sggs_only
-            else ""
-        )
-
         results: dict[int, sqlite3.Row] = {}
         for a, b in sorted(split_pairs):
             part1 = ascii_query[:a]
@@ -735,7 +711,6 @@ class OfflineShabadSearcher:
                 WHERE l1.first_letters LIKE ? || '%'
                   AND l2.first_letters LIKE ? || '%'
                   AND l3.first_letters LIKE ? || '%'
-                  {scope}
                 GROUP BY s.sttm_id
                 ORDER BY l1.order_id
                 LIMIT ?
@@ -827,8 +802,7 @@ class OfflineShabadSearcher:
 
         rows = self._conn.execute(
             _LINE_SELECT
-            + _scope_clause()
-            + """
+            +"""
             AND l.first_letters LIKE '%' || ? || '%'
             GROUP BY s.sttm_id
             ORDER BY l.order_id
@@ -905,8 +879,7 @@ class OfflineShabadSearcher:
         placeholders = ",".join("?" * len(sids))
         all_rows = self._conn.execute(
             _LINE_SELECT
-            + _scope_clause()
-            + f"AND {_SHABAD_ID_EXPR} IN ({placeholders}) ORDER BY l.order_id",
+            +f"AND {_SHABAD_ID_EXPR} IN ({placeholders}) ORDER BY l.order_id",
             sids,
         ).fetchall()
 

@@ -60,6 +60,41 @@ class YtDlpAudioFeeder:
     def cached_path(self) -> Path:
         return self.cache_dir / f"{self.video_id}.opus"
 
+    def _ensure_cached_sync(self) -> Path:
+        """Synchronous wrapper: download audio to cache without loading into memory.
+
+        Used by the /eval/audio REST endpoint which calls this via asyncio.to_thread.
+        """
+        existing = list(self.cache_dir.glob(f"{self.video_id}.*"))
+        if existing:
+            return existing[0]
+
+        import subprocess
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[YtDlpFeeder] Downloading {self.video_id} via yt-dlp (sync)…")
+
+        url = f"https://www.youtube.com/watch?v={self.video_id}"
+        out_template = str(self.cache_dir / f"{self.video_id}.%(ext)s")
+
+        result = subprocess.run(
+            [
+                "yt-dlp", "--quiet", "-x",
+                "--audio-format", "opus",
+                "--audio-quality", "0",
+                "-o", out_template,
+                url,
+            ],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"yt-dlp failed for {self.video_id}: {result.stderr.decode()[:500]}"
+            )
+        candidates = list(self.cache_dir.glob(f"{self.video_id}.*"))
+        if not candidates:
+            raise FileNotFoundError(f"yt-dlp produced no output for {self.video_id}")
+        return candidates[0]
+
     async def load(self) -> np.ndarray:
         """Return the session audio slice as float32 16 kHz mono numpy array."""
         if self._audio is not None:
@@ -199,11 +234,8 @@ class PlaywrightYouTubeDriver:
         self._page = await ctx.new_page()
 
         offset_s = max(0, int(self.audio_t0))
-        # Embed URL suppresses most ads and allows autoplay without user gesture
-        url = (
-            f"https://www.youtube.com/embed/{self.video_id}"
-            f"?autoplay=1&start={offset_s}&mute=0"
-        )
+        # Use watch URL — embed URLs trigger error 153 on restricted videos
+        url = f"https://www.youtube.com/watch?v={self.video_id}&t={offset_s}s"
         print(f"[PlaywrightYT] Opening {url}")
         await self._page.goto(url)
         await self._page.wait_for_load_state("domcontentloaded")

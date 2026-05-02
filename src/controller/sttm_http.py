@@ -50,6 +50,30 @@ if _VERSE_MAP:
 if _SHABAD_MAP:
     print(f"[STTM HTTP] Loaded shabad map: {len(_SHABAD_MAP)} entries")
 
+# Realm shabad_id → ordered list of Realm Verse.IDs, built from realm_verses.json.
+# Used in navigate_line to get the correct verseId by index, bypassing cases where
+# _VERSE_MAP maps multiple consecutive lines to the same Realm verse (bad match).
+_REALM_SHABAD_VERSES_PATH = _PROJECT_ROOT / "data" / "realm_verses.json"
+
+
+def _build_realm_shabad_verses(path: Path) -> dict[int, list[int]]:
+    try:
+        data = json.loads(path.read_text())
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {}
+    shabad_verses: dict[int, list[int]] = {}
+    for v in data:
+        for sid in v.get("s", []):
+            shabad_verses.setdefault(sid, []).append(v["i"])
+    return {sid: sorted(vs) for sid, vs in shabad_verses.items()}
+
+
+_REALM_SHABAD_VERSES: dict[int, list[int]] = _build_realm_shabad_verses(
+    _REALM_SHABAD_VERSES_PATH
+)
+if _REALM_SHABAD_VERSES:
+    print(f"[STTM HTTP] Loaded realm shabad verses: {len(_REALM_SHABAD_VERSES)} shabads")
+
 # shabados/database `banis.id` → STTM Desktop Realm `Banis.ID`.
 # Built by matching Gurmukhi/Token across both DBs (scripts/dump_realm_banis.js).
 # Entries missing from STTM's Realm (e.g. Asa Ki Var, Alahnia, Mundavnni) are
@@ -153,8 +177,14 @@ class STTMHttpController(STTMController):
         first_verse_order_id = (
             verse_ids[0] if verse_ids else await self._get_first_verse_id(shabad_id)
         )
-        realm_verse_id = _VERSE_MAP.get(first_verse_order_id, first_verse_order_id)
         realm_shabad_id = _SHABAD_MAP.get(shabad_id)
+        realm_verses_for_shabad = (
+            _REALM_SHABAD_VERSES.get(realm_shabad_id, []) if realm_shabad_id else []
+        )
+        if realm_verses_for_shabad:
+            realm_verse_id = realm_verses_for_shabad[0]
+        else:
+            realm_verse_id = _VERSE_MAP.get(first_verse_order_id, first_verse_order_id)
 
         if realm_shabad_id is not None:
             ok = await self._send_control({
@@ -225,9 +255,26 @@ class STTMHttpController(STTMController):
             next_idx = min(len(verse_ids) - 1, self._active_line_idx + 1)
 
         raw_verse_id = verse_ids[next_idx]
-        realm_verse_id = _VERSE_MAP.get(raw_verse_id, raw_verse_id)
 
         if self._active_realm_shabad_id is not None:
+            # Prefer direct index lookup from realm_verses.json — avoids cases
+            # where _VERSE_MAP collapses multiple lines onto the same Realm ID.
+            realm_verses_for_shabad = _REALM_SHABAD_VERSES.get(
+                self._active_realm_shabad_id, []
+            )
+            if next_idx < len(realm_verses_for_shabad):
+                realm_verse_id = realm_verses_for_shabad[next_idx]
+            else:
+                realm_verse_id = _VERSE_MAP.get(raw_verse_id, raw_verse_id)
+        else:
+            realm_verse_id = _VERSE_MAP.get(raw_verse_id, raw_verse_id)
+
+        if self._active_realm_shabad_id is not None:
+            home_realm_verse_id = (
+                realm_verses_for_shabad[0]
+                if realm_verses_for_shabad
+                else _VERSE_MAP.get(verse_ids[0], verse_ids[0])
+            )
             payload = {
                 "type": "shabad",
                 "shabadId": self._active_realm_shabad_id,
@@ -235,7 +282,7 @@ class STTMHttpController(STTMController):
                 "verseId": realm_verse_id,
                 "lineCount": next_idx + 1,
                 "highlight": realm_verse_id,
-                "homeId": _VERSE_MAP.get(verse_ids[0], verse_ids[0]),
+                "homeId": home_realm_verse_id,
             }
         elif self._active_bani_id is not None:
             payload = {
@@ -254,6 +301,52 @@ class STTMHttpController(STTMController):
                 "homeId": verse_ids[0],
             }
 
+        ok = await self._send_control(payload)
+        if ok:
+            self._active_line_idx = next_idx
+        return ok
+
+    async def navigate_to_line(self, target_idx: int) -> bool:
+        """Jump directly to a specific line index (0-based) within the active shabad."""
+        if self._active_shabad_id is None or target_idx <= 0:
+            return False
+        verse_ids = await self._get_verse_ids(self._active_shabad_id)
+        if not verse_ids or target_idx >= len(verse_ids):
+            return False
+        next_idx = target_idx
+        raw_verse_id = verse_ids[next_idx]
+        if self._active_realm_shabad_id is not None:
+            realm_verses_for_shabad = _REALM_SHABAD_VERSES.get(self._active_realm_shabad_id, [])
+            if next_idx < len(realm_verses_for_shabad):
+                realm_verse_id = realm_verses_for_shabad[next_idx]
+            else:
+                realm_verse_id = _VERSE_MAP.get(raw_verse_id, raw_verse_id)
+            home_realm_verse_id = (
+                realm_verses_for_shabad[0] if realm_verses_for_shabad
+                else _VERSE_MAP.get(verse_ids[0], verse_ids[0])
+            )
+            payload = {
+                "type": "shabad",
+                "shabadId": self._active_realm_shabad_id,
+                "id": self._active_realm_shabad_id,
+                "verseId": realm_verse_id,
+                "lineCount": next_idx + 1,
+                "highlight": realm_verse_id,
+                "homeId": home_realm_verse_id,
+            }
+        elif self._active_bani_id is not None:
+            realm_verse_id = _VERSE_MAP.get(raw_verse_id, raw_verse_id)
+            payload = {"type": "bani", "baniId": self._active_bani_id, "verseId": realm_verse_id}
+        else:
+            payload = {
+                "type": "shabad",
+                "shabadId": self._active_shabad_id,
+                "id": self._active_shabad_id,
+                "verseId": raw_verse_id,
+                "lineCount": next_idx + 1,
+                "highlight": raw_verse_id,
+                "homeId": verse_ids[0],
+            }
         ok = await self._send_control(payload)
         if ok:
             self._active_line_idx = next_idx

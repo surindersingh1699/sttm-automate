@@ -5,6 +5,7 @@
 
 let ws = null;
 let isPaused = false;
+let micMuted = false;
 let reconnectTimer = null;
 let currentVerses = [];
 let currentLineIndex = -1;
@@ -175,11 +176,35 @@ function handleMessage(data) {
             if (Object.prototype.hasOwnProperty.call(data, "audio_device")) {
                 updateAudioDevice(data.audio_device);
             }
-            if (Object.prototype.hasOwnProperty.call(data, "sggs_only")) {
-                updateSggsOnly(data.sggs_only);
+            if (Object.prototype.hasOwnProperty.call(data, "mic_muted")) {
+                updateMicMuted(data.mic_muted);
+            }
+            if (Object.prototype.hasOwnProperty.call(data, "fast_response_enabled")) {
+                updateFastResponse(data.fast_response_enabled);
+            }
+            // The nested `decoder_toggles` blob is the canonical source on first connect —
+            // covers any toggle whose checkbox isn't fed by a flat top-level field above.
+            if (data.decoder_toggles) {
+                if (Object.prototype.hasOwnProperty.call(data.decoder_toggles, "fast_response_enabled")) {
+                    updateFastResponse(data.decoder_toggles.fast_response_enabled);
+                }
+                if (Object.prototype.hasOwnProperty.call(data.decoder_toggles, "hallucination_guards")) {
+                    updateHallucinationGuards(data.decoder_toggles.hallucination_guards);
+                }
+                if (Object.prototype.hasOwnProperty.call(data.decoder_toggles, "zero_overlap_window")) {
+                    updateZeroOverlapWindow(data.decoder_toggles.zero_overlap_window);
+                }
             }
             if (Object.prototype.hasOwnProperty.call(data, "engine")) {
                 updateWhisperEngine(data.engine);
+            }
+            if (Object.prototype.hasOwnProperty.call(data, "hf_model_id")) {
+                updateWhisperModel(data.hf_model_id);
+            }
+            // REA-10 streaming settings — sync UI from the canonical blob so a page
+            // reload restores whatever was persisted in .runtime_settings.json.
+            if (data.streaming_settings) {
+                updateStreamingSettings(data.streaming_settings);
             }
             if (data.pipeline_state === "searching" || data.pipeline_state === "candidate_lock") {
                 if (currentVerses.length > 0) {
@@ -227,8 +252,25 @@ function handleMessage(data) {
         case "audio_device_updated":
             updateAudioDevice(data.device);
             break;
-        case "sggs_only_updated":
-            updateSggsOnly(data.sggs_only);
+        case "mic_muted_updated":
+            updateMicMuted(data.muted);
+            break;
+        case "decoder_toggles_updated":
+            if (data.toggles) {
+                if (Object.prototype.hasOwnProperty.call(data.toggles, "fast_response_enabled")) {
+                    updateFastResponse(data.toggles.fast_response_enabled);
+                }
+                if (Object.prototype.hasOwnProperty.call(data.toggles, "hallucination_guards")) {
+                    updateHallucinationGuards(data.toggles.hallucination_guards);
+                }
+                if (Object.prototype.hasOwnProperty.call(data.toggles, "zero_overlap_window")) {
+                    updateZeroOverlapWindow(data.toggles.zero_overlap_window);
+                }
+            }
+            break;
+        case "streaming_settings_updated":
+            // Server confirms our toggle change applied (or another client toggled).
+            if (data.settings) updateStreamingSettings(data.settings);
             break;
         case "engine_loading":
             setEngineStatus("Loading " + data.engine + "…");
@@ -246,6 +288,24 @@ function handleMessage(data) {
             if (fsel) fsel.disabled = false;
             if (data.current_engine) updateWhisperEngine(data.current_engine);
             setEngineStatus("Failed: " + (data.error || "unknown error"));
+            break;
+        }
+        case "model_loading":
+            setModelStatus("Loading " + data.model_id + "…");
+            break;
+        case "model_updated": {
+            updateWhisperModel(data.model_id);
+            var msel = document.getElementById("whisper-model");
+            if (msel) msel.disabled = false;
+            setModelStatus("Ready: " + data.model_id);
+            setTimeout(function() { setModelStatus(""); }, 3000);
+            break;
+        }
+        case "model_update_failed": {
+            var mfsel = document.getElementById("whisper-model");
+            if (mfsel) mfsel.disabled = false;
+            if (data.current_model_id) updateWhisperModel(data.current_model_id);
+            setModelStatus("Failed: " + (data.error || "unknown error"));
             break;
         }
         case "sttm_reconnecting":
@@ -268,7 +328,22 @@ function handleMessage(data) {
         case "error":
             showError(data.message);
             break;
+        default:
+            if (typeof evalHandleMessage === "function" && data.type && data.type.startsWith("eval_")) {
+                evalHandleMessage(data);
+            }
+            break;
     }
+}
+
+// --- Tab switching ---
+
+function switchTab(name) {
+    document.getElementById("view-dashboard").hidden = name !== "dashboard";
+    document.getElementById("view-eval").hidden = name !== "eval";
+    document.getElementById("tab-dashboard").classList.toggle("tab-active", name === "dashboard");
+    document.getElementById("tab-eval").classList.toggle("tab-active", name === "eval");
+    if (name === "eval" && typeof evalInit === "function") evalInit();
 }
 
 // --- UI Updates ---
@@ -561,6 +636,35 @@ function togglePause() {
     updatePauseButton();
 }
 
+function toggleMicMute() {
+    var next = !micMuted;
+    if (next && audioSource === "remote") {
+        // Also stop the browser-side capture so the OS mic indicator clears.
+        stopRemoteMic();
+    }
+    send({ type: "set_mic_muted", muted: next });
+    // Optimistic UI; server will confirm via mic_muted_updated.
+    updateMicMuted(next);
+    if (!next && audioSource === "remote" && !audioWs) {
+        startRemoteMic();
+    }
+}
+
+function updateMicMuted(muted) {
+    micMuted = !!muted;
+    var btn = document.getElementById("btn-mute-mic");
+    if (btn) {
+        btn.textContent = micMuted ? "Unmute Mic" : "Mute Mic";
+        btn.className = micMuted ? "btn btn-danger" : "btn btn-warning";
+    }
+    var micStatus = document.getElementById("mic-status");
+    if (micStatus && micMuted) {
+        micStatus.textContent = "Mic muted";
+    } else if (micStatus && audioSource !== "remote") {
+        micStatus.textContent = "";
+    }
+}
+
 function setControllerPin() {
     var input = document.getElementById("controller-pin");
     if (!input) return;
@@ -780,13 +884,62 @@ function updateAudioDevice(device) {
     }
 }
 
-function updateSggsOnly(enabled) {
-    var el = document.getElementById("sggs-only");
+function updateFastResponse(enabled) {
+    var el = document.getElementById("fast-response");
     if (el) el.checked = !!enabled;
 }
 
-function setSggsOnly(enabled) {
-    send({ type: "set_sggs_only", enabled: !!enabled });
+function setFastResponse(enabled) {
+    send({ type: "set_decoder_toggles", toggles: { fast_response_enabled: !!enabled } });
+}
+
+// ─── REA-10: streaming-pipeline toggles ────────────────────────────────────
+// Each toggle posts a `set_streaming_settings` message with one or more
+// fields. The server responds with `streaming_settings_updated` carrying the
+// canonical settings blob, which calls back into updateStreamingSettings().
+function setStreamingMode(mode) {
+    send({ type: "set_streaming_settings", settings: { streaming_mode: mode } });
+}
+function setDedupStrategy(strategy) {
+    send({ type: "set_streaming_settings", settings: { dedup_strategy: strategy } });
+}
+function setStreamingBool(key, value) {
+    var settings = {};
+    settings[key] = !!value;
+    send({ type: "set_streaming_settings", settings: settings });
+}
+function updateStreamingSettings(settings) {
+    if (!settings) return;
+    var byId = function (id) { return document.getElementById(id); };
+    var sm = byId("streaming-mode");
+    if (sm && settings.streaming_mode) sm.value = settings.streaming_mode;
+    var ds = byId("dedup-strategy");
+    if (ds && settings.dedup_strategy) ds.value = settings.dedup_strategy;
+    var lp = byId("locked-prompt-anchor");
+    if (lp && Object.prototype.hasOwnProperty.call(settings, "locked_prompt_anchor")) {
+        lp.checked = !!settings.locked_prompt_anchor;
+    }
+}
+
+function updateHallucinationGuards(enabled) {
+    var el = document.getElementById("hallucination-guards");
+    if (el) el.checked = !!enabled;
+}
+
+function setHallucinationGuards(enabled) {
+    send({ type: "set_decoder_toggles", toggles: { hallucination_guards: !!enabled } });
+}
+
+// REA-11: zero-overlap window mode. Mirrors the hallucination-guards plumbing —
+// the orchestrator's _active_step_duration() reads config.audio.zero_overlap_window
+// each tick, so the toggle takes effect on the very next wake without restart.
+function updateZeroOverlapWindow(enabled) {
+    var el = document.getElementById("zero-overlap-window");
+    if (el) el.checked = !!enabled;
+}
+
+function setZeroOverlapWindow(enabled) {
+    send({ type: "set_decoder_toggles", toggles: { zero_overlap_window: !!enabled } });
 }
 
 // --- Whisper engine selector ---
@@ -806,6 +959,26 @@ function setWhisperEngine(name) {
 
 function setEngineStatus(text) {
     var el = document.getElementById("engine-status");
+    if (el) el.textContent = text || "";
+}
+
+// --- Whisper model selector ---
+
+function updateWhisperModel(modelId) {
+    var sel = document.getElementById("whisper-model");
+    if (sel && modelId) sel.value = modelId;
+    setModelStatus("");
+}
+
+function setWhisperModel(modelId) {
+    setModelStatus("Loading " + modelId + "…");
+    var sel = document.getElementById("whisper-model");
+    if (sel) sel.disabled = true;
+    send({ type: "set_model", model_id: modelId });
+}
+
+function setModelStatus(text) {
+    var el = document.getElementById("model-status");
     if (el) el.textContent = text || "";
 }
 

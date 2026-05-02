@@ -43,6 +43,7 @@ class EvalJobManager:
         min_match_score: float = 60.0,
         video_ids: list[str] | None = None,
         dataset: str | None = None,
+        audio_device: int | None = None,
     ) -> str:
         if self.is_running():
             raise RuntimeError("Eval run already in progress")
@@ -62,7 +63,7 @@ class EvalJobManager:
             finished_at=None,
         )
         self._task = asyncio.create_task(
-            self._run(run_id, mode, limit_videos, min_match_score, video_ids, dataset)
+            self._run(run_id, mode, limit_videos, min_match_score, video_ids, dataset, audio_device)
         )
         return run_id
 
@@ -74,10 +75,11 @@ class EvalJobManager:
         min_match_score: float,
         video_ids: list[str] | None,
         dataset: str | None,
+        audio_device: int | None = None,
     ):
         from tests.eval.dataset import _DATASET, load_eval_sessions
         from tests.eval.metrics import compute_aggregate, save_json
-        from tests.eval.runner import HeadlessSessionDriver, LiveSessionDriver, SessionResult
+        from tests.eval.runner import HeadlessSessionDriver, MicSessionDriver, SessionResult
         from tests.eval.scorer import print_kpis
 
         state = self._state
@@ -102,7 +104,10 @@ class EvalJobManager:
                 "mode": mode,
             })
 
-            driver = HeadlessSessionDriver(run_id=run_id) if mode == "headless" else LiveSessionDriver(run_id=run_id)
+            if mode == "headless":
+                driver = HeadlessSessionDriver(run_id=run_id)
+            else:
+                driver = MicSessionDriver(run_id=run_id, audio_device=audio_device)
             results: list[SessionResult] = []
 
             for i, session in enumerate(sessions):
@@ -163,6 +168,28 @@ class EvalJobManager:
             state.report = asdict(kpis)
             state.status = "done"
             state.finished_at = time.time()
+
+            # Auto-save report to disk so the eval UI can list past runs
+            try:
+                import json
+                from pathlib import Path
+                report_dir = Path(__file__).parent / "runs" / run_id
+                report_dir.mkdir(parents=True, exist_ok=True)
+                report_data = {
+                    "run_id": run_id,
+                    "mode": mode,
+                    "started_at": state.started_at,
+                    "finished_at": state.finished_at,
+                    "total_sessions": state.completed,
+                    "aggregate": state.report,
+                    "sessions": state.per_session,
+                }
+                (report_dir / "report.json").write_text(
+                    json.dumps(report_data, indent=2, ensure_ascii=False)
+                )
+            except Exception:
+                pass
+
             await self._broadcast({
                 "type": "eval_complete",
                 "run_id": run_id,
