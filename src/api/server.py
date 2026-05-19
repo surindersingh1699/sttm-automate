@@ -183,6 +183,8 @@ def load_runtime_settings():
             prec = data["onnx_precision"]
             if isinstance(prec, str) and prec in config.whisper.available_precisions:
                 config.whisper.onnx_precision = prec
+        if "lm_enabled" in data:
+            config.whisper.lm_enabled = bool(data["lm_enabled"])
         # Migrate legacy ("indicconformer-rnnt"|"indicconformer-ctc") engine
         # names from older runtime settings to the unified "indicconformer".
         if config.whisper.engine in ("indicconformer-rnnt", "indicconformer-ctc"):
@@ -209,6 +211,7 @@ def save_runtime_settings():
         "engine": config.whisper.engine,
         "hf_model_id": config.whisper.hf_model_id,
         "onnx_precision": config.whisper.onnx_precision,
+        "lm_enabled": config.whisper.lm_enabled,
         "mic_muted": bool(pipeline.mic_muted) if pipeline else mic_muted_pref,
     }
     try:
@@ -363,6 +366,8 @@ async def websocket_endpoint(
             "current_family": config.whisper.model_family(),
             "onnx_precision": config.whisper.onnx_precision,
             "available_precisions": list(config.whisper.available_precisions),
+            "lm_enabled": config.whisper.lm_enabled,
+            "lm_supported_engines": list(INDIC_ENGINES),
         }
         if current and current.verses:
             init_state["verses"] = [
@@ -504,6 +509,19 @@ async def websocket_endpoint(
                 await broadcast({
                     "type": "decoder_toggles_updated",
                     "toggles": get_decoder_toggles(),
+                })
+
+            elif msg_type == "set_lm_enabled":
+                # IndicConformer KenLM pair toggle. The engine watches
+                # ``config.whisper.lm_enabled`` and rebuilds the pyctcdecode
+                # decoder + char-LM scorer on the next transcribe(); we don't
+                # need to tear anything down here.
+                enabled = bool(msg.get("enabled", False))
+                config.whisper.lm_enabled = enabled
+                save_runtime_settings()
+                await broadcast({
+                    "type": "lm_enabled_updated",
+                    "lm_enabled": config.whisper.lm_enabled,
                 })
 
             elif msg_type == "set_streaming_settings":

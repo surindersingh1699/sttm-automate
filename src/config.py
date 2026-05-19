@@ -132,6 +132,30 @@ class WhisperConfig(BaseModel):
     # 0 disables; 0.5 s is a safe default (~half a pankti syllable).
     nemo_chunk_context_s: float = 0.5
 
+    # ── KenLM language-model fusion (IndicConformer only) ──────────────
+    # Two-LM pair, both gated by ``lm_enabled``:
+    #   - BPE 4-gram via pyctcdecode for in-beam shallow fusion
+    #   - char 6-gram run post-hoc as a hallucination PPL gate
+    # Either piece silently falls back to greedy/no-gate if its .bin or
+    # Python dep (kenlm / pyctcdecode) isn't available. See
+    # ``docs/asr-engines.md`` for the full picture.
+    lm_enabled: bool = False
+    lm_bpe_path: str = "models/lm/gurbani_canon_bpe_4gram.bin"
+    lm_char_path: str = "models/lm/gurbani_canon_char_6gram.bin"
+    # In-beam fusion weights — sweep on the eval set if changed.
+    #   α weights log P_LM in the beam score
+    #   β is a word-insertion bonus (higher = more words per second)
+    lm_alpha: float = 0.5
+    lm_beta: float = 1.5
+    lm_beam_width: int = 100
+    # Hallucination gate (char-LM perplexity per char). Defaults calibrated
+    # to canon ~3-4 / modern Punjabi ~6-8 / garbage 200+ — see lm_scorer.py.
+    lm_hallucination_ppl_threshold: float = 25.0
+    lm_low_confidence_ppl_threshold: float = 12.0
+    # Short outputs (< this many chars) skip the gate to avoid PPL spikes on
+    # single-syllable callouts.
+    lm_gate_min_chars: int = 6
+
     def model_family(self, model_id: str | None = None) -> str:
         """Return ``"whisper"`` or ``"indicconformer"`` for the given model id.
 

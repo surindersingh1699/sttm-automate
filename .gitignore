@@ -27,6 +27,8 @@ data/*.nemo
 
 # KenLM language model (large binary, downloaded/copied on demand)
 models/lm/*.bin
+# SentencePiece tokenizer required for in-beam BPE LM fusion
+models/onnx/*.model
 
 # FAISS / vector indexes (large binaries, rebuilt on demand)
 index/

@@ -36,6 +36,9 @@
                 <option value="fp32">fp32 (470 MB, accuracy)</option>
                 <option value="int8" selected>int8 (134 MB, fastest)</option>
             </select>
+            <label id="lm-toggle-wrap" class="decoder-toggle" title="Pair the IndicConformer engine with two Gurbani KenLM models: a BPE 4-gram for in-beam shallow fusion (anchors beams to canon Gurbani) and a char 6-gram run post-hoc as a hallucination gate. IndicConformer engine only." hidden>
+                <input type="checkbox" id="lm-enabled" onchange="setLmEnabled(this.checked)"> Gurbani LM
+            </label>
             <span id="engine-status" class="pin-status"></span>
             <select id="whisper-model" class="control-input" onchange="setWhisperModel(this.value)" title="Active Whisper model. Switching reloads the engine with the new model paths — first load downloads + converts the model (~5–60 s depending on engine).">
                 <option value="surindersinghssj/surt-small-v3">surt-small-v3 (244M, full)</option>

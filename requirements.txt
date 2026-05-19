@@ -10,6 +10,16 @@ pywhispercpp>=1.2.0  # whisper.cpp bindings (cross-platform, incl. iOS build pat
 # or download from the HF repo on first load.
 sherpa-onnx>=1.10.0
 onnxruntime>=1.17.0
+# KenLM fusion for the IndicConformer engine (optional, toggled from dashboard):
+#   - pyctcdecode  -> wraps CTC logprobs in a beam decoder with a KenLM scorer
+#                     plug-in (in-beam BPE 4-gram fusion).
+#   - kenlm        -> Python binding for the KenLM C++ library; .bin LMs are
+#                     mmap'd at load. Needs a C++ compiler at install time on
+#                     macOS (Xcode Command Line Tools).
+# Both are optional at runtime — IndicConformer falls back to greedy CTC and
+# skips the hallucination gate if either dep or its .bin file is missing.
+pyctcdecode>=0.5.0
+kenlm>=0.2.0
 gurmukhiutils>=0.3.1  # AnvaadLipi ASCII → Unicode Gurmukhi for display
 sounddevice>=0.4.6
 numpy>=1.24.0

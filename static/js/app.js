@@ -204,6 +204,9 @@ function handleMessage(data) {
             if (Object.prototype.hasOwnProperty.call(data, "onnx_precision")) {
                 updateIndicPrecision(data.onnx_precision);
             }
+            if (Object.prototype.hasOwnProperty.call(data, "lm_enabled")) {
+                updateLmEnabled(data.lm_enabled);
+            }
             // REA-10 streaming settings — sync UI from the canonical blob so a page
             // reload restores whatever was persisted in .runtime_settings.json.
             if (data.streaming_settings) {
@@ -257,6 +260,9 @@ function handleMessage(data) {
             break;
         case "mic_muted_updated":
             updateMicMuted(data.muted);
+            break;
+        case "lm_enabled_updated":
+            updateLmEnabled(data.lm_enabled);
             break;
         case "decoder_toggles_updated":
             if (data.toggles) {
@@ -978,6 +984,10 @@ function applyFamilyVisibility(family) {
     if (ip) ip.hidden = !isIndic;
     if (wm) wm.hidden = isIndic;
     if (im) im.hidden = !isIndic;
+    // KenLM toggle only makes sense for IndicConformer — Whisper has no CTC
+    // beam hook for shallow fusion. Hide the checkbox under Whisper family.
+    var lmw = byId("lm-toggle-wrap");
+    if (lmw) lmw.hidden = !isIndic;
     // Whisper-only decoder toggles — hide them when Indic is active. They
     // do nothing for the NeMo backend.
     var whisperToggleIds = [
@@ -1043,6 +1053,21 @@ function setIndicPrecision(precision) {
     var ip = document.getElementById("indic-precision");
     if (ip) ip.disabled = true;
     send({ type: "set_precision", precision: precision });
+}
+
+// --- KenLM Gurbani LM pair toggle (IndicConformer only) ---
+
+function setLmEnabled(checked) {
+    var cb = document.getElementById("lm-enabled");
+    if (cb) cb.disabled = true;
+    send({ type: "set_lm_enabled", enabled: !!checked });
+}
+
+function updateLmEnabled(enabled) {
+    var cb = document.getElementById("lm-enabled");
+    if (!cb) return;
+    cb.disabled = false;
+    cb.checked = !!enabled;
 }
 
 function updateIndicPrecision(precision) {
