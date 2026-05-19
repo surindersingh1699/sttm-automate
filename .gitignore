@@ -20,6 +20,14 @@ data/surt-small-turbo-baseline-v0*.ggml
 data/_baseline-v0-source/
 data/_whisper_cpp_assets/
 
+# IndicConformer artifacts (ONNX bundles + NeMo checkpoints + caches)
+data/_onnx_cache/
+data/_nemo_cache/
+data/*.nemo
+
+# KenLM language model (large binary, downloaded/copied on demand)
+models/lm/*.bin
+
 # FAISS / vector indexes (large binaries, rebuilt on demand)
 index/
 
@@ -31,6 +39,9 @@ tests/eval/runs/
 .claude/
 .DS_Store
 *.spec
+
+# Per-install dashboard auth token (secret — never commit)
+.controller_token
 
 # Auto-downloaded from HF dataset on first run
 database.sqlite
