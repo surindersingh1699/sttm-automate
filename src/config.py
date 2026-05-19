@@ -39,6 +39,7 @@ class WhisperConfig(BaseModel):
     # "faster-whisper" = CTranslate2 int8 (default, cross-platform CPU)
     # "mlx-whisper"    = Apple MLX (GPU/ANE, macOS Apple Silicon only)
     # "whisper-cpp"    = whisper.cpp via pywhispercpp (cross-platform incl. iOS)
+    # "indicconformer" = AI4Bharat IndicConformer hybrid CTC/RNN-T via NeMo
     engine: str = "faster-whisper"
     # Active model (HuggingFace repo id). User-selectable from the dashboard.
     # The engine-specific cache paths below derive from this — switching the
@@ -46,11 +47,21 @@ class WhisperConfig(BaseModel):
     hf_model_id: str = "surindersinghssj/surt-small-v3"
     # Registry of selectable models. Add a new HF repo id here to expose it
     # in the dashboard's model dropdown. Each entry is auto-converted to the
-    # active engine's cache format on first load (CT2 / MLX / GGML).
+    # active engine's cache format on first load (CT2 / MLX / GGML / .nemo).
     available_models: list[str] = [
         "surindersinghssj/surt-small-v3",
         "surindersinghssj/surt-small-turbo-baseline-v0",
+        "surindersinghssj/indicconformer-pa-v3-kirtan",
     ]
+    # Model family classifier — drives which engine set is valid for each
+    # entry in available_models, and which Whisper-style cache paths get
+    # rewritten by apply_model_id(). NeMo models bypass the GGML/CT2/MLX
+    # conversion machinery entirely.
+    model_families: dict[str, str] = {
+        "surindersinghssj/surt-small-v3": "whisper",
+        "surindersinghssj/surt-small-turbo-baseline-v0": "whisper",
+        "surindersinghssj/indicconformer-pa-v3-kirtan": "indicconformer",
+    }
     local_model_dir: str = "data/surt-small-v3-ct2"  # where the converted CT2 model lives
     # MLX-specific:
     mlx_model_dir: str = "data/surt-small-v3-mlx"  # converted MLX weights cache (Apple Metal)
@@ -91,17 +102,63 @@ class WhisperConfig(BaseModel):
     hg_logprob_thold: float = -2.5       # very lenient — sung speech has much lower per-token confidence
     hg_entropy_thold: float = 8.0        # loosened from 2.4 (kirtan refrains are legitimately repetitive)
     hg_temperature_inc: float = 0.2      # fallback ladder step (0 → no fallback)
+    # ── IndicConformer (ONNX, CTC) ──────────────────────────────────────
+    # CTC-only ONNX export of our fine-tuned IndicConformer-pa, served via
+    # sherpa-onnx. Three precisions live side-by-side under
+    # ``{onnx_model_dir}/{onnx_precision}/indicconformer-pa-ctc.onnx`` with a
+    # shared ``tokens.txt`` at the root; the engine downloads the relevant
+    # files from the HF repo on first load if they aren't already there.
+    onnx_model_dir: str = "~/models/exports-pa"
+    # Active precision — selectable from the dashboard.
+    #   fp32 — accuracy reference (~470 MB)
+    #   fp16 — currently BROKEN: NeMo→ONNX fp16 export left mixed float/half
+    #          tensors at /pre_encode/Add and onnxruntime refuses to load it.
+    #          Re-export with the cast fixed before re-enabling.
+    #   int8 — fastest + smallest (~134 MB). Default until fp16 is re-exported.
+    onnx_precision: str = "int8"
+    available_precisions: tuple[str, ...] = ("fp32", "int8")
+    # CPU thread count for the ONNX session.
+    onnx_threads: int = 4
+    # Chunked streaming for IndicConformer (StreamingConfig.streaming_mode="nemo_chunked").
+    # Decode every `nemo_chunk_len_s` seconds of audio standalone (no VAD gating,
+    # no rolling window). Latency ≈ chunk_len_s; CPU cost ≈ one decode per chunk.
+    # Smaller chunk = lower latency + more boundary errors; matcher's first-letter
+    # retrieval is robust to a missing word at the edges, so 1.0–1.5 s works well
+    # for fast bani. Set to 0 to disable (fall back to vad_segmented behavior).
+    nemo_chunk_len_s: float = 1.5
+    # Optional left-context audio fed to the model alongside each chunk to give
+    # the encoder a warm-up region before the new audio. We only KEEP the new
+    # text — context exists purely to stabilize the encoder's first frames.
+    # 0 disables; 0.5 s is a safe default (~half a pankti syllable).
+    nemo_chunk_context_s: float = 0.5
+
+    def model_family(self, model_id: str | None = None) -> str:
+        """Return ``"whisper"`` or ``"indicconformer"`` for the given model id.
+
+        Defaults to the active model. Unknown ids fall back to ``"whisper"``
+        — the legacy assumption — so config files written before the family
+        registry shipped continue to work.
+        """
+        mid = model_id or self.hf_model_id
+        return self.model_families.get(mid, "whisper")
 
     def apply_model_id(self, model_id: str) -> None:
-        """Switch the active model; rewrite all engine-specific cache paths.
+        """Switch the active model; rewrite engine-specific cache paths.
 
-        Each engine reads its model location from these fields, so the four
-        paths must move together. Caller is responsible for triggering an
-        engine reload (``pipeline.switch_engine(current_engine)``) afterward
-        so the new weights are actually loaded.
+        For Whisper models we update all four cache paths (CT2/MLX/GGML/GGML-q8)
+        together so any of the four engines can pick up the swap. For
+        IndicConformer the active artifacts live under ``onnx_model_dir`` and
+        track the HF repo id directly, so there's no per-model cache path to
+        rewrite here.
+
+        Caller is responsible for triggering an engine reload
+        (``pipeline.switch_engine(current_engine)``) afterward so the new
+        weights are actually loaded.
         """
         short = model_id.rsplit("/", 1)[-1]
         self.hf_model_id = model_id
+        if self.model_family(model_id) == "indicconformer":
+            return
         self.local_model_dir = f"data/{short}-ct2"
         self.mlx_model_dir = f"data/{short}-mlx"
         self.whisper_cpp_model_path = f"data/{short}.ggml"
@@ -277,6 +334,11 @@ class StreamingConfig(BaseModel):
     #                     prefix two consecutive decodes agree on (Macháček 2023).
     # hybrid           — VAD-bounded utterance buffers + LocalAgreement-2 inside.
     #                     Production target.
+    # nemo_chunked     — IndicConformer-only: decode every `nemo_chunk_len_s` seconds
+    #                     of audio standalone. Bypasses VAD entirely so fast bani
+    #                     (no breath gaps) doesn't merge multiple panktis into one
+    #                     decode. Whisper-engine guard rails make this a no-op for
+    #                     non-NeMo engines — they fall back to naive automatically.
     streaming_mode: str = "naive"
 
     # ── VAD ─────────────────────────────────────────────────────────────
@@ -341,8 +403,14 @@ class STTMConfig(BaseModel):
 
 
 class DashboardConfig(BaseModel):
-    host: str = "0.0.0.0"
+    # Default to localhost-only. Token auth is meant as a polite gate, not a
+    # MITM defence — keeping the listener bound to 127.0.0.1 means an
+    # attacker has to already be on this Mac to even *try* a token guess.
+    # Set STTM_LAN_MODE=1 (or `lan_mode = true` in .runtime_settings.json)
+    # to expose the controller on the local network for sangat-mode clients.
+    host: str = "127.0.0.1"
     port: int = 8080
+    lan_mode: bool = False  # when True, host flips to 0.0.0.0
     max_candidates: int = 5  # top N candidates to show
 
 
@@ -365,3 +433,84 @@ class AppConfig(BaseModel):
 
 # Global config instance
 config = AppConfig()
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Engine-family tuning profiles
+# ──────────────────────────────────────────────────────────────────────
+#
+# These profiles flip a small whitelist of audio + streaming knobs so the
+# capture pipeline matches what each engine family actually wants. They do
+# NOT touch matcher knobs — that's `set_confidence_mode`'s job. Call
+# `apply_engine_profile()` after a model/engine swap or at startup once
+# `.runtime_settings.json` has been merged in.
+#
+# Why a whitelist instead of full presets? The user-tunable knobs in
+# `.runtime_settings.json` should keep winning when they don't conflict
+# with engine-family invariants. We only override the keys whose "right
+# default" depends on the engine.
+
+# Per (family, speed) overlay. Speed is a hint — "normal" (default) is the
+# safe baseline; "fast" tightens VAD + capture cadence for fast recitation.
+_ENGINE_PROFILES: dict[tuple[str, str], dict[str, dict[str, object]]] = {
+    # Whisper baseline — restores legacy values so swapping back from
+    # IndicConformer doesn't strand the operator with indic-tuned VAD.
+    ("whisper", "normal"): {
+        "streaming": {
+            "vad_min_silence_ms": 200,
+            "vad_min_speech_ms": 300,
+            "vad_max_utterance_ms": 30000,
+        },
+        "audio": {
+            "fast_step_duration": 1.5,
+        },
+    },
+    # IndicConformer baseline — loosely matches what the existing
+    # `pin_indic_best_settings` already enforces, plus VAD knobs.
+    ("indicconformer", "normal"): {
+        "streaming": {
+            "vad_min_silence_ms": 180,
+            "vad_min_speech_ms": 250,
+            "vad_max_utterance_ms": 8000,
+        },
+        "audio": {
+            "fast_step_duration": 1.2,
+        },
+    },
+    # IndicConformer FAST — tuned for very rapid Nitnem-style recitation.
+    # Cuts utterances on shorter breaths, force-flushes utterances at 2.5 s
+    # so one decode ≈ one pankti even when the ragi barely pauses.
+    ("indicconformer", "fast"): {
+        "streaming": {
+            "vad_min_silence_ms": 100,
+            "vad_min_speech_ms": 150,
+            "vad_max_utterance_ms": 2500,
+            "vad_speech_pad_ms": 100,
+        },
+        "audio": {
+            "fast_step_duration": 0.8,
+        },
+    },
+}
+
+
+def apply_engine_profile(family: str | None = None, speed: str = "normal") -> bool:
+    """Apply audio/streaming defaults for the given engine family.
+
+    Returns True if a profile was applied. Unknown (family, speed) pairs are
+    a no-op (return False) so callers can pass through user input safely.
+    Idempotent — calling twice with the same args is identical to calling once.
+    """
+    if family is None:
+        family = config.whisper.model_family()
+    overlay = _ENGINE_PROFILES.get((family, speed))
+    if overlay is None:
+        return False
+    for section_name, section_overrides in overlay.items():
+        section = getattr(config, section_name, None)
+        if section is None:
+            continue
+        for key, value in section_overrides.items():
+            if hasattr(section, key):
+                setattr(section, key, value)
+    return True

@@ -237,6 +237,13 @@ class PipelineOrchestrator:
                 f"LocalAgreement-2 mid-utterance commits "
                 f"(decode_interval={config.streaming.local_agreement_decode_interval_ms}ms)"
             )
+        elif mode == "nemo_chunked":
+            print(
+                f"[Pipeline] streaming_mode=nemo_chunked — fixed "
+                f"{config.whisper.nemo_chunk_len_s:.2f}s decodes, "
+                f"context={config.whisper.nemo_chunk_context_s:.2f}s "
+                f"(IndicConformer-only; bypasses VAD)"
+            )
 
         print("[Pipeline] Pipeline running. Listening for kirtan...")
         # Streaming-mode-aware task layout. The naive path keeps capture and
@@ -258,6 +265,11 @@ class PipelineOrchestrator:
             tasks = {
                 asyncio.create_task(self._meter_tick_task()),
                 asyncio.create_task(self._hybrid_streaming_loop()),
+            }
+        elif mode == "nemo_chunked":
+            tasks = {
+                asyncio.create_task(self._meter_tick_task()),
+                asyncio.create_task(self._nemo_chunked_loop()),
             }
         else:
             tasks = {
@@ -361,6 +373,32 @@ class PipelineOrchestrator:
         self.audio.reset_ring()
         # Release old model memory (helps mlx/ggml releases).
         del prev
+        # IndicConformer best-settings pin. Whisper-only knobs become no-ops
+        # under NeMo; the dashboard hides them in lock-step (see
+        # applyFamilyVisibility in app.js). Helper lives in factory so the
+        # startup path can call it too — keeps the disk-loaded config
+        # honest without re-running switch_engine.
+        from src.transcription.factory import pin_indic_best_settings
+        if pin_indic_best_settings():
+            print(
+                f"[Pipeline] Indic engine active — pinned streaming_mode="
+                f"{config.streaming.streaming_mode}, dedup={config.streaming.dedup_strategy}, "
+                f"locked_prompt_anchor=False, zero_overlap=False, hallucination_guards=False"
+            )
+        # Engine-family overlay: refresh VAD/capture defaults for whichever
+        # family we just swapped to. "fast" speed if the user is already on
+        # the indic_fast confidence mode, "normal" otherwise. set_confidence_mode
+        # also calls apply_engine_profile when the user picks indic_fast, so
+        # this is the symmetric path for "engine swap while keeping mode".
+        from src.config import apply_engine_profile
+        family = config.whisper.model_family()
+        speed = "fast" if self._confidence_mode == "indic_fast" else "normal"
+        if apply_engine_profile(family, speed):
+            print(
+                f"[Pipeline] Applied engine profile family={family} speed={speed} "
+                f"(vad_min_silence={config.streaming.vad_min_silence_ms}ms, "
+                f"vad_max_utt={config.streaming.vad_max_utterance_ms}ms)"
+            )
         print(f"[Pipeline] Transcription engine switched to: {name}")
         return True, None
 
@@ -552,6 +590,32 @@ class PipelineOrchestrator:
                 "silence_autolock_min_score": 0.75,
                 "candidate_lock_miss_windows": 5,
             },
+            # IndicConformer + fast bani profile. Looser dwell, smaller
+            # word-overlap floors, and lower thresholds so the matcher can
+            # follow rapid Nitnem-style recitation where each VAD chunk is
+            # ~1 pankti (≈ 1.5 s) instead of Whisper's 3 s window. Pairs with
+            # apply_engine_profile("indicconformer", "fast") which tightens
+            # the VAD knobs that produce these short chunks in the first place.
+            "indic_fast": {
+                "auto_threshold": 0.70,
+                "instant_lock_threshold": 0.82,
+                "min_raw_lock_score": 0.66,
+                "word_overlap_auto_min": 1,
+                "word_overlap_evidence_min": 1,
+                "word_overlap_instant_min": 1,
+                "instant_challenger_switch_score": 0.86,
+                "instant_challenger_switch_margin": 0.06,
+                "word_overlap_instant_challenger_min": 1,
+                "suggest_threshold": 0.55,
+                "challenger_margin": 0.08,
+                "challenger_windows": 2,
+                "candidate_lock_windows": 1,
+                "weak_line_recovery_windows": 2,
+                "recovery_challenger_score": 0.60,
+                "local_line_follow_threshold": 0.38,
+                "silence_autolock_min_score": 0.78,
+                "candidate_lock_miss_windows": 5,
+            },
             # Gurudwara — tighter than conservative on every threshold.
             # Live PA reverb, sangat noise, and the public visibility of false
             # locks all argue for "rather wait than lock wrong". Pair with the
@@ -602,6 +666,18 @@ class PipelineOrchestrator:
             candidate_lock_windows=config.matcher.candidate_lock_windows,
         )
         self._confidence_mode = mode if mode in profiles else "balanced"
+        # indic_fast also flips matcher knobs that aren't in the standard profile
+        # shape — line-advance gating, alaap detection (false-positives on rapid
+        # syllables), and fast-response — and wires up the matching engine-family
+        # VAD overlay so the chunks coming in are actually short.
+        if self._confidence_mode == "indic_fast":
+            from src.config import apply_engine_profile
+            config.matcher.min_line_dwell_seconds = 1.5
+            config.matcher.min_words_for_line_advance = 1
+            config.matcher.dense_dominant_margin = 0.50
+            config.matcher.alaap_detection_enabled = False
+            config.matcher.fast_response_enabled = True
+            apply_engine_profile("indicconformer", "fast")
 
     @property
     def confidence_mode(self) -> str:
@@ -850,6 +926,96 @@ class PipelineOrchestrator:
                 await self._broadcast({"type": "error", "message": str(e)})
                 await asyncio.sleep(1)
             await asyncio.sleep(poll_period_s)
+
+    # ──────────────────────────────────────────────────────────────────
+    # nemo_chunked streaming mode (IndicConformer-only)
+    # ──────────────────────────────────────────────────────────────────
+
+    async def _nemo_chunked_loop(self):
+        """Decode IndicConformer at fixed audio intervals, no VAD gating.
+
+        Why this exists: VAD-segmented mode cuts on silence, but very fast
+        bani has almost no silence between panktis — multiple panktis fuse
+        into a single 6-8 s utterance and the matcher can't track lines.
+        This loop bypasses VAD entirely and feeds the model `nemo_chunk_len_s`
+        seconds of fresh audio every cycle, giving deterministic ~chunk-len
+        latency regardless of breath pattern.
+
+        Whisper engines fall through to `naive` here — the chunked path
+        depends on IndicConformer's tolerance for very short inputs.
+        """
+        import time as _time
+        import numpy as _np
+
+        if config.whisper.engine != "indicconformer":
+            print(
+                f"[Pipeline] nemo_chunked requested but active engine is "
+                f"{config.whisper.engine!r} — falling back to naive."
+            )
+            await self._capture_tick_task()
+            return
+
+        chunk_len_s = max(0.3, float(config.whisper.nemo_chunk_len_s))
+        context_s = max(0.0, float(config.whisper.nemo_chunk_context_s))
+        samplerate = config.audio.samplerate
+        chunk_samples = int(chunk_len_s * samplerate)
+        last_seen = self.audio.samples_written()
+
+        while self.running:
+            try:
+                cur = self.audio.samples_written()
+                grew = cur - last_seen
+                if grew < chunk_samples:
+                    # Sleep just enough wall-clock time for the next chunk to
+                    # land. Don't sub-poll — IndicConformer decodes are cheap
+                    # but not free, and over-polling burns CPU on no-ops.
+                    needed_samples = chunk_samples - grew
+                    await asyncio.sleep(max(0.05, needed_samples / float(samplerate)))
+                    continue
+                last_seen = cur
+
+                if self.paused:
+                    await asyncio.sleep(chunk_len_s)
+                    continue
+
+                # Pull `chunk_len_s + context_s` of newest audio. The decoder
+                # reads the whole thing — context exists only to warm up the
+                # encoder. We attribute the produced text to chunk_len_s for
+                # the speech-rate denominator (anything else would slowly
+                # rotate LPS toward the context length).
+                read_seconds = chunk_len_s + context_s
+                audio = self.audio.latest_window(read_seconds)
+                if audio.size == 0:
+                    continue
+
+                chunk_rms = float(_np.sqrt(_np.mean(audio ** 2)))
+                has_vocals = bool(self.transcriber.has_vocal_content(audio))
+
+                await self._broadcast({
+                    "type": "audio_level",
+                    "rms": round(chunk_rms, 4),
+                    "has_vocals": has_vocals,
+                    "speech_rate_lps": round(self._speech_rate_lps, 2),
+                    "listening_mode": "nemo_chunked",
+                    "window_seconds": round(chunk_len_s, 2),
+                })
+
+                if not has_vocals:
+                    # No singing in this chunk — don't waste a decode.
+                    continue
+
+                await self._process_one_audio_window(
+                    audio=audio,
+                    listening_mode="nemo_chunked",
+                    window_seconds=chunk_len_s,
+                    has_vocals=True,
+                    chunk_rms=chunk_rms,
+                    now_mono=_time.monotonic(),
+                )
+            except Exception as e:
+                print(f"[Pipeline] nemo_chunked loop error: {e}")
+                await self._broadcast({"type": "error", "message": str(e)})
+                await asyncio.sleep(1)
 
     # ──────────────────────────────────────────────────────────────────
     # local_agreement streaming mode (REA-10 Phase 3)
@@ -1212,6 +1378,7 @@ class PipelineOrchestrator:
         ):
             self._suggest_first_seen.clear()
             self._challenger_first_seen.clear()
+            self._prev_first_letters = ""
             print(
                 f"  [STALE RESET] gap={now_mono - self._last_window_timestamp:.1f}s "
                 f"> {config.matcher.stale_memory_threshold_seconds:.0f}s — "
@@ -1253,13 +1420,14 @@ class PipelineOrchestrator:
         # repetition (REA-10).
         window_audio_start = now_mono - window_seconds
         _t0 = _time.monotonic()
-        print(f"  [DEBUG] Starting Whisper transcription ({window_seconds:.1f}s audio, mode={listening_mode})...")
+        _engine_label = config.whisper.engine
+        print(f"  [DEBUG] Starting {_engine_label} transcription ({window_seconds:.1f}s audio, mode={listening_mode})...")
         segments = await asyncio.to_thread(
             self.transcriber.transcribe, audio_for_stt, initial_prompt
         )
         _elapsed = _time.monotonic() - _t0
         text = self.processor.process(segments, audio_window_start=window_audio_start)
-        print(f"  [DEBUG] Whisper done in {_elapsed:.1f}s → '{text[:80]}'" if text else f"  [DEBUG] Whisper done in {_elapsed:.1f}s → (empty)")
+        print(f"  [DEBUG] {_engine_label} done in {_elapsed:.1f}s → '{text[:80]}'" if text else f"  [DEBUG] {_engine_label} done in {_elapsed:.1f}s → (empty)")
 
         # Drop windows where decode took too long (protects lock state from
         # junk output of runaway decodes). Transparent to UI via status flag.
@@ -1380,7 +1548,17 @@ class PipelineOrchestrator:
             PipelineState.SEARCHING,
             PipelineState.CANDIDATE_LOCK,
         ):
-            if len(first_letters) < config.matcher.min_search_letters:
+            # When the current window alone is too short to search, try stitching
+            # with the previous window's letters before giving up. Mirrors the
+            # locked-state stitch path so a short-fragment window (e.g. ASR
+            # returns 1-2 words mid-verse) can still contribute to retrieval.
+            stitched_pc = f"{self._prev_first_letters}{first_letters}"
+            stitched_cp = f"{first_letters}{self._prev_first_letters}"
+            best_stitch_len = max(len(stitched_pc), len(stitched_cp))
+            if (
+                len(first_letters) < config.matcher.min_search_letters
+                and best_stitch_len < config.matcher.min_search_letters
+            ):
                 if self.tracker.state == PipelineState.CANDIDATE_LOCK:
                     self._candidate_lock_misses += 1
                     if self._candidate_lock_misses >= config.matcher.candidate_lock_miss_windows:
@@ -1391,6 +1569,7 @@ class PipelineOrchestrator:
                 first_letters,
                 start_mode=self._after_break_windows > 0,
                 transcript_text=text,
+                prev_first_letters=self._prev_first_letters,
             )
             if self._after_break_windows > 0:
                 self._after_break_windows -= 1
@@ -1432,19 +1611,52 @@ class PipelineOrchestrator:
         first_letters: str,
         start_mode: bool = False,
         transcript_text: str = "",
+        prev_first_letters: str = "",
     ):
         """SEARCHING state: broad search, score candidates, try to lock."""
-        # Broad local-DB search (offline SQLite).
-        candidates = await asyncio.to_thread(
-            self.searcher.search,
-            first_letters,
-            10,
-            start_mode,
-            transcript_text,
-        )
+        # Pick the search query: when the fresh window alone is too short to
+        # search reliably, fall back to a stitch with the previous window's
+        # letters. Try both directions (prev+current and current+prev) — fast
+        # kirtan can split a verse across the window boundary either way — and
+        # use whichever yields the stronger top candidate. Mirrors the locked
+        # path's stitch behaviour.
+        scoring_letters = first_letters
+        candidates: list = []
+        if (
+            prev_first_letters
+            and len(first_letters) < config.matcher.min_search_letters
+        ):
+            best_top = -1.0
+            for variant in (
+                f"{prev_first_letters}{first_letters}",
+                f"{first_letters}{prev_first_letters}",
+            ):
+                if len(variant) < config.matcher.min_search_letters:
+                    continue
+                trial = await asyncio.to_thread(
+                    self.searcher.search,
+                    variant,
+                    10,
+                    start_mode,
+                    transcript_text,
+                )
+                trial_top = trial[0]["score"] if trial else 0.0
+                if trial_top > best_top:
+                    best_top = trial_top
+                    scoring_letters = variant
+                    candidates = trial
+        else:
+            candidates = await asyncio.to_thread(
+                self.searcher.search,
+                first_letters,
+                10,
+                start_mode,
+                transcript_text,
+            )
 
-        # Score candidates
-        scored = self._score_candidates(first_letters, candidates, transcript_text)
+        # Score candidates against the same letters that retrieved them — when we
+        # stitched, scoring with the original short query understates the match.
+        scored = self._score_candidates(scoring_letters, candidates, transcript_text)
         top_candidates = scored[:config.dashboard.max_candidates]
         self.tracker.observe_candidates(top_candidates, self._window_index)
         best_hypothesis = self.tracker.best_hypothesis()

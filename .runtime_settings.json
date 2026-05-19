@@ -1,5 +1,5 @@
 {
-  "controller_pin": 1389,
+  "controller_pin": 2716,
   "confidence_mode": "balanced",
   "audio_device": 1,
   "decoder_toggles": {
@@ -12,24 +12,25 @@
     "hallucination_guards": false,
     "multi_line_search": true,
     "multi_line_locked_align": true,
-    "fast_response_enabled": false,
+    "fast_response_enabled": true,
     "zero_overlap_window": false
   },
   "streaming": {
-    "streaming_mode": "naive",
+    "streaming_mode": "nemo_chunked",
     "vad_backend": "kirtan",
-    "vad_threshold": 0.65,
-    "vad_min_silence_ms": 200,
-    "vad_min_speech_ms": 300,
+    "vad_threshold": 0.25,
+    "vad_min_silence_ms": 180,
+    "vad_min_speech_ms": 250,
     "vad_speech_pad_ms": 200,
-    "vad_max_utterance_ms": 30000,
+    "vad_max_utterance_ms": 8000,
     "local_agreement_n": 2,
     "local_agreement_decode_interval_ms": 1500,
     "local_agreement_max_buffer_ms": 20000,
-    "dedup_strategy": "text",
+    "dedup_strategy": "none",
     "locked_prompt_anchor": false
   },
-  "engine": "mlx-whisper",
-  "hf_model_id": "surindersinghssj/surt-small-turbo-baseline-v0",
-  "mic_muted": false
+  "engine": "indicconformer",
+  "hf_model_id": "surindersinghssj/indicconformer-pa-v3-kirtan",
+  "onnx_precision": "fp32",
+  "mic_muted": true
 }

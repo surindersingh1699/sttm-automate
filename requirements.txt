@@ -4,6 +4,12 @@ transformers>=4.36.0  # needed for ct2-transformers converter
 # Alternative Whisper backends — selectable at runtime from the dashboard.
 mlx-whisper>=0.4.0; sys_platform == "darwin" and platform_machine == "arm64"
 pywhispercpp>=1.2.0  # whisper.cpp bindings (cross-platform, incl. iOS build path)
+# AI4Bharat IndicConformer — fine-tuned for Punjabi kirtan, served as a CTC
+# ONNX export via sherpa-onnx (CPU-fast, mobile-deployable). The NeMo runtime
+# is no longer needed at inference time; weights live under ~/models/exports-pa
+# or download from the HF repo on first load.
+sherpa-onnx>=1.10.0
+onnxruntime>=1.17.0
 gurmukhiutils>=0.3.1  # AnvaadLipi ASCII → Unicode Gurmukhi for display
 sounddevice>=0.4.6
 numpy>=1.24.0

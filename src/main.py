@@ -47,13 +47,32 @@ async def run_pipeline_only():
 
 def run_with_dashboard():
     """Run the pipeline with the web dashboard."""
+    import os
     import uvicorn
+    from src.api.auth import get_or_create_token
     from src.config import config
 
-    # The FastAPI app handles pipeline lifecycle
+    # LAN mode is opt-in via env var or runtime setting; default is loopback.
+    if os.environ.get("STTM_LAN_MODE", "").lower() in ("1", "true", "yes") or config.dashboard.lan_mode:
+        host = "0.0.0.0"
+        config.dashboard.lan_mode = True
+    else:
+        host = config.dashboard.host or "127.0.0.1"
+
+    token = get_or_create_token()
+    auth_url = f"http://127.0.0.1:{config.dashboard.port}/auth?token={token}"
+    bind_label = "LAN" if host == "0.0.0.0" else "loopback only"
+    print()
+    print("─" * 72)
+    print(f"  STTM controller   bind: {host}:{config.dashboard.port}  ({bind_label})")
+    print(f"  Dashboard URL     {auth_url}")
+    print(f"  WebSocket URL     ws://127.0.0.1:{config.dashboard.port}/ws?token={token}")
+    print("─" * 72)
+    print()
+
     uvicorn.run(
         "src.api.server:app",
-        host=config.dashboard.host,
+        host=host,
         port=config.dashboard.port,
         reload=False,
     )

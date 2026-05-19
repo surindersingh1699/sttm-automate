@@ -5,15 +5,21 @@ import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel
 
+from src.api.auth import get_or_create_token, verify as verify_token
 from src.config import config
 from src.controller.sttm_http import STTMHttpController
 from src.pipeline.orchestrator import PipelineOrchestrator
-from src.transcription.factory import SUPPORTED_ENGINES
+from src.transcription.factory import (
+    INDIC_ENGINES,
+    SUPPORTED_ENGINES,
+    WHISPER_ENGINES,
+    pin_indic_best_settings,
+)
 
 # Connected WebSocket clients
 clients: list[WebSocket] = []
@@ -63,7 +69,7 @@ STREAMING_KEYS: tuple[str, ...] = (
     "dedup_strategy",
     "locked_prompt_anchor",
 )
-_STREAMING_MODE_VALUES = ("naive", "vad_segmented", "local_agreement", "hybrid")
+_STREAMING_MODE_VALUES = ("naive", "vad_segmented", "local_agreement", "hybrid", "nemo_chunked")
 _VAD_BACKEND_VALUES = ("kirtan", "silero")
 _DEDUP_STRATEGY_VALUES = ("text", "audio_time", "none")
 
@@ -72,8 +78,32 @@ def get_streaming_settings() -> dict:
     return {key: getattr(config.streaming, key) for key in STREAMING_KEYS}
 
 
+# Settings that have no effect under IndicConformer. The pipeline pins each
+# of these to a fixed value when the indic engine is active (see
+# ``PipelineOrchestrator.switch_engine``); accepting user overrides would
+# just let stale UI state silently drift away from what's actually running.
+_INDIC_LOCKED_STREAMING_KEYS = frozenset({
+    # streaming_mode used to be pinned, but Indic now supports two valid
+    # choices (vad_segmented and nemo_chunked). Let the operator pick.
+    "dedup_strategy",
+    "locked_prompt_anchor",
+})
+_INDIC_LOCKED_DECODER_KEYS = frozenset({
+    "hallucination_guards",
+    "zero_overlap_window",
+})
+
+
+def _is_indic_engine_active() -> bool:
+    return config.whisper.engine in INDIC_ENGINES
+
+
 def _apply_streaming_setting(key: str, value) -> None:
     if key not in STREAMING_KEYS:
+        return
+    # Refuse no-op overrides on Indic — keeps the persisted runtime settings
+    # honest about what's actually in effect.
+    if _is_indic_engine_active() and key in _INDIC_LOCKED_STREAMING_KEYS:
         return
     # Enum-typed fields — reject unknown values rather than silently corrupting state.
     if key == "streaming_mode" and value not in _STREAMING_MODE_VALUES:
@@ -111,6 +141,8 @@ def _apply_decoder_toggle(key: str, value: bool) -> None:
     section = TOGGLE_SECTIONS.get(key)
     if section is None:
         return
+    if _is_indic_engine_active() and key in _INDIC_LOCKED_DECODER_KEYS:
+        return
     setattr(getattr(config, section), key, bool(value))
 
 
@@ -125,7 +157,7 @@ def load_runtime_settings():
             value = data["controller_pin"]
             config.sttm.controller_pin = int(value) if value not in (None, "") else None
         mode = data.get("confidence_mode", "balanced")
-        confidence_mode = mode if mode in ("conservative", "balanced", "fast", "gurudwara") else "balanced"
+        confidence_mode = mode if mode in ("conservative", "balanced", "fast", "gurudwara", "indic_fast") else "balanced"
         if "audio_device" in data:
             dev = data["audio_device"]
             config.audio.device = int(dev) if dev is not None else None
@@ -147,8 +179,21 @@ def load_runtime_settings():
             mid = data["hf_model_id"]
             if isinstance(mid, str) and mid in config.whisper.available_models:
                 config.whisper.apply_model_id(mid)
+        if "onnx_precision" in data:
+            prec = data["onnx_precision"]
+            if isinstance(prec, str) and prec in config.whisper.available_precisions:
+                config.whisper.onnx_precision = prec
+        # Migrate legacy ("indicconformer-rnnt"|"indicconformer-ctc") engine
+        # names from older runtime settings to the unified "indicconformer".
+        if config.whisper.engine in ("indicconformer-rnnt", "indicconformer-ctc"):
+            config.whisper.engine = "indicconformer"
         if "mic_muted" in data:
             mic_muted_pref = bool(data["mic_muted"])
+        # If a stale runtime config left Indic-incompatible knobs on, fix
+        # them now — before the pipeline reads any of these. Acts on the
+        # post-load engine value so this also covers `engine` overrides
+        # earlier in this same call.
+        pin_indic_best_settings()
     except Exception as e:
         print(f"[Server] Could not load runtime settings: {e}")
 
@@ -163,6 +208,7 @@ def save_runtime_settings():
         "streaming": get_streaming_settings(),
         "engine": config.whisper.engine,
         "hf_model_id": config.whisper.hf_model_id,
+        "onnx_precision": config.whisper.onnx_precision,
         "mic_muted": bool(pipeline.mic_muted) if pipeline else mic_muted_pref,
     }
     try:
@@ -231,16 +277,62 @@ static_dir = Path(__file__).parent.parent.parent / "static"
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 
+def _request_has_token(request: Request) -> bool:
+    """Allow either ?token= query, X-STTM-Token header, or sttm_token cookie."""
+    tok = (
+        request.query_params.get("token")
+        or request.headers.get("x-sttm-token")
+        or request.cookies.get("sttm_token")
+    )
+    return verify_token(tok)
+
+
+@app.get("/auth")
+async def auth_login(token: str | None = Query(default=None)):
+    """One-shot login — sets sttm_token cookie, bounces to /."""
+    if not verify_token(token):
+        raise HTTPException(status_code=401, detail="invalid token")
+    resp = RedirectResponse(url="/", status_code=302)
+    resp.set_cookie(
+        key="sttm_token",
+        value=token,
+        httponly=True,
+        samesite="lax",
+        max_age=60 * 60 * 24 * 30,
+    )
+    return resp
+
+
 @app.get("/")
-async def index():
-    """Serve the dashboard."""
+async def index(request: Request):
+    """Serve the dashboard. Token-gated."""
+    if not _request_has_token(request):
+        raise HTTPException(
+            status_code=401,
+            detail="missing or invalid token; visit /auth?token=… first",
+        )
     return FileResponse(str(static_dir / "index.html"))
 
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket endpoint for real-time dashboard communication."""
+async def websocket_endpoint(
+    websocket: WebSocket,
+    token: str | None = Query(default=None),
+):
+    """WebSocket endpoint for real-time dashboard communication.
+
+    Requires the per-install token (``?token=…`` or ``X-STTM-Token``
+    header or ``sttm_token`` cookie). Bad/missing tokens are rejected
+    before the upgrade completes.
+    """
     global confidence_mode
+
+    cookie_token = websocket.cookies.get("sttm_token")
+    header_token = websocket.headers.get("x-sttm-token")
+    if not (verify_token(token) or verify_token(cookie_token) or verify_token(header_token)):
+        await websocket.close(code=4401, reason="invalid token")
+        return
+
     await websocket.accept()
     clients.append(websocket)
 
@@ -262,6 +354,15 @@ async def websocket_endpoint(websocket: WebSocket):
             "streaming_settings": get_streaming_settings(),
             "engine": config.whisper.engine,
             "engines": list(SUPPORTED_ENGINES),
+            "whisper_engines": list(WHISPER_ENGINES),
+            "indic_engines": list(INDIC_ENGINES),
+            "hf_model_id": config.whisper.hf_model_id,
+            "model_id": config.whisper.hf_model_id,
+            "available_models": list(config.whisper.available_models),
+            "model_families": dict(config.whisper.model_families),
+            "current_family": config.whisper.model_family(),
+            "onnx_precision": config.whisper.onnx_precision,
+            "available_precisions": list(config.whisper.available_precisions),
         }
         if current and current.verses:
             init_state["verses"] = [
@@ -270,6 +371,16 @@ async def websocket_endpoint(websocket: WebSocket):
             ]
         await websocket.send_text(json.dumps(init_state, ensure_ascii=False))
 
+    # Defensive caps — guard against a runaway client OOM-ing the controller
+    # with giant frames or pinning a CPU by spamming commands. Cheap floors,
+    # not real DoS protection.
+    MAX_MESSAGE_BYTES = 16 * 1024  # 16 KiB; control messages are tiny
+    MAX_MESSAGES_PER_SECOND = 50
+
+    import time
+    msg_window_start = time.monotonic()
+    msg_window_count = 0
+
     try:
         while True:
             try:
@@ -277,7 +388,25 @@ async def websocket_endpoint(websocket: WebSocket):
             except (WebSocketDisconnect, RuntimeError):
                 break
 
-            msg = json.loads(data)
+            if len(data) > MAX_MESSAGE_BYTES:
+                await websocket.close(code=1009, reason="message too large")
+                break
+
+            now = time.monotonic()
+            if now - msg_window_start > 1.0:
+                msg_window_start = now
+                msg_window_count = 0
+            msg_window_count += 1
+            if msg_window_count > MAX_MESSAGES_PER_SECOND:
+                await websocket.close(code=1008, reason="rate limit")
+                break
+
+            try:
+                msg = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(msg, dict):
+                continue
 
             if not pipeline:
                 continue
@@ -436,6 +565,46 @@ async def websocket_endpoint(websocket: WebSocket):
                             "model_id": model_id,
                             "error": err or "Engine reload failed.",
                             "current_model_id": config.whisper.hf_model_id,
+                        })
+
+            elif msg_type == "set_precision":
+                # IndicConformer ONNX precision swap. Same reload pattern as
+                # set_engine — the engine's reload_if_precision_changed() also
+                # handles in-flight transcribes, but doing the explicit
+                # switch_engine here keeps the dashboard's engine_loading /
+                # engine_updated flow consistent with the rest of the app.
+                prec = msg.get("precision")
+                if prec not in config.whisper.available_precisions:
+                    await broadcast({
+                        "type": "precision_update_failed",
+                        "precision": prec,
+                        "error": f"Unknown precision '{prec}'.",
+                        "current_precision": config.whisper.onnx_precision,
+                    })
+                elif config.whisper.engine not in INDIC_ENGINES:
+                    await broadcast({
+                        "type": "precision_update_failed",
+                        "precision": prec,
+                        "error": "Precision applies to IndicConformer engines only.",
+                        "current_precision": config.whisper.onnx_precision,
+                    })
+                else:
+                    previous = config.whisper.onnx_precision
+                    config.whisper.onnx_precision = prec
+                    ok, err = await pipeline.switch_engine(config.whisper.engine)
+                    if ok:
+                        save_runtime_settings()
+                        await broadcast({
+                            "type": "precision_updated",
+                            "precision": config.whisper.onnx_precision,
+                        })
+                    else:
+                        config.whisper.onnx_precision = previous
+                        await broadcast({
+                            "type": "precision_update_failed",
+                            "precision": prec,
+                            "error": err or "Engine reload failed.",
+                            "current_precision": config.whisper.onnx_precision,
                         })
 
             elif msg_type == "set_engine":

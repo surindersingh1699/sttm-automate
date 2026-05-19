@@ -17,16 +17,32 @@
             <select id="audio-device" class="control-input" onchange="setAudioDevice(this.value)" title="Audio input device">
                 <option value="auto">Auto (Default Mic)</option>
             </select>
+            <!-- Model family — picks which engine + model dropdowns are visible.
+                 Whisper → Whisper engines (faster-whisper / mlx / cpp) and Whisper toggles.
+                 Indic   → IndicConformer (CTC ONNX), with a precision dropdown. -->
+            <label class="decoder-toggle" title="Whisper family — fine-tuned Whisper-small variants (faster-whisper, mlx, whisper.cpp). Streaming via rolling window.">
+                <input type="radio" name="model-family" id="family-whisper" value="whisper" checked onchange="setModelFamily(this.value)"> Whisper
+            </label>
+            <label class="decoder-toggle" title="Indic family — fine-tuned IndicConformer (CTC) shipped as ONNX via sherpa-onnx. Native streaming, ~14× realtime on CPU.">
+                <input type="radio" name="model-family" id="family-indic" value="indicconformer" onchange="setModelFamily(this.value)"> Indic
+            </label>
             <select id="whisper-engine" class="control-input" onchange="setWhisperEngine(this.value)" title="Transcription backend">
                 <option value="faster-whisper">faster-whisper (CT2 CPU)</option>
                 <option value="mlx-whisper">mlx-whisper (Apple Silicon)</option>
                 <option value="whisper-cpp">whisper.cpp f16 (488 MB)</option>
                 <option value="whisper-cpp-q8">whisper.cpp q8_0 (265 MB)</option>
             </select>
+            <select id="indic-precision" class="control-input" onchange="setIndicPrecision(this.value)" title="IndicConformer ONNX precision. fp32 = accuracy reference (~470 MB). int8 = fastest + smallest (~134 MB). (fp16 export is currently broken — re-export pending.)" hidden>
+                <option value="fp32">fp32 (470 MB, accuracy)</option>
+                <option value="int8" selected>int8 (134 MB, fastest)</option>
+            </select>
             <span id="engine-status" class="pin-status"></span>
             <select id="whisper-model" class="control-input" onchange="setWhisperModel(this.value)" title="Active Whisper model. Switching reloads the engine with the new model paths — first load downloads + converts the model (~5–60 s depending on engine).">
                 <option value="surindersinghssj/surt-small-v3">surt-small-v3 (244M, full)</option>
                 <option value="surindersinghssj/surt-small-turbo-baseline-v0">surt-small-turbo-baseline-v0 (166M, distilled)</option>
+            </select>
+            <select id="indic-model" class="control-input" onchange="setWhisperModel(this.value)" title="Active IndicConformer model. ONNX bundle is downloaded on first load (smallest precision is ~134 MB, largest ~470 MB)." hidden>
+                <option value="surindersinghssj/indicconformer-pa-v3-kirtan">indicconformer-pa-v3-kirtan</option>
             </select>
             <span id="model-status" class="pin-status"></span>
             <select id="audio-source" class="control-input" onchange="setAudioSource(this.value)" title="Local = server mic, Remote = your device mic">

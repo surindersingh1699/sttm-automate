@@ -201,6 +201,9 @@ function handleMessage(data) {
             if (Object.prototype.hasOwnProperty.call(data, "hf_model_id")) {
                 updateWhisperModel(data.hf_model_id);
             }
+            if (Object.prototype.hasOwnProperty.call(data, "onnx_precision")) {
+                updateIndicPrecision(data.onnx_precision);
+            }
             // REA-10 streaming settings — sync UI from the canonical blob so a page
             // reload restores whatever was persisted in .runtime_settings.json.
             if (data.streaming_settings) {
@@ -279,6 +282,8 @@ function handleMessage(data) {
             updateWhisperEngine(data.engine);
             var esel = document.getElementById("whisper-engine");
             if (esel) esel.disabled = false;
+            var ipSel = document.getElementById("indic-precision");
+            if (ipSel) ipSel.disabled = false;
             setEngineStatus("Ready: " + data.engine);
             setTimeout(function() { setEngineStatus(""); }, 3000);
             break;
@@ -286,7 +291,21 @@ function handleMessage(data) {
         case "engine_update_failed": {
             var fsel = document.getElementById("whisper-engine");
             if (fsel) fsel.disabled = false;
+            var fpSel = document.getElementById("indic-precision");
+            if (fpSel) fpSel.disabled = false;
             if (data.current_engine) updateWhisperEngine(data.current_engine);
+            setEngineStatus("Failed: " + (data.error || "unknown error"));
+            break;
+        }
+        case "precision_updated":
+            updateIndicPrecision(data.precision);
+            setEngineStatus("Ready: " + data.precision);
+            setTimeout(function() { setEngineStatus(""); }, 3000);
+            break;
+        case "precision_update_failed": {
+            var pSel = document.getElementById("indic-precision");
+            if (pSel) pSel.disabled = false;
+            if (data.current_precision) updateIndicPrecision(data.current_precision);
             setEngineStatus("Failed: " + (data.error || "unknown error"));
             break;
         }
@@ -942,19 +961,97 @@ function setZeroOverlapWindow(enabled) {
     send({ type: "set_decoder_toggles", toggles: { zero_overlap_window: !!enabled } });
 }
 
-// --- Whisper engine selector ---
+// --- Engine selector (Whisper + Indic share a status; family toggle swaps which dropdown is visible) ---
+
+var INDIC_ENGINE_NAMES = ["indicconformer"];
+
+function familyForEngine(name) {
+    return INDIC_ENGINE_NAMES.indexOf(name) >= 0 ? "indicconformer" : "whisper";
+}
+
+function applyFamilyVisibility(family) {
+    var isIndic = family === "indicconformer";
+    var byId = function(id) { return document.getElementById(id); };
+    var we = byId("whisper-engine"); var ip = byId("indic-precision");
+    var wm = byId("whisper-model");  var im = byId("indic-model");
+    if (we) we.hidden = isIndic;
+    if (ip) ip.hidden = !isIndic;
+    if (wm) wm.hidden = isIndic;
+    if (im) im.hidden = !isIndic;
+    // Whisper-only decoder toggles — hide them when Indic is active. They
+    // do nothing for the NeMo backend.
+    var whisperToggleIds = [
+        "hallucination-guards", "zero-overlap-window", "locked-prompt-anchor",
+    ];
+    whisperToggleIds.forEach(function(id) {
+        var el = byId(id); if (!el || !el.parentNode) return;
+        el.parentNode.style.display = isIndic ? "none" : "";
+    });
+    // Streaming-mode + dedup-strategy dropdowns — IndicConformer is decoded
+    // per VAD utterance with no inter-window dedup. Backend forces those
+    // values whenever the indic engine is active, so showing the dropdowns
+    // would just let the user pick something we'll ignore.
+    ["streaming-mode", "dedup-strategy"].forEach(function(id) {
+        var el = byId(id); if (!el) return;
+        el.hidden = isIndic;
+    });
+    // Sync the radio buttons so server-driven family changes update the UI.
+    var rw = byId("family-whisper"); var ri = byId("family-indic");
+    if (rw) rw.checked = !isIndic;
+    if (ri) ri.checked = isIndic;
+}
+
+function setModelFamily(family) {
+    applyFamilyVisibility(family);
+    // Switch engine + model to the family default. Server reloads on its own.
+    if (family === "indicconformer") {
+        send({ type: "set_model", model_id: "surindersinghssj/indicconformer-pa-v3-kirtan" });
+        setWhisperEngine("indicconformer");
+    } else {
+        send({ type: "set_model", model_id: "surindersinghssj/surt-small-v3" });
+        setWhisperEngine("faster-whisper");
+    }
+}
 
 function updateWhisperEngine(name) {
-    var sel = document.getElementById("whisper-engine");
-    if (sel && name) sel.value = name;
+    var family = familyForEngine(name);
+    applyFamilyVisibility(family);
+    if (family === "whisper") {
+        var sel = document.getElementById("whisper-engine");
+        if (sel && name) sel.value = name;
+    }
     setEngineStatus("");
 }
 
 function setWhisperEngine(name) {
     setEngineStatus("Loading " + name + "…");
-    var sel = document.getElementById("whisper-engine");
-    if (sel) sel.disabled = true;
+    var family = familyForEngine(name);
+    if (family === "whisper") {
+        var sel = document.getElementById("whisper-engine");
+        if (sel) sel.disabled = true;
+    } else {
+        var ip = document.getElementById("indic-precision");
+        if (ip) ip.disabled = true;
+    }
     send({ type: "set_engine", engine: name });
+}
+
+// --- IndicConformer ONNX precision selector ---
+
+function setIndicPrecision(precision) {
+    setEngineStatus("Loading " + precision + "…");
+    var ip = document.getElementById("indic-precision");
+    if (ip) ip.disabled = true;
+    send({ type: "set_precision", precision: precision });
+}
+
+function updateIndicPrecision(precision) {
+    var ip = document.getElementById("indic-precision");
+    if (ip) {
+        ip.disabled = false;
+        if (precision) ip.value = precision;
+    }
+    setEngineStatus("");
 }
 
 function setEngineStatus(text) {
@@ -965,8 +1062,11 @@ function setEngineStatus(text) {
 // --- Whisper model selector ---
 
 function updateWhisperModel(modelId) {
-    var sel = document.getElementById("whisper-model");
-    if (sel && modelId) sel.value = modelId;
+    if (!modelId) { setModelStatus(""); return; }
+    var isIndic = /indicconformer/i.test(modelId);
+    applyFamilyVisibility(isIndic ? "indicconformer" : "whisper");
+    var sel = document.getElementById(isIndic ? "indic-model" : "whisper-model");
+    if (sel) sel.value = modelId;
     setModelStatus("");
 }
 
