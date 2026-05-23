@@ -1,7 +1,7 @@
 {
   "controller_pin": 2716,
   "confidence_mode": "balanced",
-  "audio_device": 1,
+  "audio_device": 2,
   "decoder_toggles": {
     "greedy_decode": false,
     "single_temperature": true,
@@ -12,12 +12,12 @@
     "hallucination_guards": false,
     "multi_line_search": true,
     "multi_line_locked_align": true,
-    "fast_response_enabled": true,
+    "fast_response_enabled": false,
     "zero_overlap_window": false
   },
   "streaming": {
-    "streaming_mode": "nemo_chunked",
-    "vad_backend": "kirtan",
+    "streaming_mode": "vad_segmented",
+    "vad_backend": "silero",
     "vad_threshold": 0.25,
     "vad_min_silence_ms": 180,
     "vad_min_speech_ms": 250,
@@ -32,5 +32,6 @@
   "engine": "indicconformer",
   "hf_model_id": "surindersinghssj/indicconformer-pa-v3-kirtan",
   "onnx_precision": "fp32",
+  "lm_enabled": false,
   "mic_muted": true
 }

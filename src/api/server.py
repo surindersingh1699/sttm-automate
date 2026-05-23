@@ -5,12 +5,11 @@ import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from src.api.auth import get_or_create_token, verify as verify_token
 from src.config import config
 from src.controller.sttm_http import STTMHttpController
 from src.pipeline.orchestrator import PipelineOrchestrator
@@ -280,61 +279,16 @@ static_dir = Path(__file__).parent.parent.parent / "static"
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 
-def _request_has_token(request: Request) -> bool:
-    """Allow either ?token= query, X-STTM-Token header, or sttm_token cookie."""
-    tok = (
-        request.query_params.get("token")
-        or request.headers.get("x-sttm-token")
-        or request.cookies.get("sttm_token")
-    )
-    return verify_token(tok)
-
-
-@app.get("/auth")
-async def auth_login(token: str | None = Query(default=None)):
-    """One-shot login — sets sttm_token cookie, bounces to /."""
-    if not verify_token(token):
-        raise HTTPException(status_code=401, detail="invalid token")
-    resp = RedirectResponse(url="/", status_code=302)
-    resp.set_cookie(
-        key="sttm_token",
-        value=token,
-        httponly=True,
-        samesite="lax",
-        max_age=60 * 60 * 24 * 30,
-    )
-    return resp
-
-
 @app.get("/")
-async def index(request: Request):
-    """Serve the dashboard. Token-gated."""
-    if not _request_has_token(request):
-        raise HTTPException(
-            status_code=401,
-            detail="missing or invalid token; visit /auth?token=… first",
-        )
+async def index():
+    """Serve the dashboard."""
     return FileResponse(str(static_dir / "index.html"))
 
 
 @app.websocket("/ws")
-async def websocket_endpoint(
-    websocket: WebSocket,
-    token: str | None = Query(default=None),
-):
-    """WebSocket endpoint for real-time dashboard communication.
-
-    Requires the per-install token (``?token=…`` or ``X-STTM-Token``
-    header or ``sttm_token`` cookie). Bad/missing tokens are rejected
-    before the upgrade completes.
-    """
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for real-time dashboard communication."""
     global confidence_mode
-
-    cookie_token = websocket.cookies.get("sttm_token")
-    header_token = websocket.headers.get("x-sttm-token")
-    if not (verify_token(token) or verify_token(cookie_token) or verify_token(header_token)):
-        await websocket.close(code=4401, reason="invalid token")
-        return
 
     await websocket.accept()
     clients.append(websocket)

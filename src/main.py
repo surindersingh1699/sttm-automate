@@ -49,7 +49,6 @@ def run_with_dashboard():
     """Run the pipeline with the web dashboard."""
     import os
     import uvicorn
-    from src.api.auth import get_or_create_token
     from src.config import config
 
     # LAN mode is opt-in via env var or runtime setting; default is loopback.
@@ -59,14 +58,12 @@ def run_with_dashboard():
     else:
         host = config.dashboard.host or "127.0.0.1"
 
-    token = get_or_create_token()
-    auth_url = f"http://127.0.0.1:{config.dashboard.port}/auth?token={token}"
     bind_label = "LAN" if host == "0.0.0.0" else "loopback only"
     print()
     print("─" * 72)
     print(f"  STTM controller   bind: {host}:{config.dashboard.port}  ({bind_label})")
-    print(f"  Dashboard URL     {auth_url}")
-    print(f"  WebSocket URL     ws://127.0.0.1:{config.dashboard.port}/ws?token={token}")
+    print(f"  Dashboard URL     http://127.0.0.1:{config.dashboard.port}/")
+    print(f"  WebSocket URL     ws://127.0.0.1:{config.dashboard.port}/ws")
     print("─" * 72)
     print()
 
