@@ -15,7 +15,7 @@ Automation layer for SikhiToTheMax (STTM) Desktop that listens to live kirtan au
   - `models/onnx/pa_tokenizer.model` — the SentencePiece model the BPE LM was trained against. Required for in-beam fusion to align labels with LM vocab.
   - See [docs/asr-engines.md](docs/asr-engines.md) for the full integration story.
 - Local ShabadOS SQLite DB (`database.sqlite`) — auto-downloaded from HF on first run
-- FastAPI + WebSocket (dashboard server) — per-install token auth, loopback-only by default
+- FastAPI + WebSocket (dashboard server) — loopback-only by default, no auth
 - sounddevice (audio capture)
 - Playwright (STTM browser automation fallback)
 - httpx (STTM HTTP control only — localhost)
@@ -62,14 +62,14 @@ nohup .venv/bin/python -m src.main dashboard > /tmp/sttm-automate.log 2>&1 &
 disown
 ```
 
-At startup the process prints a one-time login URL of the form
-`http://127.0.0.1:8080/auth?token=…` — open it once to set the auth cookie,
-then use `http://localhost:8080` normally. See **Dashboard authentication**
-below. Logs go to `/tmp/sttm-automate.log`.
+Open `http://localhost:8080` once the process is running. Logs go to
+`/tmp/sttm-automate.log`.
 
 The dashboard binds to **loopback only by default**. To expose it on the LAN
 (e.g. for a phone running on the same Wi-Fi), set `STTM_LAN_MODE=1` before
-starting, or flip `config.dashboard.lan_mode = True` in `src/config.py`.
+starting, or flip `config.dashboard.lan_mode = True` in `src/config.py`. There
+is no auth on the dashboard — when running in LAN mode, anyone on the same
+network can drive STTM, so only enable it on networks you trust.
 
 If `.venv/` is missing, recreate it:
 
@@ -78,24 +78,22 @@ If `.venv/` is missing, recreate it:
 .venv/bin/pip install -r requirements.txt
 ```
 
-## Dashboard authentication
+## Audio input sources
 
-The dashboard and its WebSocket are gated by a per-install secret token,
-generated on first run and persisted to `.controller_token` at the project
-root (or `$STTM_TOKEN_PATH` if set — used by the Tauri sidecar to point at a
-user-data dir). The token is accepted on requests via:
+The dashboard's audio-device picker offers two groups:
 
-- `?token=…` query parameter (the `/auth?token=…` URL printed at startup)
-- `X-STTM-Token` header (for programmatic clients)
-- `sttm_token` cookie (set after the first `/auth?token=…` hit)
+- **Microphones** — physical input devices (laptop mic, USB mic, audio interface).
+- **System Audio (loopback)** — virtual inputs that capture whatever is playing
+  through the Mac (e.g. a YouTube gurdwara stream, Spotify, an STTM session
+  audio playback). Requires a loopback driver: `brew install blackhole-2ch`,
+  then a Multi-Output Device routing speakers + BlackHole. The interactive
+  setup helper at `scripts/setup_audio.py` walks through this and verifies
+  capture works. Once routed, BlackHole appears in the picker under the
+  "System Audio" group — selecting it streams system audio through the same
+  VAD → ASR → search pipeline as a real mic.
 
-Without a valid token, HTTP routes return 401 and the WebSocket handshake is
-refused with 403. **This is not a TLS replacement** — it just stops a curious
-LAN-mate from hijacking the dashboard or flipping the engine mid-kirtan. Pair
-it with loopback-only binding for the strongest default; opt into LAN
-exposure (`STTM_LAN_MODE=1`) only when needed.
-
-`.controller_token` is gitignored — never commit it.
+Conferencing virtual devices (Teams, Zoom, aggregate/multi-output sources) are
+always hidden — they would capture nothing useful for kirtan recognition.
 
 ## Model artifacts (gitignored — regenerate locally)
 

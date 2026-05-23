@@ -42,9 +42,6 @@ tests/eval/runs/
 .DS_Store
 *.spec
 
-# Per-install dashboard auth token (secret — never commit)
-.controller_token
-
 # Auto-downloaded from HF dataset on first run
 database.sqlite
 database.sqlite-shm
