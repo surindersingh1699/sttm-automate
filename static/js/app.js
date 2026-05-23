@@ -872,13 +872,36 @@ function loadAudioDevices() {
             autoOpt.textContent = "Auto (Default Mic)";
             select.appendChild(autoOpt);
 
+            // Split into Microphones vs System Audio (loopback) groups so users
+            // can pick whatever is playing on the Mac without hunting through a
+            // flat list. Loopback entries require BlackHole or similar — see
+            // scripts/setup_audio.py.
+            var mics = [];
+            var loopbacks = [];
             data.devices.forEach(function(dev) {
+                (dev.kind === "loopback" ? loopbacks : mics).push(dev);
+            });
+
+            function addDeviceOption(parent, dev) {
                 var opt = document.createElement("option");
                 opt.value = dev.index;
                 opt.textContent = dev.name;
                 if (dev.default) opt.textContent += " (Default)";
-                select.appendChild(opt);
-            });
+                parent.appendChild(opt);
+            }
+
+            if (mics.length) {
+                var micGroup = document.createElement("optgroup");
+                micGroup.label = "Microphones";
+                mics.forEach(function(dev) { addDeviceOption(micGroup, dev); });
+                select.appendChild(micGroup);
+            }
+            if (loopbacks.length) {
+                var loopGroup = document.createElement("optgroup");
+                loopGroup.label = "System Audio (loopback)";
+                loopbacks.forEach(function(dev) { addDeviceOption(loopGroup, dev); });
+                select.appendChild(loopGroup);
+            }
 
             // Set current selection
             if (audioDevice !== null) {
