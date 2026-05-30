@@ -17,34 +17,48 @@
             <select id="audio-device" class="control-input" onchange="setAudioDevice(this.value)" title="Audio input device">
                 <option value="auto">Auto (Default Mic)</option>
             </select>
-            <!-- Model family — picks which engine + model dropdowns are visible.
-                 Whisper → Whisper engines (faster-whisper / mlx / cpp) and Whisper toggles.
-                 Indic   → IndicConformer (CTC ONNX), with a precision dropdown. -->
-            <label class="decoder-toggle" title="Whisper family — fine-tuned Whisper-small variants (faster-whisper, mlx, whisper.cpp). Streaming via rolling window.">
-                <input type="radio" name="model-family" id="family-whisper" value="whisper" checked onchange="setModelFamily(this.value)"> Whisper
+            <!-- App mode — Live (open-ended shabad recognition) vs Gutka
+                 (follow-along on a pre-selected nitnem bani). Gutka mode
+                 hides the lock/challenger pipeline and runs a monotonic
+                 aligner over one bani's line sequence instead. -->
+            <label class="decoder-toggle" title="Live mode — open-ended kirtan recognition across every shabad in the canon. Default.">
+                <input type="radio" name="app-mode" id="app-mode-live" value="live" checked onchange="setAppMode(this.value)"> Live
             </label>
-            <label class="decoder-toggle" title="Indic family — fine-tuned IndicConformer (CTC) shipped as ONNX via sherpa-onnx. Native streaming, ~14× realtime on CPU.">
-                <input type="radio" name="model-family" id="family-indic" value="indicconformer" onchange="setModelFamily(this.value)"> Indic
+            <label class="decoder-toggle" title="Gutka mode — pick one nitnem bani up front, system follows along monotonically as you recite, highlighting each line in STTM.">
+                <input type="radio" name="app-mode" id="app-mode-gutka" value="gutka" onchange="setAppMode(this.value)"> Gutka
             </label>
-            <select id="whisper-engine" class="control-input" onchange="setWhisperEngine(this.value)" title="Transcription backend">
+            <select id="gutka-bani" class="control-input" onchange="setGutkaBani(this.value)" title="Pick the bani you're about to recite. Selecting opens it in STTM Desktop and arms the aligner at line 0." hidden>
+                <option value="">— Pick a bani —</option>
+            </select>
+            <label id="gutka-direction-wrap" class="decoder-toggle" title="Forward-only (default): aligner only advances or holds — never goes back. Bidirectional: aligner can also snap to an earlier line if a stronger match appears." hidden>
+                <input type="checkbox" id="gutka-bidirectional" onchange="setGutkaDirection(this.checked)"> Bidirectional
+            </label>
+            <!-- Local live mode is pinned to the known-good IndicConformer path.
+                 Whisper comparison remains available in the Hugging Face demo. -->
+            <label id="family-whisper-wrap" class="decoder-toggle" title="Whisper comparison lives in the Hugging Face demo. Local live mode stays on IndicConformer because Whisper is too slow/brittle here." hidden>
+                <input type="radio" name="model-family" id="family-whisper" value="whisper" disabled onchange="setModelFamily(this.value)"> Whisper
+            </label>
+            <label class="decoder-toggle" title="Indic family — fine-tuned IndicConformer CTC ONNX. This is the supported local live mode.">
+                <input type="radio" name="model-family" id="family-indic" value="indicconformer" checked onchange="setModelFamily(this.value)"> Indic
+            </label>
+            <select id="whisper-engine" class="control-input" onchange="setWhisperEngine(this.value)" title="Transcription backend" hidden disabled>
                 <option value="faster-whisper">faster-whisper (CT2 CPU)</option>
                 <option value="mlx-whisper">mlx-whisper (Apple Silicon)</option>
                 <option value="whisper-cpp">whisper.cpp f16 (488 MB)</option>
                 <option value="whisper-cpp-q8">whisper.cpp q8_0 (265 MB)</option>
             </select>
-            <select id="indic-precision" class="control-input" onchange="setIndicPrecision(this.value)" title="IndicConformer ONNX precision. fp32 = accuracy reference (~470 MB). int8 = fastest + smallest (~134 MB). (fp16 export is currently broken — re-export pending.)" hidden>
-                <option value="fp32">fp32 (470 MB, accuracy)</option>
-                <option value="int8" selected>int8 (134 MB, fastest)</option>
+            <select id="indic-precision" class="control-input" onchange="setIndicPrecision(this.value)" title="IndicConformer ONNX precision. fp32 is the supported local build; int8 is disabled because its ConvInteger export is not supported by onnxruntime CPU EP.">
+                <option value="fp32" selected>fp32 (supported)</option>
             </select>
             <label id="lm-toggle-wrap" class="decoder-toggle" title="Pair the IndicConformer engine with two Gurbani KenLM models: a BPE 4-gram for in-beam shallow fusion (anchors beams to canon Gurbani) and a char 6-gram run post-hoc as a hallucination gate. IndicConformer engine only." hidden>
                 <input type="checkbox" id="lm-enabled" onchange="setLmEnabled(this.checked)"> Gurbani LM
             </label>
             <span id="engine-status" class="pin-status"></span>
-            <select id="whisper-model" class="control-input" onchange="setWhisperModel(this.value)" title="Active Whisper model. Switching reloads the engine with the new model paths — first load downloads + converts the model (~5–60 s depending on engine).">
+            <select id="whisper-model" class="control-input" onchange="setWhisperModel(this.value)" title="Whisper model switching is disabled in local live mode; use the Hugging Face demo for comparison." hidden disabled>
                 <option value="surindersinghssj/surt-small-v3">surt-small-v3 (244M, full)</option>
                 <option value="surindersinghssj/surt-small-turbo-baseline-v0">surt-small-turbo-baseline-v0 (166M, distilled)</option>
             </select>
-            <select id="indic-model" class="control-input" onchange="setWhisperModel(this.value)" title="Active IndicConformer model. ONNX bundle is downloaded on first load (smallest precision is ~134 MB, largest ~470 MB)." hidden>
+            <select id="indic-model" class="control-input" onchange="setWhisperModel(this.value)" title="Active local ASR model. ONNX bundle is downloaded on first load.">
                 <option value="surindersinghssj/indicconformer-pa-v3-kirtan">indicconformer-pa-v3-kirtan</option>
             </select>
             <span id="model-status" class="pin-status"></span>
@@ -76,6 +90,7 @@
                 <option value="vad_segmented">vad_segmented</option>
                 <option value="local_agreement">local_agreement</option>
                 <option value="hybrid">hybrid</option>
+                <option value="nemo_chunked">nemo_chunked (Indic)</option>
             </select>
             <select id="dedup-strategy" class="control-input" onchange="setDedupStrategy(this.value)" title="Cross-window dedup strategy. text = today's prefix-strip (drops legit rahau/jaap repetition). audio_time = strict bug fix — only dedup when audio time ranges overlap. none = pass-through (use with VAD-segmented streaming).">
                 <option value="text" selected>dedup: text (current)</option>

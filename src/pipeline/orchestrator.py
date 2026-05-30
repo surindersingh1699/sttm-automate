@@ -16,6 +16,9 @@ from src.matcher.search import ShabadCandidate
 from src.matcher.offline_search import OfflineShabadSearcher
 from src.matcher.scorer import ConfidenceScorer
 from src.matcher.tracker import ShabadTracker, PipelineState
+from src.matcher.bani_loader import GutkaLine, load_bani
+from src.matcher.gutka_aligner import AlignAction, GutkaAligner
+from src.transcription.transliterate import gurmukhi_to_ascii
 from src.controller.base import STTMController
 
 
@@ -46,6 +49,17 @@ def _text_to_segments(text: str):
     if not text:
         return []
     return [TranscriptionSegment(start=0.0, end=0.0, text=text)]
+
+
+def _mean_segment_attr(segments, attr: str) -> float | None:
+    values = [
+        float(value)
+        for seg in segments
+        if (value := getattr(seg, attr, None)) is not None
+    ]
+    if not values:
+        return None
+    return sum(values) / len(values)
 
 
 def _is_alaap_output(transcript_text: str) -> bool:
@@ -177,6 +191,9 @@ class PipelineOrchestrator:
         self._in_transition_mode: bool = False
         self._transition_mode_start: float = 0.0
         self._transition_alaap_seconds: float = 0.0  # accumulated alaap/silence seconds
+        self._last_asr_confidence: float | None = None
+        self._last_asr_avg_logprob: float | None = None
+        self._last_asr_entropy: float | None = None
         # Tiered lock (Change 1): monotonic timestamp of the first window where each
         # shabad_id was the top suggest-level candidate.  Promoted to lockable once
         # (now - first_seen) >= suggest_confirmation_seconds.
@@ -189,6 +206,15 @@ class PipelineOrchestrator:
         # Last time a decode window was processed — used to detect ASR lag and
         # invalidate stale suggest/challenger memory.
         self._last_window_timestamp: float = 0.0
+        # Gutka follow-along mode (parallel to the open-ended live path).
+        # When _app_mode == "gutka" and an aligner is loaded, every decoded
+        # window short-circuits to GutkaAligner.update() and never touches
+        # OfflineShabadSearcher or the lock state machine.
+        self._app_mode: str = "live"            # "live" | "gutka"
+        self._gutka_bani_id: int | None = None  # SQLite banis.id (1-29)
+        self._gutka_bidirectional: bool = False
+        self._gutka_aligner: GutkaAligner | None = None
+        self._gutka_lines: list[GutkaLine] = []
 
     async def start(self):
         """Initialize components and start the processing loop."""
@@ -353,12 +379,14 @@ class PipelineOrchestrator:
         self.audio.reset_ring()
         print(f"[Pipeline] Audio source switched to: {source}")
 
-    async def switch_engine(self, name: str) -> tuple[bool, str | None]:
+    async def switch_engine(
+        self, name: str, force_reload: bool = False
+    ) -> tuple[bool, str | None]:
         """Hot-swap the transcription backend. Returns (ok, error_message)."""
         from src.transcription.factory import SUPPORTED_ENGINES
         if name not in SUPPORTED_ENGINES:
             return False, f"Unknown engine '{name}'."
-        if name == config.whisper.engine and self.transcriber is not None:
+        if not force_reload and name == config.whisper.engine and self.transcriber is not None:
             return True, None
         prev = self.transcriber
         try:
@@ -460,8 +488,176 @@ class PipelineOrchestrator:
             ],
         })
 
+    # ─────────────────────────────────────────────────────────────────
+    # Gutka follow-along mode
+    # ─────────────────────────────────────────────────────────────────
+
+    def get_gutka_state(self) -> dict:
+        """Snapshot of gutka-mode state for the dashboard init handshake."""
+        aligner = self._gutka_aligner
+        bani_lines = self._gutka_lines if self._app_mode == "gutka" else []
+        return {
+            "app_mode": self._app_mode,
+            "gutka_bani_id": self._gutka_bani_id,
+            "gutka_bidirectional": self._gutka_bidirectional,
+            "gutka_current_idx": aligner.current_idx if aligner else 0,
+            "gutka_lines": [
+                {
+                    "unicode": line.gurmukhi_unicode,
+                    "english": line.english,
+                    "pointer_source": line.pointer_source,
+                }
+                for line in bani_lines
+            ],
+        }
+
+    async def set_app_mode(self, mode: str) -> bool:
+        """Switch between 'live' (open-ended) and 'gutka' (follow-along)."""
+        if mode not in ("live", "gutka"):
+            return False
+        if mode == self._app_mode:
+            return True
+        self._app_mode = mode
+        if mode == "live":
+            # Stop aligning — but keep the loaded bani + idx so re-entering
+            # gutka mode with the same bani picks up where we left off.
+            await self._broadcast({"type": "app_mode_updated", "mode": "live"})
+            return True
+        # Switching INTO gutka mode: no bani picked yet is a soft state —
+        # the dashboard will prompt the user; pipeline just stops driving
+        # STTM via the live path until a bani is selected.
+        await self._broadcast({
+            "type": "app_mode_updated",
+            "mode": "gutka",
+            **self.get_gutka_state(),
+        })
+        return True
+
+    async def set_gutka_bani(self, sqlite_bani_id: int | None) -> bool:
+        """Load a nitnem bani, build the aligner, and open it in STTM.
+
+        Passing ``None`` clears the current bani — aligner is dropped, STTM
+        is left where it is (no payload sent), and the dashboard reverts to
+        the empty picker. Idempotent: re-selecting the same bani resets the
+        aligner to line 0 and re-opens STTM at the first verse.
+        """
+        if sqlite_bani_id is None:
+            self._gutka_bani_id = None
+            self._gutka_aligner = None
+            self._gutka_lines = []
+            await self._broadcast({
+                "type": "gutka_bani_updated",
+                **self.get_gutka_state(),
+            })
+            return True
+
+        try:
+            lines = await asyncio.to_thread(load_bani, int(sqlite_bani_id))
+        except KeyError:
+            return False
+        if not lines:
+            return False
+
+        self._gutka_bani_id = int(sqlite_bani_id)
+        self._gutka_lines = lines
+        self._gutka_aligner = GutkaAligner(
+            lines,
+            bidirectional=self._gutka_bidirectional,
+            forward_window=config.gutka.forward_window,
+            backward_window=config.gutka.backward_window,
+            min_score=config.gutka.min_score,
+            min_margin=config.gutka.min_margin,
+            max_span_lines=config.gutka.max_span_lines,
+            min_matched_letters=config.gutka.min_matched_letters,
+            rahau_repeat_enabled=config.gutka.rahau_repeat_enabled,
+        )
+        # Open the bani in STTM at line 0. Controller no-ops on failure
+        # (e.g. STTM disconnected) but the aligner is still armed so a
+        # later reconnect picks it up.
+        await self.controller.display_bani(int(sqlite_bani_id))
+        await self._broadcast({
+            "type": "gutka_bani_updated",
+            **self.get_gutka_state(),
+        })
+        return True
+
+    async def set_gutka_direction(self, bidirectional: bool) -> bool:
+        """Flip aligner direction without resetting position."""
+        self._gutka_bidirectional = bool(bidirectional)
+        if self._gutka_aligner is not None:
+            self._gutka_aligner.set_bidirectional(self._gutka_bidirectional)
+        await self._broadcast({
+            "type": "gutka_direction_updated",
+            "gutka_bidirectional": self._gutka_bidirectional,
+        })
+        return True
+
+    async def _handle_gutka_window(self, first_letters: str, transcript: str) -> None:
+        """Route one decoded window through the gutka aligner.
+
+        Replaces the SEARCHING/LOCKED dispatch when gutka mode is active —
+        no candidate scoring, no challenger memory, no lock state machine.
+        """
+        aligner = self._gutka_aligner
+        if aligner is None:
+            return
+        # The aligner matches against ``lines.first_letters`` which is ASCII;
+        # ``extract_first_letters`` produces Gurmukhi letters. Convert once.
+        ascii_fl = gurmukhi_to_ascii(first_letters) if first_letters else ""
+        decision = aligner.update(ascii_fl)
+
+        if decision.action in (AlignAction.ADVANCE, AlignAction.BACK, AlignAction.REPEAT):
+            target_line = aligner.lines[decision.new_idx]
+            moved = await self.controller.navigate_to_bani_line(
+                target_line.sttm_pointer_id,
+                line_count=decision.new_idx + 1,
+                fallback_verse_order_id=target_line.order_id,
+            )
+            if not moved and self._gutka_bani_id is not None:
+                # STTM may have restarted or lost active bani state. Re-open
+                # the selected bani and retry the exact pointer once.
+                await self.controller.display_bani(self._gutka_bani_id)
+                await self.controller.navigate_to_bani_line(
+                    target_line.sttm_pointer_id,
+                    line_count=decision.new_idx + 1,
+                    fallback_verse_order_id=target_line.order_id,
+                )
+
+        await self._broadcast({
+            "type": "gutka_line_aligned",
+            "bani_line_idx": aligner.current_idx,
+            "action": decision.action.value,
+            "score": round(decision.score, 3),
+            "runner_up_score": round(decision.runner_up_score, 3),
+            "asr_first_letters_ascii": ascii_fl,
+            "transcript": transcript,
+            "pointer_source": aligner.current_line.pointer_source,
+        })
+
     async def manual_navigate(self, direction: str):
         """Manually navigate lines (override from dashboard)."""
+        if self._app_mode == "gutka" and self._gutka_aligner is not None:
+            aligner = self._gutka_aligner
+            delta = -1 if direction == "prev" else 1
+            target_idx = max(0, min(len(aligner.lines) - 1, aligner.current_idx + delta))
+            aligner.reset(target_idx)
+            target_line = aligner.lines[target_idx]
+            await self.controller.navigate_to_bani_line(
+                target_line.sttm_pointer_id,
+                line_count=target_idx + 1,
+                fallback_verse_order_id=target_line.order_id,
+            )
+            await self._broadcast({
+                "type": "gutka_line_aligned",
+                "bani_line_idx": aligner.current_idx,
+                "action": "manual",
+                "score": 1.0,
+                "runner_up_score": 0.0,
+                "asr_first_letters_ascii": "",
+                "transcript": "",
+                "pointer_source": target_line.pointer_source,
+            })
+            return
         await self.controller.navigate_line(direction)
         if direction == "next":
             self.tracker.advance_line()
@@ -886,6 +1082,14 @@ class PipelineOrchestrator:
                 # frames just produce the same prob and don't open a second
                 # utterance.
                 cur_samples = self.audio.samples_written()
+                if cur_samples < last_seen_samples:
+                    # The audio ring was reset (source switch, device switch,
+                    # mute/unmute, or Clear Audio Cache). Re-anchor immediately
+                    # so this loop doesn't wait for the counter to catch up.
+                    last_seen_samples = cur_samples
+                    vad.reset()
+                    await asyncio.sleep(poll_period_s)
+                    continue
                 samples_delta = max(0, cur_samples - last_seen_samples)
                 if samples_delta == 0:
                     await asyncio.sleep(poll_period_s)
@@ -955,8 +1159,12 @@ class PipelineOrchestrator:
             await self._capture_tick_task()
             return
 
-        chunk_len_s = max(0.3, float(config.whisper.nemo_chunk_len_s))
-        context_s = max(0.0, float(config.whisper.nemo_chunk_context_s))
+        if self._app_mode == "gutka":
+            chunk_len_s = max(0.3, float(config.gutka.nemo_chunk_len_s))
+            context_s = max(0.0, float(config.gutka.nemo_chunk_context_s))
+        else:
+            chunk_len_s = max(0.3, float(config.whisper.nemo_chunk_len_s))
+            context_s = max(0.0, float(config.whisper.nemo_chunk_context_s))
         samplerate = config.audio.samplerate
         chunk_samples = int(chunk_len_s * samplerate)
         last_seen = self.audio.samples_written()
@@ -964,6 +1172,13 @@ class PipelineOrchestrator:
         while self.running:
             try:
                 cur = self.audio.samples_written()
+                if cur < last_seen:
+                    # Counter reset means the old anchor is invalid. Without
+                    # this, grew becomes negative and the sleep below can last
+                    # for a very long time after a cache/device/source reset.
+                    last_seen = cur
+                    await asyncio.sleep(0.05)
+                    continue
                 grew = cur - last_seen
                 if grew < chunk_samples:
                     # Sleep just enough wall-clock time for the next chunk to
@@ -1065,6 +1280,13 @@ class PipelineOrchestrator:
                 # short overlaps (a few ms) just get re-fed and don't change
                 # the agreement state.
                 cur = self.audio.samples_written()
+                if cur < last_seen_samples:
+                    # Audio ring reset: drop stale buffered audio/agreement and
+                    # start accumulating from the new capture epoch.
+                    last_seen_samples = cur
+                    buf.reset()
+                    await asyncio.sleep(0.05)
+                    continue
                 samples_delta = max(0, cur - last_seen_samples)
                 if samples_delta > 0:
                     read_seconds = min(
@@ -1154,6 +1376,9 @@ class PipelineOrchestrator:
                     listening_mode="local_agreement",
                     window_seconds=decode_interval_s,
                     elapsed_decode_s=elapsed,
+                    asr_confidence=_mean_segment_attr(segments, "confidence"),
+                    asr_avg_logprob=_mean_segment_attr(segments, "avg_logprob"),
+                    asr_entropy=_mean_segment_attr(segments, "entropy"),
                 )
 
             except Exception as e:
@@ -1202,6 +1427,14 @@ class PipelineOrchestrator:
         while self.running:
             try:
                 cur = self.audio.samples_written()
+                if cur < last_seen_samples:
+                    # Audio ring reset: discard any partial utterance and
+                    # re-anchor to the fresh capture epoch.
+                    last_seen_samples = cur
+                    vad.reset()
+                    utt_buf = None
+                    await asyncio.sleep(poll_period_s)
+                    continue
                 samples_delta = max(0, cur - last_seen_samples)
                 if samples_delta == 0:
                     await asyncio.sleep(poll_period_s)
@@ -1342,6 +1575,9 @@ class PipelineOrchestrator:
             listening_mode=listening_mode,
             window_seconds=decode_interval_s,
             elapsed_decode_s=elapsed,
+            asr_confidence=_mean_segment_attr(segments, "confidence"),
+            asr_avg_logprob=_mean_segment_attr(segments, "avg_logprob"),
+            asr_entropy=_mean_segment_attr(segments, "entropy"),
         )
 
     async def _process_one_audio_window(
@@ -1462,6 +1698,9 @@ class PipelineOrchestrator:
             listening_mode=listening_mode,
             window_seconds=window_seconds,
             elapsed_decode_s=_elapsed,
+            asr_confidence=_mean_segment_attr(segments, "confidence"),
+            asr_avg_logprob=_mean_segment_attr(segments, "avg_logprob"),
+            asr_entropy=_mean_segment_attr(segments, "entropy"),
         )
 
     async def _process_decoded_text(
@@ -1470,6 +1709,9 @@ class PipelineOrchestrator:
         listening_mode: str,
         window_seconds: float,
         elapsed_decode_s: float = 0.0,
+        asr_confidence: float | None = None,
+        asr_avg_logprob: float | None = None,
+        asr_entropy: float | None = None,
     ):
         """Run already-transcribed text through the matcher pipeline.
 
@@ -1507,7 +1749,24 @@ class PipelineOrchestrator:
         if elapsed_decode_s >= 0.02:
             msg["transcribe_ms"] = int(elapsed_decode_s * 1000)
             msg["rtf"] = round(elapsed_decode_s / max(window_seconds, 0.001), 3)
+        if asr_confidence is not None:
+            msg["asr_confidence"] = round(asr_confidence, 3)
+        if asr_avg_logprob is not None:
+            msg["asr_avg_logprob"] = round(asr_avg_logprob, 3)
+        if asr_entropy is not None:
+            msg["asr_entropy"] = round(asr_entropy, 3)
         await self._broadcast(msg)
+        self._last_asr_confidence = asr_confidence
+        self._last_asr_avg_logprob = asr_avg_logprob
+        self._last_asr_entropy = asr_entropy
+
+        # Gutka follow-along mode: short-circuit the open-ended live path
+        # entirely. No alaap detection, no candidate scoring, no lock state
+        # machine — the aligner is monotonic over a known bani sequence.
+        if self._app_mode == "gutka" and self._gutka_aligner is not None:
+            await self._handle_gutka_window(first_letters, text)
+            self._prev_first_letters = first_letters
+            return
 
         # 6a. Alaap detection (Change 7): detect melismatic/non-lexical windows.
         # When enabled, freeze line pointer and skip challenger logic for
@@ -1640,7 +1899,8 @@ class PipelineOrchestrator:
                     start_mode,
                     transcript_text,
                 )
-                trial_top = trial[0]["score"] if trial else 0.0
+                trial_scored = self._score_candidates(variant, trial, transcript_text)
+                trial_top = trial_scored[0]["score"] if trial_scored else 0.0
                 if trial_top > best_top:
                     best_top = trial_top
                     scoring_letters = variant
@@ -1714,6 +1974,15 @@ class PipelineOrchestrator:
                 and int(top.get("stability", 1)) >= config.matcher.candidate_lock_windows
                 and word_overlap >= config.matcher.word_overlap_evidence_min
             )
+            low_asr_confidence = (
+                config.matcher.indic_asr_confidence_enabled
+                and config.whisper.engine == "indicconformer"
+                and top.get("asr_confidence") is not None
+                and float(top["asr_confidence"]) < config.matcher.indic_asr_low_confidence
+            )
+            if low_asr_confidence:
+                meets_raw_auto = False
+                meets_evidence = False
 
             # Change 4: confidence gap check.
             # High-confidence bypass (≥0.90): skip gap requirement entirely.
@@ -1738,7 +2007,11 @@ class PipelineOrchestrator:
             for sid in list(self._suggest_first_seen):
                 if sid != top_id:
                     del self._suggest_first_seen[sid]
-            if not lockable and raw_score >= config.matcher.suggest_threshold:
+            if (
+                not lockable
+                and not low_asr_confidence
+                and raw_score >= config.matcher.suggest_threshold
+            ):
                 if top_id not in self._suggest_first_seen:
                     self._suggest_first_seen[top_id] = _now
                 elapsed = _now - self._suggest_first_seen[top_id]
@@ -1973,6 +2246,63 @@ class PipelineOrchestrator:
                 best_line_idx = best_combined_idx
                 best_line_score = best_combined_score
                 best_line_variant = best_combined_label
+
+        # Unified span alignment overlay: when a fresh window contains 2-3
+        # consecutive panktis, move the pointer to the span end. The older pair /
+        # triple fallback scored the span but kept the target at the span start,
+        # which made fast bani and dense kirtan lag behind even with a good
+        # transcription.
+        if (
+            config.matcher.multi_line_locked_align
+            and len(first_letters) >= config.matcher.multi_line_locked_min_query_length
+        ):
+            span_scores = list(line_scores)
+            span_labels = [best_line_variant] * len(current.verses)
+            max_span_len = 3 if len(first_letters) >= config.matcher.multi_line_locked_trinary_min_query_length else 2
+            for start_idx in range(len(current.verses)):
+                span_letters_parts: list[str] = []
+                span_unicode_parts: list[str] = []
+                for end_idx in range(start_idx, min(len(current.verses), start_idx + max_span_len)):
+                    verse = current.verses[end_idx]
+                    span_letters_parts.append(verse.first_letters)
+                    span_unicode_parts.append(verse.unicode)
+                    span_len = end_idx - start_idx + 1
+                    if span_len == 1:
+                        continue
+                    span_letters = "".join(span_letters_parts)
+                    span_unicode = " ".join(span_unicode_parts)
+                    raw_span = self.scorer.score_line(first_letters, span_letters)
+                    if transcript_text:
+                        raw_span = max(
+                            raw_span,
+                            self.scorer.score_line_ngram(transcript_text, span_unicode),
+                        )
+                    if (
+                        config.matcher.sw_line_scoring_enabled
+                        and transcript_text
+                        and _word_count >= 2
+                    ):
+                        raw_span = max(
+                            raw_span,
+                            self.scorer.score_line_sw(transcript_text, span_unicode),
+                        )
+                    target_idx = end_idx
+                    target_score = self._apply_progression_bias(
+                        target_idx,
+                        current.current_line,
+                        raw_span,
+                    )
+                    if target_score > span_scores[target_idx]:
+                        span_scores[target_idx] = target_score
+                        span_labels[target_idx] = f"span{span_len}_end"
+
+            best_span_idx = max(range(len(span_scores)), key=lambda idx: span_scores[idx])
+            best_span_score = span_scores[best_span_idx]
+            if best_span_score > best_line_score:
+                line_scores = span_scores
+                best_line_idx = best_span_idx
+                best_line_score = best_span_score
+                best_line_variant = span_labels[best_span_idx]
 
         # Fallback: follow nearby lines at lower confidence to avoid getting stuck.
         # This keeps movement local and avoids large random jumps.
@@ -2303,6 +2633,14 @@ class PipelineOrchestrator:
             and top_word_overlap >= required_overlap
             and challenger_gap >= self._active_override_min_gap()
         )
+        low_asr_confidence = (
+            config.matcher.indic_asr_confidence_enabled
+            and config.whisper.engine == "indicconformer"
+            and top.get("asr_confidence") is not None
+            and float(top["asr_confidence"]) < config.matcher.indic_asr_low_confidence
+        )
+        if low_asr_confidence:
+            instant_switch = False
         if instant_switch:
             old_shabad_id = current.shabad_id
             print(
@@ -2318,6 +2656,8 @@ class PipelineOrchestrator:
                 "reason": "instant_challenger",
             })
             await self._lock_shabad_from_top(top)
+            return
+        if low_asr_confidence:
             return
 
         recovery_mode = (
@@ -2441,6 +2781,18 @@ class PipelineOrchestrator:
             )
             score = detail["score"]
             dense_dominant = detail["dense_dominant"]
+            asr_confidence = self._last_asr_confidence
+            asr_confidence_applied = False
+            if (
+                config.matcher.indic_asr_confidence_enabled
+                and config.whisper.engine == "indicconformer"
+                and asr_confidence is not None
+            ):
+                asr_confidence_applied = True
+                if asr_confidence < config.matcher.indic_asr_low_confidence:
+                    score *= config.matcher.indic_asr_low_score_multiplier
+                elif asr_confidence >= config.matcher.indic_asr_high_confidence:
+                    score += config.matcher.indic_asr_high_score_bonus
             overlap_source = candidate.unicode
             if candidate.gurmukhi and candidate.gurmukhi not in overlap_source:
                 overlap_source = f"{overlap_source} {candidate.gurmukhi}"
@@ -2461,6 +2813,11 @@ class PipelineOrchestrator:
                 # All three thirds of the query hit 3 consecutive lines — even
                 # stronger evidence for very fast / dense recitation (Fix 3).
                 score += config.matcher.multi_line_trinary_score_bonus
+            if "span" in retrieval_sources and candidate.span_score is not None:
+                # Unified span retrieval has already scored the exact line/span
+                # using first-letter, word and fuzzy text evidence. Treat it as
+                # corroboration, not a replacement for the final confidence model.
+                score += min(0.12, 0.12 * candidate.span_score)
             if "type3_words" in retrieval_sources:
                 # Word-level IDF vote (Fix 2). Bonus scaled by distinct-word-hits —
                 # more distinct real words in the transcript hitting this shabad
@@ -2474,6 +2831,13 @@ class PipelineOrchestrator:
                     score += config.matcher.word_vote_bonus_2
             score = min(1.0, max(0.0, score))
             action = self.scorer.classify(score)
+            if (
+                action == "auto"
+                and asr_confidence_applied
+                and asr_confidence is not None
+                and asr_confidence < config.matcher.indic_asr_low_confidence
+            ):
+                action = "suggest"
             # Safety floor: a candidate retrieved ONLY by word-vote (no first-letter
             # strategy backed it up) must clear a higher bar before it can auto-lock.
             # Prevents a buried-words false positive from hijacking the UI when the
@@ -2492,8 +2856,8 @@ class PipelineOrchestrator:
             # _lock_shabad_from_top can land on the right verse instead of the
             # raag heading. We already have the per-line first-letters cached on
             # the candidate (space-separated, recitation order).
-            line_idx = 0
-            if first_letters and candidate.full_first_letters:
+            line_idx = max(0, int(candidate.line_idx or 0))
+            if first_letters and candidate.full_first_letters and candidate.span_score is None:
                 line_fls = candidate.full_first_letters.split(" ")
                 if len(line_fls) > 1:
                     # Score every line, then pick best — but apply a small penalty to
@@ -2520,12 +2884,53 @@ class PipelineOrchestrator:
                 "word_overlap": word_overlap,
                 "retrieval_sources": retrieval_sources,
                 "action": action,
+                "span_len": candidate.span_len,
+                "span_score": candidate.span_score,
                 "word_vote_hits": candidate.word_vote_hits,
                 "word_vote_score": candidate.word_vote_score,
                 "dense_dominant": dense_dominant,
+                "asr_confidence": round(asr_confidence, 3) if asr_confidence is not None else None,
+                "asr_avg_logprob": (
+                    round(self._last_asr_avg_logprob, 3)
+                    if self._last_asr_avg_logprob is not None
+                    else None
+                ),
+                "asr_entropy": (
+                    round(self._last_asr_entropy, 3)
+                    if self._last_asr_entropy is not None
+                    else None
+                ),
             })
         scored.sort(key=lambda x: x["score"], reverse=True)
+        if config.matcher.learned_ranker_enabled:
+            self._apply_learned_ranker(scored)
         return scored
+
+    def _apply_learned_ranker(self, scored: list[dict]) -> None:
+        """Blend optional learned ranker probabilities into candidate scores."""
+        if not scored:
+            return
+        try:
+            from src.matcher.learned_ranker import predict_probabilities
+            probs = predict_probabilities(
+                scored,
+                speech_rate_lps=self._speech_rate_lps,
+                window_seconds=self._last_window_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[LearnedRanker] disabled for this window: {exc}")
+            return
+        if not probs:
+            return
+        weight = max(0.0, min(1.0, float(config.matcher.learned_ranker_weight)))
+        for candidate, prob in zip(scored, probs):
+            base = float(candidate.get("score") or 0.0)
+            blended = (1.0 - weight) * base + weight * float(prob)
+            candidate["rule_score"] = round(base, 3)
+            candidate["ranker_probability"] = round(float(prob), 3)
+            candidate["score"] = round(max(0.0, min(1.0, blended)), 3)
+            candidate["action"] = self.scorer.classify(candidate["score"])
+        scored.sort(key=lambda x: x["score"], reverse=True)
 
     def _apply_progression_bias(
         self, index: int, current_line: int, raw_score: float
@@ -2775,14 +3180,17 @@ class PipelineOrchestrator:
         """Capture-tick cadence — controls how long we sleep between wakes.
 
         Priority order:
-        1. Zero-overlap mode: hop = the most-recently-decoded dynamic window
+        1. Gutka mode: use a sub-second wake so paath pointer updates feel live.
+        2. Zero-overlap mode: hop = the most-recently-decoded dynamic window
            seconds, so each second of audio is transcribed exactly once.
            Falls back to step_duration on the very first tick (before any
            window has been decoded).
-        2. Fast-response mode: shrinks the search-state cadence to 1.5 s
+        3. Fast-response mode: shrinks the search-state cadence to 1.5 s
            without changing accuracy thresholds.
-        3. Default: config.audio.step_duration (3 s).
+        4. Default: config.audio.step_duration (3 s).
         """
+        if self._app_mode == "gutka":
+            return max(0.2, float(config.gutka.step_duration))
         if config.audio.zero_overlap_window and self._last_window_seconds > 0.0:
             return float(self._last_window_seconds)
         if config.matcher.fast_response_enabled:
@@ -2826,7 +3234,10 @@ class PipelineOrchestrator:
     def _select_transcription_audio(self, window):
         """Choose dynamic transcription window based on current tracking context."""
         samplerate = config.audio.samplerate
-        if self._after_break_windows > 0:
+        if self._app_mode == "gutka":
+            seconds = max(0.4, float(config.gutka.window_duration))
+            mode = "gutka_fast"
+        elif self._after_break_windows > 0:
             seconds = config.audio.start_window_duration
             mode = "start_boost"
         elif self.tracker.state in (PipelineState.LOCKED, PipelineState.UNSTABLE_LOCK):

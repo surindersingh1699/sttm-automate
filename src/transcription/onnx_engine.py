@@ -142,10 +142,13 @@ class IndicConformerEngine(BaseTranscriptionEngine):
 
     @staticmethod
     def _resolved_precision() -> str:
-        precision = (getattr(config.whisper, "onnx_precision", "fp16") or "fp16").lower()
-        if precision not in ("fp32", "fp16", "int8"):
-            print(f"[IndicConformer-ONNX] Unknown precision {precision!r} — using int8.")
-            return "int8"
+        precision = (getattr(config.whisper, "onnx_precision", "fp32") or "fp32").lower()
+        if precision != "fp32":
+            print(
+                f"[IndicConformer-ONNX] Precision {precision!r} is disabled "
+                "for live CPU inference — using fp32."
+            )
+            return "fp32"
         return precision
 
     @classmethod
@@ -303,7 +306,10 @@ class IndicConformerEngine(BaseTranscriptionEngine):
 
     # IndicConformer was fine-tuned on clips up to ~15 s. Inputs much longer
     # than that silently degrade; cap and split on the rough midpoint silence.
-    _MAX_AUDIO_SECONDS = 12.0
+    # Holding the cap at 14 s leaves a 1 s safety margin under the fine-tune
+    # ceiling while letting the engine swallow a full slow pankti in one
+    # decode (previous 12 s would split long lines and break LM fusion).
+    _MAX_AUDIO_SECONDS = 14.0
 
     def transcribe(
         self,

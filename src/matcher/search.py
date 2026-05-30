@@ -37,3 +37,9 @@ class ShabadCandidate:
     word_vote_score: float | None = None
     # Count of distinct transcript words that hit this shabad via type3_words retrieval.
     word_vote_hits: int = 0
+    # Best line/span hit inside the shabad. Open-corpus search and ordered bani
+    # matching both operate on spans now; callers can land the pointer directly
+    # instead of re-guessing the line from shabad-level evidence.
+    line_idx: int = 0
+    span_len: int = 1
+    span_score: float | None = None

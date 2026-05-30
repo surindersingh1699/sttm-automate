@@ -114,23 +114,27 @@ class WhisperConfig(BaseModel):
     #   fp16 — currently BROKEN: NeMo→ONNX fp16 export left mixed float/half
     #          tensors at /pre_encode/Add and onnxruntime refuses to load it.
     #          Re-export with the cast fixed before re-enabling.
-    #   int8 — fastest + smallest (~134 MB). Default until fp16 is re-exported.
-    onnx_precision: str = "int8"
-    available_precisions: tuple[str, ...] = ("fp32", "int8")
+    #   int8 — currently disabled: the export uses ConvInteger, which the
+    #          onnxruntime CPU execution provider cannot run reliably.
+    onnx_precision: str = "fp32"
+    available_precisions: tuple[str, ...] = ("fp32",)
     # CPU thread count for the ONNX session.
     onnx_threads: int = 4
     # Chunked streaming for IndicConformer (StreamingConfig.streaming_mode="nemo_chunked").
     # Decode every `nemo_chunk_len_s` seconds of audio standalone (no VAD gating,
     # no rolling window). Latency ≈ chunk_len_s; CPU cost ≈ one decode per chunk.
-    # Smaller chunk = lower latency + more boundary errors; matcher's first-letter
-    # retrieval is robust to a missing word at the edges, so 1.0–1.5 s works well
-    # for fast bani. Set to 0 to disable (fall back to vad_segmented behavior).
-    nemo_chunk_len_s: float = 1.5
+    # Wider chunk = more acoustic context per CTC decode → fewer boundary
+    # errors and stronger LM-fusion benefit; per-second decode work stays
+    # roughly flat because hop scales with chunk length. 2.5 s is the
+    # accuracy sweet spot for kirtan: long enough to capture a full pankti
+    # of context, short enough that line tracking stays responsive and we
+    # stay well inside the model's 15 s fine-tune cap.
+    nemo_chunk_len_s: float = 2.5
     # Optional left-context audio fed to the model alongside each chunk to give
     # the encoder a warm-up region before the new audio. We only KEEP the new
     # text — context exists purely to stabilize the encoder's first frames.
-    # 0 disables; 0.5 s is a safe default (~half a pankti syllable).
-    nemo_chunk_context_s: float = 0.5
+    # 0 disables; 0.6 s pairs naturally with the 2.5 s chunk above.
+    nemo_chunk_context_s: float = 0.6
 
     # ── KenLM language-model fusion (IndicConformer only) ──────────────
     # Two-LM pair, both gated by ``lm_enabled``:
@@ -139,22 +143,43 @@ class WhisperConfig(BaseModel):
     # Either piece silently falls back to greedy/no-gate if its .bin or
     # Python dep (kenlm / pyctcdecode) isn't available. See
     # ``docs/asr-engines.md`` for the full picture.
+    # Default OFF based on 2026-05-23 eval: in-beam BPE LM fusion at α=0.3-0.5
+    # left lock accuracy/TTFCL unchanged but dragged composite pct_time_correct
+    # from 75% → 58% on the cached `-Dyi8-Qyx4I` session because canonical n-gram
+    # bias canonicalised CTC into a plausible-but-wrong pankti within the right
+    # shabad, fooling the line matcher. The post-hoc char gate (relaxed below)
+    # is still wired up so anyone flipping this on gets sensible defaults.
+    # Re-evaluate before re-defaulting to True — likely needs per-pankti rescore
+    # rather than in-beam fusion.
     lm_enabled: bool = False
     lm_bpe_path: str = "models/lm/gurbani_canon_bpe_4gram.bin"
     lm_char_path: str = "models/lm/gurbani_canon_char_6gram.bin"
     # In-beam fusion weights — sweep on the eval set if changed.
     #   α weights log P_LM in the beam score
     #   β is a word-insertion bonus (higher = more words per second)
-    lm_alpha: float = 0.5
+    # α at 0.3 (down from upstream 0.5) is the lightest fusion that still
+    # lifts standalone WER on alaap-heavy windows — used if the toggle is
+    # re-enabled. 0.5 was too strong and dragged line tracking measurably.
+    lm_alpha: float = 0.3
     lm_beta: float = 1.5
-    lm_beam_width: int = 100
+    # 64 beams is the tightest setting that keeps the LM accuracy lift on
+    # held-out kirtan while bringing decode latency well within the
+    # per-chunk budget. 100+ beams added <0.5 % WER for ~1.6× the CTC cost.
+    lm_beam_width: int = 64
     # Hallucination gate (char-LM perplexity per char). Defaults calibrated
     # to canon ~3-4 / modern Punjabi ~6-8 / garbage 200+ — see lm_scorer.py.
-    lm_hallucination_ppl_threshold: float = 25.0
-    lm_low_confidence_ppl_threshold: float = 12.0
-    # Short outputs (< this many chars) skip the gate to avoid PPL spikes on
-    # single-syllable callouts.
-    lm_gate_min_chars: int = 6
+    # Threshold raised to 80 (from 25) after live eval showed the strict
+    # gate was dropping real CTC outputs with vowel-attachment / word-
+    # boundary artifacts (per_char_PPL 30-110) that the matcher would
+    # otherwise have used for first-letter retrieval. 80 still blocks
+    # outright Devanagari/random hallucinations (PPL 200+) without
+    # penalising the model's everyday CTC noise.
+    lm_hallucination_ppl_threshold: float = 80.0
+    lm_low_confidence_ppl_threshold: float = 40.0
+    # Short outputs (< this many chars) skip the gate. Raised from 6 → 15
+    # so single-pankti fragments (which are first-letter useful even when
+    # noisy) don't get accidentally axed.
+    lm_gate_min_chars: int = 15
 
     def model_family(self, model_id: str | None = None) -> str:
         """Return ``"whisper"`` or ``"indicconformer"`` for the given model id.
@@ -268,10 +293,17 @@ class MatcherConfig(BaseModel):
     min_words_for_line_advance: int = 2
     # Line-advance gate — keeps the pointer on the current pangati until the ragi has
     # actually left it. Without this, the 3 s micro window advances mid-line as soon
-    # as the next line's first syllable bleeds in. Matches the micro window duration
-    # so the pointer cannot advance faster than one window tick.
-    min_line_dwell_seconds: float = 4.5
-    line_advance_override_score: float = 0.82  # next-line score that bypasses the dwell gate
+    # as the next line's first syllable bleeds in.
+    # Tightened 4.5 → 3.0 on 2026-05-23 after multi-video eval showed a
+    # consistent 2-3 line LAG behind GT on a 5-video sample (wrong_line
+    # median 28.6%). 4.5 s held the pointer for longer than the typical
+    # pankti, so each ragi advance landed 1-2 panktis behind. 3.0 s ≈ the
+    # naive-mode step duration — the pointer can now advance once per
+    # decode tick when evidence supports it.
+    min_line_dwell_seconds: float = 3.0
+    # Override score lowered 0.82 → 0.75 so a strong "we just jumped lines"
+    # match (e.g. the rahau looping back) bypasses dwell more readily.
+    line_advance_override_score: float = 0.75
     fast_speech_letters_per_second: float = 1.50  # above this, favor shorter windows
     slow_speech_letters_per_second: float = 0.65  # below this, favor longer windows
     speech_rate_ema_alpha: float = 0.35  # smoothing factor for speech-rate estimate
@@ -339,6 +371,19 @@ class MatcherConfig(BaseModel):
     fast_response_enabled: bool = False
     fast_min_line_dwell_seconds: float = 3.0
     fast_suggest_confirmation_seconds: float = 2.5
+    # IndicConformer ASR confidence gating — uses CTC acoustic confidence from
+    # TranscriptionSegment. Conservative by default: low-confidence windows lose
+    # lock/switch authority; high-confidence windows get a small score nudge.
+    indic_asr_confidence_enabled: bool = True
+    indic_asr_low_confidence: float = 0.45
+    indic_asr_high_confidence: float = 0.78
+    indic_asr_low_score_multiplier: float = 0.85
+    indic_asr_high_score_bonus: float = 0.03
+    # Optional learned lock ranker. The rule-based score remains the fallback;
+    # enabling this blends in a calibrated probability from a small sklearn model.
+    learned_ranker_enabled: bool = False
+    learned_ranker_model_path: str = "models/lock_ranker.joblib"
+    learned_ranker_weight: float = 0.35
 
 
 class StreamingConfig(BaseModel):
@@ -445,6 +490,22 @@ class DatabaseConfig(BaseModel):
     hf_filename: str = "database.sqlite"
 
 
+class GutkaConfig(BaseModel):
+    # Gutka follow-along aligner tuning. Inert until the user flips app_mode
+    # to "gutka" and picks a bani — open-ended live recognition ignores these.
+    forward_window: int = 12          # candidate lines scanned ahead of current_idx
+    backward_window: int = 4          # additional lines scanned behind (bidirectional only)
+    min_score: float = 0.54           # span-alignment threshold to commit a move
+    min_margin: float = 0.04          # winner must beat runner-up by this margin
+    max_span_lines: int = 3           # score 1..N consecutive panktis per chunk
+    min_matched_letters: int = 2      # ignore extremely short/noisy ASR fragments
+    rahau_repeat_enabled: bool = True # re-fire current line on confident repeat
+    step_duration: float = 0.8        # naive-mode wake cadence while in gutka mode
+    window_duration: float = 2.4      # latest audio sent to ASR while in gutka mode
+    nemo_chunk_len_s: float = 1.0     # Indic chunk size when nemo_chunked + gutka
+    nemo_chunk_context_s: float = 0.4 # left context for short Indic gutka chunks
+
+
 class AppConfig(BaseModel):
     audio: AudioConfig = AudioConfig()
     whisper: WhisperConfig = WhisperConfig()
@@ -453,6 +514,7 @@ class AppConfig(BaseModel):
     sttm: STTMConfig = STTMConfig()
     dashboard: DashboardConfig = DashboardConfig()
     database: DatabaseConfig = DatabaseConfig()
+    gutka: GutkaConfig = GutkaConfig()
 
 
 # Global config instance

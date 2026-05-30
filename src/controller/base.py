@@ -31,6 +31,38 @@ class STTMController(ABC):
         """Navigate to next/previous line. Direction: 'next' or 'prev'. Returns True on success."""
         ...
 
+    async def display_bani(self, sqlite_bani_id: int) -> bool:
+        """Open a nitnem bani (gutka follow-along mode). Default no-op for
+        controllers that don't support bani-level display (e.g. the
+        Playwright fallback). Returns True on success.
+        """
+        return False
+
+    async def navigate_to_bani_verse(self, verse_order_id: int) -> bool:
+        """Highlight a specific line of the currently-displayed bani.
+        ``verse_order_id`` is ``lines.order_id`` from the local SQLite DB —
+        the same value STTM Desktop accepts as ``verseId``. Default no-op
+        for controllers without bani support.
+        """
+        return False
+
+    async def navigate_to_bani_line(
+        self,
+        pointer_id: int,
+        *,
+        line_count: int | None = None,
+        fallback_verse_order_id: int | None = None,
+    ) -> bool:
+        """Highlight a Gutka line by STTM's bani-mode pointer id.
+
+        ``pointer_id`` should be Realm ``Banis_Shabad.ID`` when available.
+        ``fallback_verse_order_id`` lets older callers/controllers degrade to
+        the legacy local verse id path.
+        """
+        if fallback_verse_order_id is None:
+            fallback_verse_order_id = pointer_id
+        return await self.navigate_to_bani_verse(fallback_verse_order_id)
+
     @abstractmethod
     async def disconnect(self):
         """Disconnect from STTM."""

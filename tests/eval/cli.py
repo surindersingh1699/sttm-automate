@@ -31,12 +31,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 async def main(args: argparse.Namespace):
     from tests.eval.dataset import _DATASET, load_eval_sessions
     from tests.eval.metrics import compute_aggregate, print_session_summary, save_json
-    from tests.eval.runner import HeadlessSessionDriver, LiveSessionDriver, SessionResult
+    from tests.eval.runner import HeadlessSessionDriver, MicSessionDriver, SessionResult
     from tests.eval.scorer import print_kpis
 
-    if args.mode == "live":
+    if args.mode == "mic":
         from tests.eval.preflight import print_preflight
-        if not print_preflight("live"):
+        if not print_preflight("mic"):
             sys.exit(1)
 
     dataset = args.dataset or _DATASET
@@ -60,7 +60,7 @@ async def main(args: argparse.Namespace):
     if args.mode == "headless":
         driver = HeadlessSessionDriver(run_id=run_id)
     else:
-        driver = LiveSessionDriver(run_id=run_id)
+        driver = MicSessionDriver(run_id=run_id)
 
     results: list[SessionResult] = []
     for i, session in enumerate(sessions, 1):
@@ -101,8 +101,8 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--dataset", help="HuggingFace dataset ID")
     p.add_argument("--split", default="train")
-    p.add_argument("--mode", choices=["headless", "live"], default="headless",
-                   help="headless=yt-dlp+mock (CI), live=Playwright+STTM (observable)")
+    p.add_argument("--mode", choices=["headless", "mic"], default="headless",
+                   help="headless=yt-dlp+mock (CI), mic=play through speakers + capture (observable)")
     p.add_argument("--video-id", dest="video_id",
                    help="Run only this YouTube video ID")
     p.add_argument("--limit", type=int, help="Max videos to load from dataset")

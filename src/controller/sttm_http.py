@@ -352,6 +352,96 @@ class STTMHttpController(STTMController):
             self._active_line_idx = next_idx
         return ok
 
+    async def display_bani(self, sqlite_bani_id: int) -> bool:
+        """Open a nitnem bani in STTM Desktop (type:"bani" payload).
+
+        Translates our SQLite bani id → STTM Realm ``Banis.ID`` via
+        ``_SQLITE_TO_REALM_BANI``. The first verse of the bani (looked up
+        in :mod:`src.matcher.bani_loader`) becomes the initial highlight.
+        Returns False when the bani isn't in STTM's Realm (Asa Ki Var,
+        Alahnia, Mundavnni — intentionally absent from the picker).
+        """
+        realm_bani_id = _SQLITE_TO_REALM_BANI.get(int(sqlite_bani_id))
+        if realm_bani_id is None:
+            return False
+
+        from src.matcher.bani_loader import load_bani
+        try:
+            lines = await asyncio.to_thread(load_bani, int(sqlite_bani_id))
+        except KeyError:
+            return False
+        if not lines:
+            return False
+
+        first_line = lines[0]
+        pointer_id = first_line.sttm_pointer_id
+
+        ok = await self._send_control({
+            "type": "bani",
+            "baniId": realm_bani_id,
+            # STTM Desktop's bani-controller path treats verseId as
+            # Banis_Shabad.ID (crossPlatformId), not the normal Verse.ID.
+            "verseId": pointer_id,
+            "lineCount": 1,
+            "highlight": pointer_id,
+        })
+        if ok:
+            # Bani-mode owns the active state — shabad-mode bookkeeping is
+            # cleared so a subsequent display_shabad/navigate_line knows
+            # the session is in bani mode.
+            self._active_shabad_id = None
+            self._active_realm_shabad_id = None
+            self._active_bani_id = realm_bani_id
+            self._active_line_idx = 0
+        return ok
+
+    async def navigate_to_bani_verse(self, verse_order_id: int) -> bool:
+        """Legacy fallback: highlight a specific local verse within the active bani.
+
+        Prefer :meth:`navigate_to_bani_line`, which sends STTM's native
+        Banis_Shabad.ID pointer. This method is kept for controllers/tests
+        that still only know about local ``lines.order_id``.
+        """
+        if self._active_bani_id is None:
+            return False
+        realm_verse_id = _VERSE_MAP.get(int(verse_order_id), int(verse_order_id))
+        return await self._send_control({
+            "type": "bani",
+            "baniId": self._active_bani_id,
+            "verseId": realm_verse_id,
+            "highlight": realm_verse_id,
+        })
+
+    async def navigate_to_bani_line(
+        self,
+        pointer_id: int,
+        *,
+        line_count: int | None = None,
+        fallback_verse_order_id: int | None = None,
+    ) -> bool:
+        """Highlight a specific line within the currently-open Gutka bani.
+
+        ``pointer_id`` is ideally Realm ``Banis_Shabad.ID``. STTM's local IPC
+        handler stores it as ``savedCrossPlatformId`` and ``ShabadText`` finds
+        the rendered line by ``crossPlatformId``. ``lineCount`` is also sent so
+        older controller code can scroll near the correct row.
+        """
+        if self._active_bani_id is None:
+            return False
+        pid = int(pointer_id)
+        payload = {
+            "type": "bani",
+            "baniId": self._active_bani_id,
+            "verseId": pid,
+            "highlight": pid,
+        }
+        if line_count is not None:
+            payload["lineCount"] = max(1, int(line_count))
+        ok = await self._send_control(payload)
+        if ok and line_count is not None:
+            self._active_line_idx = max(0, int(line_count) - 1)
+        return ok
+
     async def disconnect(self):
         """Close the HTTP client + local DB connection."""
         await self._client.aclose()
