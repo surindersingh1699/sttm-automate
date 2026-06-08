@@ -57,6 +57,32 @@ Replace the first-letter-centric, multi-strategy retrieval with a content-first
 matcher whose core similarity is `matra` (full words, matras kept). First-letters
 drop to at most a cheap pre-filter.
 
+## Applied to production (2026-06-07)
+
+`OfflineShabadSearcher._span_search` now scores **content-first**: the `matra`
+signal (normalized-LCS coverage over full Gurmukhi text, matras kept) is the
+primary term (0.60), word overlap secondary (0.25), first-letters a minor cue
+(0.15, still the retrieval seed). char-4gram overlap is kept only for the recall
+gate. Spans carry a `full` field for this.
+
+A/B through the real `search()` on the same 100 cached pairs, with realistic
+**8-word windows** (not the full repeated 14s query), GT not force-added:
+
+| scorer | top-1 | top-3 |
+|---|---|---|
+| baseline (FL-primary blend 0.58/0.27/0.15) | 56/100 | 65/100 |
+| matra-primary (0.60/0.25/0.15) | 58/100 | 69/100 |
+
+**Modest but real (+2 top-1, +4 top-3, no regression).** Smaller than the
+encoding experiment's 69-vs-9 because the production scorer was always a *blend*
+(word/char already carried content), never FL-only. The win is mostly sharper
+confidence separation, which should help locking decisions.
+
+> ⚠️ This is a **proxy** metric (line-correct via ≥0.8 coverage). It does **not**
+> measure the real production metric (pct_time_correct / lock / TTFCL over live
+> sessions with the state machine). Run `tests/eval/runner.py` before relying on
+> this in production.
+
 ## Open / not yet measured
 
 - **Retrieval recall** of content-based (`matra`/word) indexes vs. FL — does it
