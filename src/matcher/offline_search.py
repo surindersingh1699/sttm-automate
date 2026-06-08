@@ -13,6 +13,8 @@ import math
 import re
 import sqlite3
 from collections import defaultdict
+from dataclasses import dataclass
+from difflib import SequenceMatcher
 from functools import lru_cache
 from pathlib import Path
 
@@ -137,6 +139,78 @@ def _tokenize_gurmukhi_words(text: str) -> list[str]:
     return [token for token in _GURMUKHI_TOKEN.findall(text) if len(token) >= 2]
 
 
+def _char_4grams(text: str) -> frozenset[str]:
+    s = (text or "").strip()
+    if len(s) < 4:
+        return frozenset({s} if s else set())
+    return frozenset(s[i: i + 4] for i in range(len(s) - 3))
+
+
+def _lcs_len(a: str, b: str) -> int:
+    if not a or not b:
+        return 0
+    prev = [0] * (len(b) + 1)
+    curr = [0] * (len(b) + 1)
+    for ach in a:
+        for idx, bch in enumerate(b):
+            if ach == bch:
+                curr[idx + 1] = prev[idx] + 1
+            else:
+                curr[idx + 1] = max(prev[idx + 1], curr[idx])
+        prev, curr = curr, prev
+        for i in range(len(curr)):
+            curr[i] = 0
+    return prev[len(b)]
+
+
+def _span_fl_score(query_ascii: str, span_ascii: str) -> float:
+    """Shared first-letter score for one-line and multi-line spans."""
+    if not query_ascii or not span_ascii:
+        return 0.0
+    ratio = SequenceMatcher(None, query_ascii, span_ascii).ratio()
+    matched = _lcs_len(query_ascii, span_ascii)
+    span_cov = matched / max(1, len(span_ascii))
+    query_cov = matched / max(1, len(query_ascii))
+    dense = 1.0 if span_ascii in query_ascii or query_ascii in span_ascii else 0.0
+    return max(ratio, (0.65 * span_cov) + (0.35 * query_cov), dense)
+
+
+def _overlap_coeff(left: set | frozenset, right: set | frozenset) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / min(len(left), len(right))
+
+
+@dataclass(frozen=True)
+class _IndexedLine:
+    shabad_id: int
+    line_idx: int
+    order_id: int
+    gurmukhi_ascii: str
+    unicode: str
+    english: str
+    first_letters_ascii: str
+    source_code: str
+    page_no: int
+    words: frozenset[str]
+    char4: frozenset[str]
+
+
+@dataclass(frozen=True)
+class _IndexedSpan:
+    shabad_id: int
+    line_idx: int
+    span_len: int
+    gurmukhi_ascii: str
+    unicode: str
+    english: str
+    first_letters_ascii: str
+    source_code: str
+    page_no: int
+    words: frozenset[str]
+    char4: frozenset[str]
+
+
 class OfflineShabadSearcher:
     """Searches the ShabadOS SQLite DB using ASCII first-letter indices."""
 
@@ -158,6 +232,12 @@ class OfflineShabadSearcher:
         self._ngram4_index: dict[str, list[int]] | None = None
         # line_rowid → (sttm_id, unicode_text, first_letters_ascii, frozenset of 4-grams)
         self._ngram4_line_data: dict[int, tuple[int, str, str, frozenset]] | None = None
+        # Unified span index: the same evidence model for Kirtan open search and
+        # ordered bani/nitnem style matching.
+        self._span_index: list[_IndexedSpan] | None = None
+        self._span_fl_grams: dict[str, set[int]] | None = None
+        self._span_words: dict[str, set[int]] | None = None
+        self._span_char4: dict[str, set[int]] | None = None
 
     def _ensure_word_index(self) -> None:
         """Build word→shabad and shabad→first-letters indices on first use.
@@ -268,6 +348,233 @@ class OfflineShabadSearcher:
         self._ngram4_index = dict(ngram4_index)
         self._ngram4_line_data = line_data
 
+    def _ensure_span_index(self) -> None:
+        """Build a shared 1/2/3-line span index for open and ordered matching.
+
+        The previous retriever had separate SQL strategies for prefix, contains,
+        full-word, 2-line, 3-line, word-vote and char-ngram matching. This index
+        stores the common unit they were all trying to find: a specific line span.
+        Search becomes "collect plausible spans, score them with the same three
+        evidence channels, keep the best span per shabad."
+        """
+        if self._span_index is not None:
+            return
+
+        from src.transcription.transliterate import normalize_for_fullword_search
+
+        rows = self._conn.execute(
+            f"""
+            SELECT
+                {_SHABAD_ID_EXPR} AS sttm_id,
+                l.gurmukhi       AS gurmukhi_ascii,
+                l.first_letters  AS first_letters,
+                l.order_id       AS order_id,
+                l.source_page    AS source_page,
+                s.source_id      AS source_id,
+                (
+                    SELECT t.translation FROM translations t
+                    WHERE t.line_id = l.id AND t.translation_source_id = {_ENGLISH_TRANSLATION_SOURCE}
+                    LIMIT 1
+                ) AS english
+            FROM lines l
+            JOIN shabads s ON l.shabad_id = s.id
+            ORDER BY sttm_id, l.order_id
+            """
+        ).fetchall()
+
+        lines_by_shabad: dict[int, list[_IndexedLine]] = defaultdict(list)
+        for row in rows:
+            sid = row["sttm_id"]
+            if sid is None:
+                continue
+            ascii_g = row["gurmukhi_ascii"] or ""
+            unicode_text = _to_unicode(ascii_g)
+            normalized = normalize_for_fullword_search(unicode_text)
+            source_code = "G" if row["source_id"] == _SOURCE_SGGS else "D"
+            lines_by_shabad[sid].append(
+                _IndexedLine(
+                    shabad_id=sid,
+                    line_idx=len(lines_by_shabad[sid]),
+                    order_id=row["order_id"],
+                    gurmukhi_ascii=ascii_g,
+                    unicode=unicode_text,
+                    english=row["english"] or "",
+                    first_letters_ascii=row["first_letters"] or "",
+                    source_code=source_code,
+                    page_no=row["source_page"] or 0,
+                    words=frozenset(_tokenize_gurmukhi_words(normalized)),
+                    char4=_char_4grams(normalized),
+                )
+            )
+
+        span_index: list[_IndexedSpan] = []
+        fl_grams: dict[str, set[int]] = defaultdict(set)
+        word_index: dict[str, set[int]] = defaultdict(set)
+        char4_index: dict[str, set[int]] = defaultdict(set)
+        shabad_concat: dict[int, str] = {}
+
+        for sid, lines in lines_by_shabad.items():
+            shabad_concat[sid] = " ".join(line.first_letters_ascii for line in lines)
+            for start_idx, line in enumerate(lines):
+                ascii_parts: list[str] = []
+                unicode_parts: list[str] = []
+                fl_parts: list[str] = []
+                words: set[str] = set()
+                char4: set[str] = set()
+                for end_idx in range(start_idx, min(len(lines), start_idx + 3)):
+                    part = lines[end_idx]
+                    ascii_parts.append(part.gurmukhi_ascii)
+                    unicode_parts.append(part.unicode)
+                    fl_parts.append(part.first_letters_ascii)
+                    words.update(part.words)
+                    char4.update(part.char4)
+                    span_fl = "".join(fl_parts)
+                    if not span_fl and not words and not char4:
+                        continue
+                    span_id = len(span_index)
+                    span = _IndexedSpan(
+                        shabad_id=sid,
+                        line_idx=end_idx,
+                        span_len=end_idx - start_idx + 1,
+                        gurmukhi_ascii=" ".join(p for p in ascii_parts if p).strip(),
+                        unicode=" ".join(p for p in unicode_parts if p).strip(),
+                        english=line.english,
+                        first_letters_ascii=span_fl,
+                        source_code=line.source_code,
+                        page_no=line.page_no,
+                        words=frozenset(words),
+                        char4=frozenset(char4),
+                    )
+                    span_index.append(span)
+                    for gram in self._ascii_grams(span_fl):
+                        fl_grams[gram].add(span_id)
+                    for token in span.words:
+                        word_index[token].add(span_id)
+                    for gram in span.char4:
+                        char4_index[gram].add(span_id)
+
+        self._span_index = span_index
+        self._span_fl_grams = dict(fl_grams)
+        self._span_words = dict(word_index)
+        self._span_char4 = dict(char4_index)
+        if self._shabad_first_letters is None:
+            self._shabad_first_letters = shabad_concat
+            self._total_shabads = len(shabad_concat)
+
+    @staticmethod
+    def _ascii_grams(value: str) -> set[str]:
+        value = value or ""
+        if not value:
+            return set()
+        sizes = (3, 4) if len(value) >= 4 else (len(value),)
+        grams: set[str] = set()
+        for size in sizes:
+            if size <= 0 or len(value) < size:
+                continue
+            grams.update(value[i: i + size] for i in range(len(value) - size + 1))
+        return grams
+
+    def _span_search(
+        self,
+        first_letters: str,
+        transcript_text: str,
+        limit: int,
+        signal: str = "span",
+        start_mode: bool = False,
+    ) -> list[ShabadCandidate]:
+        """Retrieve and rank exact line spans using FL, word, and char evidence."""
+        if len(first_letters) < 3 and not transcript_text.strip():
+            return []
+        self._ensure_span_index()
+        assert self._span_index is not None
+        assert self._span_fl_grams is not None
+        assert self._span_words is not None
+        assert self._span_char4 is not None
+
+        from src.transcription.transliterate import normalize_for_fullword_search
+
+        query_ascii = gurmukhi_to_ascii(first_letters) if first_letters else ""
+        if start_mode and query_ascii:
+            query_ascii = query_ascii[: min(8, len(query_ascii))]
+        normalized = normalize_for_fullword_search(transcript_text) if transcript_text else ""
+        q_words = frozenset(_tokenize_gurmukhi_words(normalized))
+        q_char4 = _char_4grams(normalized)
+
+        seed_ids: set[int] = set()
+        for gram in self._ascii_grams(query_ascii):
+            seed_ids.update(self._span_fl_grams.get(gram, ()))
+        for token in q_words:
+            seed_ids.update(self._span_words.get(token, ()))
+        for gram in q_char4:
+            seed_ids.update(self._span_char4.get(gram, ()))
+
+        if not seed_ids:
+            return []
+
+        best_per_shabad: dict[int, tuple[float, _IndexedSpan, int, float, float, float]] = {}
+        for span_id in seed_ids:
+            span = self._span_index[span_id]
+            fl_score = _span_fl_score(query_ascii, span.first_letters_ascii)
+            word_score = _overlap_coeff(q_words, span.words)
+            char_score = _overlap_coeff(q_char4, span.char4)
+            if fl_score < 0.20 and word_score < 0.34 and char_score < config.matcher.ngram4_min_overlap:
+                continue
+
+            weights: list[tuple[float, float]] = []
+            if query_ascii:
+                weights.append((0.58, fl_score))
+            if q_words:
+                weights.append((0.27, word_score))
+            if q_char4:
+                weights.append((0.15, char_score))
+            if not weights:
+                continue
+            total_weight = sum(weight for weight, _ in weights)
+            score = sum(weight * value for weight, value in weights) / total_weight
+
+            # Longer spans are only a bonus when the query itself is long enough
+            # to plausibly cover multiple panktis.
+            if span.span_len > 1 and len(query_ascii) >= config.matcher.multi_line_min_query_length:
+                score += 0.035 * (span.span_len - 1)
+            if span.line_idx == 0 and config.matcher.penalize_heading_line:
+                score -= 0.08
+            score = max(0.0, min(1.0, score))
+
+            current = best_per_shabad.get(span.shabad_id)
+            if current is None or score > current[0]:
+                best_per_shabad[span.shabad_id] = (
+                    score,
+                    span,
+                    len(q_words & span.words),
+                    word_score,
+                    char_score,
+                    fl_score,
+                )
+
+        ranked = sorted(best_per_shabad.values(), key=lambda item: item[0], reverse=True)
+        candidates: list[ShabadCandidate] = []
+        for score, span, word_hits, _word_score, _char_score, _fl_score in ranked[:limit]:
+            candidate = ShabadCandidate(
+                shabad_id=span.shabad_id,
+                gurmukhi=span.gurmukhi_ascii,
+                unicode=span.unicode,
+                english=span.english,
+                source_id=span.source_code,
+                page_no=span.page_no,
+                retrieval_sources={signal},
+                full_first_letters=(
+                    self._shabad_first_letters.get(span.shabad_id)
+                    if self._shabad_first_letters
+                    else None
+                ),
+                word_vote_hits=word_hits,
+                line_idx=span.line_idx,
+                span_len=span.span_len,
+                span_score=round(score, 3),
+            )
+            candidates.append(candidate)
+        return candidates
+
     def _ngram4_search(
         self,
         transcript_text: str,
@@ -372,7 +679,28 @@ class OfflineShabadSearcher:
         candidates: list[ShabadCandidate] = []
         seen_ids: set[int] = set()
 
-        if len(first_letters) >= 3:
+        # Unified span search first. This replaces the old "try many unrelated
+        # strategies then reconcile later" shape with one candidate stream that
+        # already knows the best line/span for the pointer.
+        self._add_unique(
+            self._span_search(
+                first_letters,
+                transcript_text,
+                max(max_results * 2, 20),
+                "span",
+                start_mode,
+            ),
+            candidates,
+            seen_ids,
+        )
+
+        # Legacy SQL/string strategies are now fallback only. The span index
+        # already combines first-letter, word and char evidence and returns the
+        # exact pointer line, so keep the older stack as a safety net for sparse
+        # or unusual queries instead of letting it dominate normal ranking.
+        legacy_fallback = len(candidates) < 3
+
+        if legacy_fallback and len(first_letters) >= 3:
             ascii_fl = gurmukhi_to_ascii(first_letters)
             query = ascii_fl[: min(8, len(ascii_fl))] if start_mode else ascii_fl
 
@@ -407,35 +735,14 @@ class OfflineShabadSearcher:
                     self._add_unique(self._contains_search(sub, 5, "type1_sub"), candidates, seen_ids)
 
         # Strategy 4: full-word phrase search from transcript text
-        if transcript_text.strip():
+        if legacy_fallback and transcript_text.strip():
             self._add_unique(self._fullword_search(transcript_text, max_results, "type2"), candidates, seen_ids)
-
-        # Strategy 5: multi-line search — the window spans 2+ DB lines (nitnem / dense text).
-        # Split the query in half and require consecutive line hits for both halves.
-        if (
-            config.matcher.multi_line_search
-            and len(first_letters) >= config.matcher.multi_line_min_query_length
-        ):
-            ascii_fl_full = gurmukhi_to_ascii(first_letters)
-            self._add_unique(
-                self._multiline_search(ascii_fl_full, max_results, "multiline"),
-                candidates,
-                seen_ids,
-            )
-            # 3-way split fires *in addition* when the query is long enough to
-            # plausibly span 3 consecutive DB lines (very fast recitation).
-            if len(first_letters) >= config.matcher.multi_line_trinary_min_query_length:
-                self._add_unique(
-                    self._multiline3_search(ascii_fl_full, max_results, "multiline3"),
-                    candidates,
-                    seen_ids,
-                )
 
         # Strategy 6: rotation search — ragi sang words out of canonical line order.
         # Always run for short queries (≤4 chars): type1 may find other candidates
         # but the correct shabad requires a rotation (e.g. "tmm" misses "kkjmmthj"
         # but rotation "mmt" hits pos 3-5). Scorer ranks all candidates by confidence.
-        if len(first_letters) >= 3 and len(first_letters) <= 4:
+        if legacy_fallback and len(first_letters) >= 3 and len(first_letters) <= 4:
             ascii_rot = gurmukhi_to_ascii(first_letters)
             self._add_unique(
                 self._rotation_search(ascii_rot, max_results, "type_rotation"),
@@ -447,7 +754,8 @@ class OfflineShabadSearcher:
         # the transcript's real words survived among Whisper filler, even if the
         # resulting first-letters string is too noisy for prefix/contains search.
         if (
-            config.matcher.word_vote_enabled
+            legacy_fallback
+            and config.matcher.word_vote_enabled
             and transcript_text.strip()
         ):
             self._add_unique(
@@ -463,7 +771,7 @@ class OfflineShabadSearcher:
         # Whisper prepends an extra word (e.g. singing "ਤੇਰਾ ਮੋਹਿ..." before the tuk
         # starts at "ਮੋਹਿ" in the DB, so the full variant doesn't substring-match).
         # Only fires when the original query found few candidates.
-        if len(first_letters) >= 3:
+        if legacy_fallback and len(first_letters) >= 3:
             ascii_fl_ph = gurmukhi_to_ascii(first_letters)
             for variant in self._phonetic_variants(ascii_fl_ph):
                 self._add_unique(
@@ -493,7 +801,7 @@ class OfflineShabadSearcher:
         # Strategy 9: char 4-gram Unicode retrieval — catches end-fragment kirtan
         # patterns (ragi repeats 2nd half of a line) that are invisible to FL search.
         # Gated by config so it can be disabled if the index build cost is a concern.
-        if config.matcher.ngram4_search_enabled and transcript_text.strip():
+        if legacy_fallback and config.matcher.ngram4_search_enabled and transcript_text.strip():
             self._add_unique(
                 self._ngram4_search(transcript_text, config.matcher.ngram4_max_results, "ngram4"),
                 candidates,
@@ -534,7 +842,7 @@ class OfflineShabadSearcher:
             unicode_text = _to_unicode(row["gurmukhi_ascii"] or "")
             verses.append(
                 ShabadVerse(
-                    verse_id=0,
+                    verse_id=int(row["order_id"]),
                     unicode=unicode_text,
                     gurmukhi=row["gurmukhi_ascii"] or "",
                     english=row["english"] or "",
@@ -543,30 +851,13 @@ class OfflineShabadSearcher:
             )
         return verses
 
-    def _rotation_search(self, ascii_query: str, limit: int, signal: str) -> list[ShabadCandidate]:
-        """Try all cyclic rotations of a short (≤4 char) query as substring matches."""
-        results: list[ShabadCandidate] = []
-        seen_ids: set[int] = set()
-        seen_rotations: set[str] = {ascii_query}
-        q = ascii_query
-        for _ in range(len(q) - 1):
-            q = q[1:] + q[0]
-            if q in seen_rotations:
-                continue
-            seen_rotations.add(q)
-            for c in self._contains_search(q, limit, signal):
-                if c.shabad_id not in seen_ids:
-                    seen_ids.add(c.shabad_id)
-                    results.append(c)
-        return results
-
     def _prefix_search(self, ascii_query: str, limit: int, signal: str) -> list[ShabadCandidate]:
         """ASCII first-letter prefix match."""
         rows = self._conn.execute(
             _LINE_SELECT
-            +"""
+            +f"""
             AND l.first_letters LIKE ? || '%'
-            GROUP BY s.sttm_id
+            GROUP BY {_SHABAD_ID_EXPR}
             ORDER BY l.order_id
             LIMIT ?
             """,
@@ -578,203 +869,15 @@ class OfflineShabadSearcher:
         """ASCII first-letter contains match (broader)."""
         rows = self._conn.execute(
             _LINE_SELECT
-            +"""
+            +f"""
             AND l.first_letters LIKE '%' || ? || '%'
-            GROUP BY s.sttm_id
+            GROUP BY {_SHABAD_ID_EXPR}
             ORDER BY l.order_id
             LIMIT ?
             """,
             (ascii_query, limit),
         ).fetchall()
         return [self._row_to_candidate(r, signal) for r in rows]
-
-    def _multiline_search(
-        self, ascii_query: str, limit: int, signal: str
-    ) -> list[ShabadCandidate]:
-        """
-        Split a long first-letter query in half and require BOTH halves to hit
-        consecutive lines within the same shabad. Handles windows that span
-        multiple DB lines (dense nitnem text, fast kirtan).
-        """
-        if len(ascii_query) < 8:
-            return []
-
-        # Try a few split positions since we don't know exact word boundaries
-        # in the first-letter string.
-        mid = len(ascii_query) // 2
-        split_positions = {mid}
-        if mid > 3:
-            split_positions.add(mid - 1)
-            split_positions.add(mid + 1)
-
-        results: dict[int, sqlite3.Row] = {}
-        for split_at in sorted(split_positions):
-            head = ascii_query[:split_at]
-            tail = ascii_query[split_at:]
-            if len(head) < 3 or len(tail) < 3:
-                continue
-
-            # Self-join lines so each row pairs with its next-order sibling in
-            # the same shabad. Match head against line-N, tail against line-N+1.
-            rows = self._conn.execute(
-                f"""
-                SELECT
-                    l1.gurmukhi       AS gurmukhi_ascii,
-                    l2.gurmukhi       AS gurmukhi_ascii_next,
-                    l1.first_letters  AS first_letters,
-                    l1.order_id       AS order_id,
-                    l1.source_page    AS source_page,
-                    {_SHABAD_ID_EXPR} AS sttm_id,
-                    s.source_id       AS source_id,
-                    (
-                        SELECT t.translation FROM translations t
-                        WHERE t.line_id = l1.id AND t.translation_source_id = {_ENGLISH_TRANSLATION_SOURCE}
-                        LIMIT 1
-                    ) AS english
-                FROM lines l1
-                JOIN shabads s ON l1.shabad_id = s.id
-                JOIN lines l2
-                    ON l2.shabad_id = l1.shabad_id
-                    AND l2.order_id = l1.order_id + 1
-                WHERE l1.first_letters LIKE ? || '%'
-                  AND l2.first_letters LIKE ? || '%'
-                GROUP BY s.sttm_id
-                ORDER BY l1.order_id
-                LIMIT ?
-                """,
-                (head, tail, limit),
-            ).fetchall()
-
-            for row in rows:
-                # Keep the first hit per shabad (from the earliest split_at tried).
-                results.setdefault(row["sttm_id"], row)
-            if len(results) >= limit:
-                break
-
-        return [
-            self._row_to_multiline_candidate(r, signal)
-            for r in list(results.values())[:limit]
-        ]
-
-    def _multiline3_search(
-        self, ascii_query: str, limit: int, signal: str
-    ) -> list[ShabadCandidate]:
-        """3-way variant of `_multiline_search` for very fast / dense recitation.
-
-        Splits the query into THREE chunks and requires three consecutive lines
-        in the same shabad to each match one chunk. Fires alongside the 2-way
-        split when the query is long enough to plausibly span 3 lines.
-        """
-        if len(ascii_query) < 9:
-            return []
-
-        # Evenly trisect with small jitter — first-letter strings don't carry
-        # word boundaries so exact split positions are approximate.
-        third = len(ascii_query) // 3
-        split_pairs: set[tuple[int, int]] = set()
-        for a_off in (-1, 0, 1):
-            for b_off in (-1, 0, 1):
-                a = third + a_off
-                b = 2 * third + b_off
-                if a >= 3 and (b - a) >= 3 and (len(ascii_query) - b) >= 3:
-                    split_pairs.add((a, b))
-
-        results: dict[int, sqlite3.Row] = {}
-        for a, b in sorted(split_pairs):
-            part1 = ascii_query[:a]
-            part2 = ascii_query[a:b]
-            part3 = ascii_query[b:]
-            rows = self._conn.execute(
-                f"""
-                SELECT
-                    l1.gurmukhi       AS gurmukhi_ascii,
-                    l2.gurmukhi       AS gurmukhi_ascii_2,
-                    l3.gurmukhi       AS gurmukhi_ascii_3,
-                    l1.first_letters  AS first_letters,
-                    l1.order_id       AS order_id,
-                    l1.source_page    AS source_page,
-                    {_SHABAD_ID_EXPR} AS sttm_id,
-                    s.source_id       AS source_id,
-                    (
-                        SELECT t.translation FROM translations t
-                        WHERE t.line_id = l1.id AND t.translation_source_id = {_ENGLISH_TRANSLATION_SOURCE}
-                        LIMIT 1
-                    ) AS english
-                FROM lines l1
-                JOIN shabads s ON l1.shabad_id = s.id
-                JOIN lines l2
-                    ON l2.shabad_id = l1.shabad_id
-                    AND l2.order_id = l1.order_id + 1
-                JOIN lines l3
-                    ON l3.shabad_id = l1.shabad_id
-                    AND l3.order_id = l1.order_id + 2
-                WHERE l1.first_letters LIKE ? || '%'
-                  AND l2.first_letters LIKE ? || '%'
-                  AND l3.first_letters LIKE ? || '%'
-                GROUP BY s.sttm_id
-                ORDER BY l1.order_id
-                LIMIT ?
-                """,
-                (part1, part2, part3, limit),
-            ).fetchall()
-            for row in rows:
-                results.setdefault(row["sttm_id"], row)
-            if len(results) >= limit:
-                break
-
-        return [
-            self._row_to_multiline3_candidate(r, signal)
-            for r in list(results.values())[:limit]
-        ]
-
-    @staticmethod
-    def _row_to_multiline3_candidate(row: sqlite3.Row, signal: str) -> ShabadCandidate:
-        """Stitch all 3 matched lines into a single candidate for downstream scoring."""
-        ascii_parts = [
-            row["gurmukhi_ascii"] or "",
-            row["gurmukhi_ascii_2"] or "",
-            row["gurmukhi_ascii_3"] or "",
-        ]
-        combined_ascii = " ".join(p for p in ascii_parts if p).strip()
-        combined_unicode = " ".join(
-            _to_unicode(p) for p in ascii_parts if p
-        ).strip()
-        try:
-            db_source = row["source_id"]
-        except (IndexError, KeyError):
-            db_source = _SOURCE_SGGS
-        source_code = "G" if db_source == _SOURCE_SGGS else "D"
-        return ShabadCandidate(
-            shabad_id=row["sttm_id"],
-            gurmukhi=combined_ascii,
-            unicode=combined_unicode,
-            english=row["english"] or "",
-            source_id=source_code,
-            page_no=row["source_page"],
-            retrieval_sources={signal} if signal else set(),
-        )
-
-    @staticmethod
-    def _row_to_multiline_candidate(row: sqlite3.Row, signal: str) -> ShabadCandidate:
-        """
-        Build a candidate that carries BOTH matched lines' text, so the scorer's
-        letter-ratio and word-overlap logic can see the full query's worth of
-        content instead of only line N. Without this, a 12-letter query scored
-        against ~6 letters of line N gets penalized even on a perfect 2-line hit.
-        """
-        ascii_line1 = row["gurmukhi_ascii"] or ""
-        ascii_line2 = row["gurmukhi_ascii_next"] or ""
-        combined_ascii = f"{ascii_line1} {ascii_line2}".strip()
-        combined_unicode = f"{_to_unicode(ascii_line1)} {_to_unicode(ascii_line2)}".strip()
-        return ShabadCandidate(
-            shabad_id=row["sttm_id"],
-            gurmukhi=combined_ascii,
-            unicode=combined_unicode,
-            english=row["english"] or "",
-            source_id="G",
-            page_no=row["source_page"],
-            retrieval_sources={signal} if signal else set(),
-        )
 
     def _fullword_search(self, transcript_text: str, limit: int, signal: str) -> list[ShabadCandidate]:
         """Phrase search: match transcript words against Unicode Gurmukhi lines.
@@ -802,9 +905,9 @@ class OfflineShabadSearcher:
 
         rows = self._conn.execute(
             _LINE_SELECT
-            +"""
+            +f"""
             AND l.first_letters LIKE '%' || ? || '%'
-            GROUP BY s.sttm_id
+            GROUP BY {_SHABAD_ID_EXPR}
             ORDER BY l.order_id
             LIMIT ?
             """,
@@ -1048,3 +1151,12 @@ class OfflineShabadSearcher:
                     if c.word_vote_hits and not existing_c.word_vote_hits:
                         existing_c.word_vote_hits = c.word_vote_hits
                         existing_c.word_vote_score = c.word_vote_score
+                    if c.span_score is not None and (
+                        existing_c.span_score is None or c.span_score > existing_c.span_score
+                    ):
+                        existing_c.line_idx = c.line_idx
+                        existing_c.span_len = c.span_len
+                        existing_c.span_score = c.span_score
+                        existing_c.gurmukhi = c.gurmukhi
+                        existing_c.unicode = c.unicode
+                        existing_c.english = c.english

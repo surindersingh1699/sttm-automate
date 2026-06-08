@@ -1,5 +1,14 @@
 # Fine-Tuning Whisper for Gurbani Recognition
 
+> **Status (2026-05):** Whisper is no longer the **default** engine in
+> `sttm-automate` — the runtime now defaults to **IndicConformer-pa CTC**
+> (ONNX), with optional KenLM fusion. Whisper is preserved as a selectable
+> fallback engine in the dashboard. See [asr-engines.md](asr-engines.md) for
+> the current engine architecture. This guide remains the source of truth
+> for reproducing the `surt-small-v3` / `surt-small-turbo-baseline-v0`
+> Whisper fine-tunes used by the fallback path, and for any future
+> Whisper-based work.
+
 This guide covers how to fine-tune OpenAI's Whisper model on Gurbani audio data for improved kirtan recognition accuracy.
 
 ## Why Fine-Tune?

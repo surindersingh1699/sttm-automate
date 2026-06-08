@@ -27,8 +27,24 @@ from tests.eval.dataset import GroundTruthEvent, SessionDescriptor, gt_at
 @dataclass
 class LockMetrics:
     """Axis A: did we lock the right shabad, and how fast?"""
-    lock_accuracy_pct: float          # % of locked-time on correct shabad
+    lock_accuracy_pct: float          # % of locked-time on correct shabad (excludes unlocked time)
     lock_coverage_pct: float          # % of vocal GT time where any lock held
+    # ── real-world correctness view (user's 70% target) ───────────────
+    # locked_correct_pct: vocal time on CORRECT shabad. Target: ≥ 70%.
+    # locked_wrong_pct:   vocal time on a WRONG shabad — actively misleading
+    #                     on the projector, worse than nothing.
+    # unlocked_pct:       vocal time with no lock — inactive, not misleading.
+    # net_lock_score_pct: locked_correct_pct − locked_wrong_pct. Positive =
+    #                     net helpful; negative = net misleading. The single
+    #                     number that captures the wrong-lock penalty.
+    locked_correct_pct: float
+    locked_wrong_pct: float
+    unlocked_pct: float
+    net_lock_score_pct: float
+    # wrong_line_pct: vocal time where shabad is RIGHT but line is > ±1 off
+    # GT — i.e. correct shabad, wrong pointer. The "wrong pointer move"
+    # penalty term.
+    wrong_line_pct: float
     ttfcl_s: float | None             # time-to-first-correct-lock from shabad start
     wrong_first_lock: bool            # did we lock a wrong shabad first?
     wrong_first_lock_duration_s: float | None
@@ -133,7 +149,10 @@ def score_lock(events: list[dict], session: SessionDescriptor) -> LockMetrics:
     vocal_gt = session.vocal_gt
     if not vocal_gt:
         return LockMetrics(
-            lock_accuracy_pct=0, lock_coverage_pct=0, ttfcl_s=None,
+            lock_accuracy_pct=0, lock_coverage_pct=0,
+            locked_correct_pct=0, locked_wrong_pct=0,
+            unlocked_pct=0, net_lock_score_pct=0, wrong_line_pct=0,
+            ttfcl_s=None,
             wrong_first_lock=False, wrong_first_lock_duration_s=None,
             never_locked=True, total_shabads=0,
         )
@@ -164,6 +183,40 @@ def score_lock(events: list[dict], session: SessionDescriptor) -> LockMetrics:
 
     lock_accuracy = round(locked_correct / locked_any * 100, 1) if locked_any else 0.0
     lock_coverage = round(locked_any / total_vocal * 100, 1) if total_vocal else 0.0
+    # Locked-wrong: vocal events where a lock was held but on the wrong shabad.
+    locked_wrong = locked_any - locked_correct
+    locked_correct_pct = (
+        round(locked_correct / total_vocal * 100, 1) if total_vocal else 0.0
+    )
+    locked_wrong_pct = (
+        round(locked_wrong / total_vocal * 100, 1) if total_vocal else 0.0
+    )
+    unlocked_pct = round(100.0 - lock_coverage, 1) if total_vocal else 100.0
+    # Net score: reward correct locks, penalise wrong locks. Unlocked is
+    # neutral (inactive, not misleading). Range: −100 to +100.
+    net_lock_score_pct = round(locked_correct_pct - locked_wrong_pct, 1)
+
+    # Wrong-pointer-move penalty: vocal events where shabad lock IS correct
+    # but the displayed line is more than ±1 off the GT line. Needs the
+    # line_aligned / line_update event stream — keeps line metric and lock
+    # metric in their own functions but the "right shabad, wrong line"
+    # number belongs alongside the lock numbers because it's the projector's
+    # other failure mode the user worries about.
+    line_events_for_penalty = _events_of_type(events, "line_aligned", "line_update")
+    wrong_line_count = 0
+    for gt_ev in vocal_gt:
+        mid_t = (gt_ev.start_s + gt_ev.end_s) / 2
+        locked_sid = _locked_shabad_at(lock_events, mid_t)
+        if locked_sid != gt_ev.shabad_id:
+            continue  # only relevant when shabad is correct
+        pipe_line = _current_line_at(line_events_for_penalty, mid_t)
+        if pipe_line is None:
+            continue
+        if abs(pipe_line - gt_ev.line_idx_in_shabad) > 1:
+            wrong_line_count += 1
+    wrong_line_pct = (
+        round(wrong_line_count / total_vocal * 100, 1) if total_vocal else 0.0
+    )
 
     # --- time to first correct lock per primary shabad ---
     primary_shabad = gt_shabads[0] if gt_shabads else None
@@ -208,6 +261,11 @@ def score_lock(events: list[dict], session: SessionDescriptor) -> LockMetrics:
     return LockMetrics(
         lock_accuracy_pct=lock_accuracy,
         lock_coverage_pct=lock_coverage,
+        locked_correct_pct=locked_correct_pct,
+        locked_wrong_pct=locked_wrong_pct,
+        unlocked_pct=unlocked_pct,
+        net_lock_score_pct=net_lock_score_pct,
+        wrong_line_pct=wrong_line_pct,
         ttfcl_s=ttfcl,
         wrong_first_lock=wrong_first,
         wrong_first_lock_duration_s=wrong_dur,
@@ -464,6 +522,11 @@ class AggregateKPIs:
     # Axis A — Lock
     median_lock_accuracy_pct: float
     median_lock_coverage_pct: float
+    # Real-world correctness view (user's 70% target). See LockMetrics docstring.
+    median_locked_correct_pct: float
+    median_locked_wrong_pct: float
+    median_net_lock_score_pct: float
+    median_wrong_line_pct: float
     p50_ttfcl_s: float | None
     p90_ttfcl_s: float | None
     wrong_first_lock_rate_pct: float
@@ -499,6 +562,8 @@ def aggregate_sessions(metrics_list: list[SessionMetrics], mode: str = "headless
         return AggregateKPIs(
             total_sessions=0, mode=mode, total_duration_s=0,
             median_lock_accuracy_pct=0, median_lock_coverage_pct=0,
+            median_locked_correct_pct=0, median_locked_wrong_pct=0,
+            median_net_lock_score_pct=0, median_wrong_line_pct=0,
             p50_ttfcl_s=None, p90_ttfcl_s=None,
             wrong_first_lock_rate_pct=0, never_locked_rate_pct=0,
             total_gt_transitions=0, overall_detection_rate_pct=0,
@@ -544,6 +609,10 @@ def aggregate_sessions(metrics_list: list[SessionMetrics], mode: str = "headless
 
         median_lock_accuracy_pct=round(statistics.median([m.lock.lock_accuracy_pct for m in metrics_list]), 1),
         median_lock_coverage_pct=round(statistics.median([m.lock.lock_coverage_pct for m in metrics_list]), 1),
+        median_locked_correct_pct=round(statistics.median([m.lock.locked_correct_pct for m in metrics_list]), 1),
+        median_locked_wrong_pct=round(statistics.median([m.lock.locked_wrong_pct for m in metrics_list]), 1),
+        median_net_lock_score_pct=round(statistics.median([m.lock.net_lock_score_pct for m in metrics_list]), 1),
+        median_wrong_line_pct=round(statistics.median([m.lock.wrong_line_pct for m in metrics_list]), 1),
         p50_ttfcl_s=_med(ttfcl_all),
         p90_ttfcl_s=_p90(ttfcl_all),
         wrong_first_lock_rate_pct=round(wrong_first / total * 100, 1),
@@ -583,12 +652,16 @@ def print_kpis(kpis: AggregateKPIs):
     print(bar)
 
     print("\n  ── A. LOCK THE RIGHT SHABAD ────────────────────────────────")
-    print(f"  Lock accuracy (median):   {kpis.median_lock_accuracy_pct}%")
-    print(f"  Lock coverage (median):   {kpis.median_lock_coverage_pct}%")
-    print(f"  Time-to-correct-lock P50: {_f(kpis.p50_ttfcl_s)}")
-    print(f"  Time-to-correct-lock P90: {_f(kpis.p90_ttfcl_s)}")
-    print(f"  Wrong-first-lock rate:    {kpis.wrong_first_lock_rate_pct}%")
-    print(f"  Never-locked rate:        {kpis.never_locked_rate_pct}%")
+    print(f"  ★ Locked-correct % (≥70 goal):  {kpis.median_locked_correct_pct}%")
+    print(f"    Locked-wrong %  (penalised):  {kpis.median_locked_wrong_pct}%")
+    print(f"    Wrong-line % (right shabad):  {kpis.median_wrong_line_pct}%")
+    print(f"    Net lock score (correct−wrong): {kpis.median_net_lock_score_pct}%")
+    print(f"  Lock accuracy (given locked):   {kpis.median_lock_accuracy_pct}%")
+    print(f"  Lock coverage:                  {kpis.median_lock_coverage_pct}%")
+    print(f"  Time-to-correct-lock P50:       {_f(kpis.p50_ttfcl_s)}")
+    print(f"  Time-to-correct-lock P90:       {_f(kpis.p90_ttfcl_s)}")
+    print(f"  Wrong-first-lock rate:          {kpis.wrong_first_lock_rate_pct}%")
+    print(f"  Never-locked rate:              {kpis.never_locked_rate_pct}%")
 
     print("\n  ── B. RE-LOCK ON TRANSITION ────────────────────────────────")
     print(f"  GT transitions:           {kpis.total_gt_transitions}")

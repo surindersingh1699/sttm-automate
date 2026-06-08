@@ -20,6 +20,16 @@ data/surt-small-turbo-baseline-v0*.ggml
 data/_baseline-v0-source/
 data/_whisper_cpp_assets/
 
+# IndicConformer artifacts (ONNX bundles + NeMo checkpoints + caches)
+data/_onnx_cache/
+data/_nemo_cache/
+data/*.nemo
+
+# KenLM language model (large binary, downloaded/copied on demand)
+models/lm/*.bin
+# SentencePiece tokenizer required for in-beam BPE LM fusion
+models/onnx/*.model
+
 # FAISS / vector indexes (large binaries, rebuilt on demand)
 index/
 

@@ -53,3 +53,7 @@ class MockSTTMController(STTMController):
     async def navigate_line(self, direction: str = "next") -> bool:
         self._record("navigate_line", direction=direction)
         return True
+
+    async def navigate_to_line(self, target_idx: int) -> bool:
+        self._record("navigate_to_line", target_idx=target_idx)
+        return True

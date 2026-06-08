@@ -19,6 +19,13 @@ let audioWs = null;
 let audioContext = null;
 let audioStream = null;
 let audioProcessor = null;
+// Gutka follow-along mode state.
+let appMode = "live";              // "live" | "gutka"
+let gutkaBaniId = null;            // SQLite banis.id (1-29)
+let gutkaBidirectional = false;
+let gutkaLines = [];               // [{unicode, english}, ...]
+let availableBanis = [];           // [{sqlite_id, name_gurmukhi, name_english, line_count}, ...]
+let gutkaBaniDropdownPopulated = false;
 const DASHBOARD_STATE_KEY = "sttm_automate_dashboard_state_v1";
 
 // --- Safe DOM Helpers ---
@@ -201,10 +208,34 @@ function handleMessage(data) {
             if (Object.prototype.hasOwnProperty.call(data, "hf_model_id")) {
                 updateWhisperModel(data.hf_model_id);
             }
+            if (Object.prototype.hasOwnProperty.call(data, "onnx_precision")) {
+                updateIndicPrecision(data.onnx_precision);
+            }
+            if (Object.prototype.hasOwnProperty.call(data, "lm_enabled")) {
+                updateLmEnabled(data.lm_enabled);
+            }
             // REA-10 streaming settings — sync UI from the canonical blob so a page
             // reload restores whatever was persisted in .runtime_settings.json.
             if (data.streaming_settings) {
                 updateStreamingSettings(data.streaming_settings);
+            }
+            // Gutka mode init: pick up available_banis + current bani state
+            // from the handshake. When in gutka mode, the gutka pankti panel
+            // owns the verse list — skip the live-mode pipeline_state branch
+            // below so it doesn't wipe the bani's lines.
+            if (Array.isArray(data.available_banis)) {
+                availableBanis = data.available_banis;
+                gutkaBaniDropdownPopulated = false;
+            }
+            if (
+                Object.prototype.hasOwnProperty.call(data, "app_mode")
+                || Object.prototype.hasOwnProperty.call(data, "gutka_lines")
+                || Object.prototype.hasOwnProperty.call(data, "gutka_bani_id")
+            ) {
+                applyGutkaStateFromPayload(data);
+            }
+            if (appMode === "gutka") {
+                break;
             }
             if (data.pipeline_state === "searching" || data.pipeline_state === "candidate_lock") {
                 if (currentVerses.length > 0) {
@@ -255,6 +286,9 @@ function handleMessage(data) {
         case "mic_muted_updated":
             updateMicMuted(data.muted);
             break;
+        case "lm_enabled_updated":
+            updateLmEnabled(data.lm_enabled);
+            break;
         case "decoder_toggles_updated":
             if (data.toggles) {
                 if (Object.prototype.hasOwnProperty.call(data.toggles, "fast_response_enabled")) {
@@ -279,6 +313,8 @@ function handleMessage(data) {
             updateWhisperEngine(data.engine);
             var esel = document.getElementById("whisper-engine");
             if (esel) esel.disabled = false;
+            var ipSel = document.getElementById("indic-precision");
+            if (ipSel) ipSel.disabled = false;
             setEngineStatus("Ready: " + data.engine);
             setTimeout(function() { setEngineStatus(""); }, 3000);
             break;
@@ -286,7 +322,21 @@ function handleMessage(data) {
         case "engine_update_failed": {
             var fsel = document.getElementById("whisper-engine");
             if (fsel) fsel.disabled = false;
+            var fpSel = document.getElementById("indic-precision");
+            if (fpSel) fpSel.disabled = false;
             if (data.current_engine) updateWhisperEngine(data.current_engine);
+            setEngineStatus("Failed: " + (data.error || "unknown error"));
+            break;
+        }
+        case "precision_updated":
+            updateIndicPrecision(data.precision);
+            setEngineStatus("Ready: " + data.precision);
+            setTimeout(function() { setEngineStatus(""); }, 3000);
+            break;
+        case "precision_update_failed": {
+            var pSel = document.getElementById("indic-precision");
+            if (pSel) pSel.disabled = false;
+            if (data.current_precision) updateIndicPrecision(data.current_precision);
             setEngineStatus("Failed: " + (data.error || "unknown error"));
             break;
         }
@@ -295,16 +345,31 @@ function handleMessage(data) {
             break;
         case "model_updated": {
             updateWhisperModel(data.model_id);
+            if (data.engine) updateWhisperEngine(data.engine);
+            if (data.decoder_toggles) {
+                if (Object.prototype.hasOwnProperty.call(data.decoder_toggles, "hallucination_guards")) {
+                    updateHallucinationGuards(data.decoder_toggles.hallucination_guards);
+                }
+                if (Object.prototype.hasOwnProperty.call(data.decoder_toggles, "zero_overlap_window")) {
+                    updateZeroOverlapWindow(data.decoder_toggles.zero_overlap_window);
+                }
+            }
+            if (data.streaming_settings) updateStreamingSettings(data.streaming_settings);
             var msel = document.getElementById("whisper-model");
+            var imsel = document.getElementById("indic-model");
             if (msel) msel.disabled = false;
+            if (imsel) imsel.disabled = false;
             setModelStatus("Ready: " + data.model_id);
             setTimeout(function() { setModelStatus(""); }, 3000);
             break;
         }
         case "model_update_failed": {
             var mfsel = document.getElementById("whisper-model");
+            var ifsel = document.getElementById("indic-model");
             if (mfsel) mfsel.disabled = false;
+            if (ifsel) ifsel.disabled = false;
             if (data.current_model_id) updateWhisperModel(data.current_model_id);
+            if (data.current_engine) updateWhisperEngine(data.current_engine);
             setModelStatus("Failed: " + (data.error || "unknown error"));
             break;
         }
@@ -325,6 +390,27 @@ function handleMessage(data) {
         case "audio_level":
             updateAudioLevel(data.rms, data.has_vocals);
             break;
+        case "app_mode_updated":
+            applyGutkaStateFromPayload(data);
+            break;
+        case "gutka_bani_updated":
+            applyGutkaStateFromPayload(data);
+            break;
+        case "gutka_direction_updated":
+            if (Object.prototype.hasOwnProperty.call(data, "gutka_bidirectional")) {
+                gutkaBidirectional = !!data.gutka_bidirectional;
+                var dirEl = document.getElementById("gutka-bidirectional");
+                if (dirEl) dirEl.checked = gutkaBidirectional;
+            }
+            break;
+        case "gutka_line_aligned":
+            // Aligner emits this every window with its current position (and
+            // action: advance / repeat / back / hold). Drive the pankti
+            // highlight from current_idx so the dashboard mirrors STTM.
+            if (Number.isInteger(data.bani_line_idx) && gutkaLines.length > 0) {
+                highlightPangati(data.bani_line_idx);
+            }
+            break;
         case "error":
             showError(data.message);
             break;
@@ -334,6 +420,96 @@ function handleMessage(data) {
             }
             break;
     }
+}
+
+// --- Gutka mode senders + UI helpers ---
+
+function setAppMode(mode) {
+    if (mode !== "live" && mode !== "gutka") return;
+    appMode = mode;
+    applyGutkaVisibility();
+    send({ type: "set_app_mode", mode: mode });
+}
+
+function setGutkaBani(value) {
+    var id = value === "" || value === null ? null : parseInt(value, 10);
+    if (Number.isNaN(id)) id = null;
+    gutkaBaniId = id;
+    send({ type: "set_gutka_bani", sqlite_bani_id: id });
+}
+
+function setGutkaDirection(checked) {
+    gutkaBidirectional = !!checked;
+    send({ type: "set_gutka_direction", bidirectional: gutkaBidirectional });
+}
+
+function populateGutkaBaniDropdown() {
+    var sel = document.getElementById("gutka-bani");
+    if (!sel || !availableBanis || availableBanis.length === 0) return;
+    if (gutkaBaniDropdownPopulated) return;
+    // Wipe existing options except the placeholder, then inject one per bani.
+    clearChildren(sel);
+    sel.appendChild(createElement("option", null, "— Pick a bani —")).value = "";
+    availableBanis.forEach(function(b) {
+        var opt = createElement(
+            "option",
+            null,
+            (b.name_gurmukhi || b.name_english) +
+                "  (" + b.name_english + ", " + b.line_count + " lines)"
+        );
+        opt.value = String(b.sqlite_id);
+        sel.appendChild(opt);
+    });
+    if (gutkaBaniId !== null) sel.value = String(gutkaBaniId);
+    gutkaBaniDropdownPopulated = true;
+}
+
+function applyGutkaVisibility() {
+    var isGutka = appMode === "gutka";
+    var picker = document.getElementById("gutka-bani");
+    var dirWrap = document.getElementById("gutka-direction-wrap");
+    if (picker) picker.hidden = !isGutka;
+    if (dirWrap) dirWrap.hidden = !isGutka;
+    var liveRadio = document.getElementById("app-mode-live");
+    var gutkaRadio = document.getElementById("app-mode-gutka");
+    if (liveRadio) liveRadio.checked = !isGutka;
+    if (gutkaRadio) gutkaRadio.checked = isGutka;
+}
+
+function applyGutkaStateFromPayload(data) {
+    if (Object.prototype.hasOwnProperty.call(data, "app_mode")) {
+        appMode = data.app_mode === "gutka" ? "gutka" : "live";
+    }
+    if (Object.prototype.hasOwnProperty.call(data, "gutka_bani_id")) {
+        gutkaBaniId = data.gutka_bani_id == null ? null : parseInt(data.gutka_bani_id, 10);
+    }
+    if (Object.prototype.hasOwnProperty.call(data, "gutka_bidirectional")) {
+        gutkaBidirectional = !!data.gutka_bidirectional;
+    }
+    if (Array.isArray(data.gutka_lines)) {
+        gutkaLines = data.gutka_lines;
+        // Render the whole bani in the pankti panel so the user sees the
+        // gutka "page" with the current line highlighted. Reuses the
+        // existing renderer — gutka_lines have the same {unicode, english}
+        // shape as the open-ended verses payload.
+        if (gutkaLines.length > 0) {
+            currentVerses = gutkaLines;
+            currentLineIndex = Number.isInteger(data.gutka_current_idx)
+                ? data.gutka_current_idx
+                : 0;
+            currentShabadId = null;
+            renderPangati();
+            highlightPangati(currentLineIndex);
+        } else if (appMode === "gutka") {
+            clearPangati();
+        }
+    }
+    populateGutkaBaniDropdown();
+    var sel = document.getElementById("gutka-bani");
+    if (sel) sel.value = gutkaBaniId == null ? "" : String(gutkaBaniId);
+    var dir = document.getElementById("gutka-bidirectional");
+    if (dir) dir.checked = gutkaBidirectional;
+    applyGutkaVisibility();
 }
 
 // --- Tab switching ---
@@ -847,13 +1023,36 @@ function loadAudioDevices() {
             autoOpt.textContent = "Auto (Default Mic)";
             select.appendChild(autoOpt);
 
+            // Split into Microphones vs System Audio (loopback) groups so users
+            // can pick whatever is playing on the Mac without hunting through a
+            // flat list. Loopback entries require BlackHole or similar — see
+            // scripts/setup_audio.py.
+            var mics = [];
+            var loopbacks = [];
             data.devices.forEach(function(dev) {
+                (dev.kind === "loopback" ? loopbacks : mics).push(dev);
+            });
+
+            function addDeviceOption(parent, dev) {
                 var opt = document.createElement("option");
                 opt.value = dev.index;
                 opt.textContent = dev.name;
                 if (dev.default) opt.textContent += " (Default)";
-                select.appendChild(opt);
-            });
+                parent.appendChild(opt);
+            }
+
+            if (mics.length) {
+                var micGroup = document.createElement("optgroup");
+                micGroup.label = "Microphones";
+                mics.forEach(function(dev) { addDeviceOption(micGroup, dev); });
+                select.appendChild(micGroup);
+            }
+            if (loopbacks.length) {
+                var loopGroup = document.createElement("optgroup");
+                loopGroup.label = "System Audio (loopback)";
+                loopbacks.forEach(function(dev) { addDeviceOption(loopGroup, dev); });
+                select.appendChild(loopGroup);
+            }
 
             // Set current selection
             if (audioDevice !== null) {
@@ -942,19 +1141,126 @@ function setZeroOverlapWindow(enabled) {
     send({ type: "set_decoder_toggles", toggles: { zero_overlap_window: !!enabled } });
 }
 
-// --- Whisper engine selector ---
+// --- Engine selector (Whisper + Indic share a status; family toggle swaps which dropdown is visible) ---
+
+var INDIC_ENGINE_NAMES = ["indicconformer"];
+var LOCAL_WHISPER_MODELS_ENABLED = false;
+
+function familyForEngine(name) {
+    return INDIC_ENGINE_NAMES.indexOf(name) >= 0 ? "indicconformer" : "whisper";
+}
+
+function applyFamilyVisibility(family) {
+    if (!LOCAL_WHISPER_MODELS_ENABLED && family !== "indicconformer") {
+        family = "indicconformer";
+    }
+    var isIndic = family === "indicconformer";
+    var byId = function(id) { return document.getElementById(id); };
+    var we = byId("whisper-engine"); var ip = byId("indic-precision");
+    var wm = byId("whisper-model");  var im = byId("indic-model");
+    var ww = byId("family-whisper-wrap");
+    if (ww) ww.hidden = !LOCAL_WHISPER_MODELS_ENABLED;
+    if (we) we.hidden = isIndic;
+    if (ip) ip.hidden = !isIndic;
+    if (wm) wm.hidden = isIndic;
+    if (im) im.hidden = !isIndic;
+    // KenLM toggle only makes sense for IndicConformer — Whisper has no CTC
+    // beam hook for shallow fusion. Hide the checkbox under Whisper family.
+    var lmw = byId("lm-toggle-wrap");
+    if (lmw) lmw.hidden = !isIndic;
+    // Whisper-only decoder toggles — hide them when Indic is active. They
+    // do nothing for the NeMo backend.
+    var whisperToggleIds = [
+        "hallucination-guards", "zero-overlap-window", "locked-prompt-anchor",
+    ];
+    whisperToggleIds.forEach(function(id) {
+        var el = byId(id); if (!el || !el.parentNode) return;
+        el.parentNode.style.display = isIndic ? "none" : "";
+    });
+    // Streaming-mode + dedup-strategy dropdowns — IndicConformer is decoded
+    // per VAD utterance with no inter-window dedup. Backend forces those
+    // values whenever the indic engine is active, so showing the dropdowns
+    // would just let the user pick something we'll ignore.
+    ["streaming-mode", "dedup-strategy"].forEach(function(id) {
+        var el = byId(id); if (!el) return;
+        el.hidden = isIndic;
+    });
+    // Sync the radio buttons so server-driven family changes update the UI.
+    var rw = byId("family-whisper"); var ri = byId("family-indic");
+    if (rw) rw.checked = !isIndic;
+    if (ri) ri.checked = isIndic;
+}
+
+function setModelFamily(family) {
+    if (!LOCAL_WHISPER_MODELS_ENABLED && family !== "indicconformer") {
+        setModelStatus("Whisper comparison is available in the Hugging Face demo; live mode stays on Indic.");
+        applyFamilyVisibility("indicconformer");
+        return;
+    }
+    applyFamilyVisibility(family);
+    // Switch to the family default. The server selects the compatible engine
+    // and reloads it with the new model in one serialized operation.
+    if (family === "indicconformer") {
+        send({ type: "set_model", model_id: "surindersinghssj/indicconformer-pa-v3-kirtan" });
+    } else {
+        send({ type: "set_model", model_id: "surindersinghssj/surt-small-v3" });
+    }
+}
 
 function updateWhisperEngine(name) {
-    var sel = document.getElementById("whisper-engine");
-    if (sel && name) sel.value = name;
+    var family = familyForEngine(name);
+    applyFamilyVisibility(family);
+    if (family === "whisper") {
+        var sel = document.getElementById("whisper-engine");
+        if (sel && name) sel.value = name;
+    }
     setEngineStatus("");
 }
 
 function setWhisperEngine(name) {
     setEngineStatus("Loading " + name + "…");
-    var sel = document.getElementById("whisper-engine");
-    if (sel) sel.disabled = true;
+    var family = familyForEngine(name);
+    if (family === "whisper") {
+        var sel = document.getElementById("whisper-engine");
+        if (sel) sel.disabled = true;
+    } else {
+        var ip = document.getElementById("indic-precision");
+        if (ip) ip.disabled = true;
+    }
     send({ type: "set_engine", engine: name });
+}
+
+// --- IndicConformer ONNX precision selector ---
+
+function setIndicPrecision(precision) {
+    setEngineStatus("Loading " + precision + "…");
+    var ip = document.getElementById("indic-precision");
+    if (ip) ip.disabled = true;
+    send({ type: "set_precision", precision: precision });
+}
+
+// --- KenLM Gurbani LM pair toggle (IndicConformer only) ---
+
+function setLmEnabled(checked) {
+    var cb = document.getElementById("lm-enabled");
+    if (cb) cb.disabled = true;
+    send({ type: "set_lm_enabled", enabled: !!checked });
+}
+
+function updateLmEnabled(enabled) {
+    var cb = document.getElementById("lm-enabled");
+    if (!cb) return;
+    cb.disabled = false;
+    cb.checked = !!enabled;
+}
+
+function updateIndicPrecision(precision) {
+    var ip = document.getElementById("indic-precision");
+    if (ip) {
+        ip.disabled = false;
+        if (precision) ip.value = precision;
+    }
+    setEngineStatus("");
 }
 
 function setEngineStatus(text) {
@@ -965,14 +1271,18 @@ function setEngineStatus(text) {
 // --- Whisper model selector ---
 
 function updateWhisperModel(modelId) {
-    var sel = document.getElementById("whisper-model");
-    if (sel && modelId) sel.value = modelId;
+    if (!modelId) { setModelStatus(""); return; }
+    var isIndic = /indicconformer/i.test(modelId);
+    applyFamilyVisibility(isIndic ? "indicconformer" : "whisper");
+    var sel = document.getElementById(isIndic ? "indic-model" : "whisper-model");
+    if (sel) sel.value = modelId;
     setModelStatus("");
 }
 
 function setWhisperModel(modelId) {
     setModelStatus("Loading " + modelId + "…");
-    var sel = document.getElementById("whisper-model");
+    var isIndic = /indicconformer/i.test(modelId);
+    var sel = document.getElementById(isIndic ? "indic-model" : "whisper-model");
     if (sel) sel.disabled = true;
     send({ type: "set_model", model_id: modelId });
 }

@@ -11,9 +11,28 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from src.config import config
-from src.controller.sttm_http import STTMHttpController
+from src.controller.sttm_http import STTMHttpController, _SQLITE_TO_REALM_BANI
+from src.matcher.bani_loader import list_available_banis
 from src.pipeline.orchestrator import PipelineOrchestrator
-from src.transcription.factory import SUPPORTED_ENGINES
+from src.transcription.factory import (
+    INDIC_ENGINES,
+    SUPPORTED_ENGINES,
+    WHISPER_ENGINES,
+    pin_indic_best_settings,
+)
+
+
+def _available_banis_payload() -> list[dict]:
+    """Bani picker options for the dashboard — restricted to banis we can
+    actually display in STTM (i.e. present in ``_SQLITE_TO_REALM_BANI``).
+    Banis without a Realm equivalent (Asa Ki Var, Alahnia, Mundavnni) are
+    silently dropped so the picker can't select something that won't work.
+    """
+    try:
+        return list_available_banis(sorted(_SQLITE_TO_REALM_BANI.keys()))
+    except Exception as e:
+        print(f"[Server] Failed to load available banis: {e}")
+        return []
 
 # Connected WebSocket clients
 clients: list[WebSocket] = []
@@ -26,6 +45,11 @@ eval_manager = None
 runtime_settings_path = Path(__file__).parent.parent.parent / ".runtime_settings.json"
 confidence_mode = "balanced"
 mic_muted_pref = False
+# Gutka mode preferences loaded from .runtime_settings.json before the
+# pipeline exists; applied to the orchestrator in the lifespan startup.
+_restore_app_mode: str = "live"
+_restore_gutka_bani_id: int | None = None
+_restore_gutka_bidirectional: bool = False
 
 
 # Maps each wire toggle key to the config section that owns it. Keeps the
@@ -41,6 +65,8 @@ TOGGLE_SECTIONS: dict[str, str] = {
     "multi_line_search": "matcher",
     "multi_line_locked_align": "matcher",
     "fast_response_enabled": "matcher",
+    "indic_asr_confidence_enabled": "matcher",
+    "learned_ranker_enabled": "matcher",
     "zero_overlap_window": "audio",
 }
 DECODER_TOGGLE_KEYS = tuple(TOGGLE_SECTIONS.keys())
@@ -63,7 +89,7 @@ STREAMING_KEYS: tuple[str, ...] = (
     "dedup_strategy",
     "locked_prompt_anchor",
 )
-_STREAMING_MODE_VALUES = ("naive", "vad_segmented", "local_agreement", "hybrid")
+_STREAMING_MODE_VALUES = ("naive", "vad_segmented", "local_agreement", "hybrid", "nemo_chunked")
 _VAD_BACKEND_VALUES = ("kirtan", "silero")
 _DEDUP_STRATEGY_VALUES = ("text", "audio_time", "none")
 
@@ -72,8 +98,40 @@ def get_streaming_settings() -> dict:
     return {key: getattr(config.streaming, key) for key in STREAMING_KEYS}
 
 
+# Settings that have no effect under IndicConformer. The pipeline pins each
+# of these to a fixed value when the indic engine is active (see
+# ``PipelineOrchestrator.switch_engine``); accepting user overrides would
+# just let stale UI state silently drift away from what's actually running.
+_INDIC_LOCKED_STREAMING_KEYS = frozenset({
+    # streaming_mode used to be pinned, but Indic now supports two valid
+    # choices (vad_segmented and nemo_chunked). Let the operator pick.
+    "dedup_strategy",
+    "locked_prompt_anchor",
+})
+_INDIC_LOCKED_DECODER_KEYS = frozenset({
+    "hallucination_guards",
+    "zero_overlap_window",
+})
+
+
+def _is_indic_engine_active() -> bool:
+    return config.whisper.engine in INDIC_ENGINES
+
+
+def _is_model_selectable(model_id: str) -> bool:
+    """Return whether the dashboard may switch to this model in live use."""
+    # Whisper checkpoints remain in config for offline experiments, but the
+    # local live dashboard should not switch to them: unlike the HF demo Space,
+    # this app has no ZeroGPU/H200 path, so local Whisper is slow/brittle.
+    return config.whisper.model_family(model_id) == "indicconformer"
+
+
 def _apply_streaming_setting(key: str, value) -> None:
     if key not in STREAMING_KEYS:
+        return
+    # Refuse no-op overrides on Indic — keeps the persisted runtime settings
+    # honest about what's actually in effect.
+    if _is_indic_engine_active() and key in _INDIC_LOCKED_STREAMING_KEYS:
         return
     # Enum-typed fields — reject unknown values rather than silently corrupting state.
     if key == "streaming_mode" and value not in _STREAMING_MODE_VALUES:
@@ -111,6 +169,8 @@ def _apply_decoder_toggle(key: str, value: bool) -> None:
     section = TOGGLE_SECTIONS.get(key)
     if section is None:
         return
+    if _is_indic_engine_active() and key in _INDIC_LOCKED_DECODER_KEYS:
+        return
     setattr(getattr(config, section), key, bool(value))
 
 
@@ -125,7 +185,7 @@ def load_runtime_settings():
             value = data["controller_pin"]
             config.sttm.controller_pin = int(value) if value not in (None, "") else None
         mode = data.get("confidence_mode", "balanced")
-        confidence_mode = mode if mode in ("conservative", "balanced", "fast", "gurudwara") else "balanced"
+        confidence_mode = mode if mode in ("conservative", "balanced", "fast", "gurudwara", "indic_fast") else "balanced"
         if "audio_device" in data:
             dev = data["audio_device"]
             config.audio.device = int(dev) if dev is not None else None
@@ -147,8 +207,42 @@ def load_runtime_settings():
             mid = data["hf_model_id"]
             if isinstance(mid, str) and mid in config.whisper.available_models:
                 config.whisper.apply_model_id(mid)
+        if "onnx_precision" in data:
+            prec = data["onnx_precision"]
+            if isinstance(prec, str) and prec in config.whisper.available_precisions:
+                config.whisper.onnx_precision = prec
+        if "lm_enabled" in data:
+            config.whisper.lm_enabled = bool(data["lm_enabled"])
+        # Migrate legacy ("indicconformer-rnnt"|"indicconformer-ctc") engine
+        # names from older runtime settings to the unified "indicconformer".
+        if config.whisper.engine in ("indicconformer-rnnt", "indicconformer-ctc"):
+            config.whisper.engine = "indicconformer"
+        # Live dashboard policy: always boot into the known-good local ASR
+        # path. Whisper remains useful for the separate HF demo / experiments,
+        # but local dashboard switching to Whisper can leave the live pipeline
+        # unusably slow or broken.
+        if not _is_model_selectable(config.whisper.hf_model_id):
+            config.whisper.apply_model_id("surindersinghssj/indicconformer-pa-v3-kirtan")
+        if config.whisper.model_family() == "indicconformer":
+            config.whisper.engine = INDIC_ENGINES[0]
         if "mic_muted" in data:
             mic_muted_pref = bool(data["mic_muted"])
+        # Gutka mode state (app_mode + bani picker + alignment direction).
+        # Re-applied to the pipeline in the lifespan startup, after the
+        # PipelineOrchestrator is constructed.
+        global _restore_app_mode, _restore_gutka_bani_id, _restore_gutka_bidirectional
+        if "app_mode" in data and data["app_mode"] in ("live", "gutka"):
+            _restore_app_mode = data["app_mode"]
+        if "gutka_bani_id" in data:
+            gid = data["gutka_bani_id"]
+            _restore_gutka_bani_id = int(gid) if isinstance(gid, int) else None
+        if "gutka_bidirectional" in data:
+            _restore_gutka_bidirectional = bool(data["gutka_bidirectional"])
+        # If a stale runtime config left Indic-incompatible knobs on, fix
+        # them now — before the pipeline reads any of these. Acts on the
+        # post-load engine value so this also covers `engine` overrides
+        # earlier in this same call.
+        pin_indic_best_settings()
     except Exception as e:
         print(f"[Server] Could not load runtime settings: {e}")
 
@@ -163,7 +257,16 @@ def save_runtime_settings():
         "streaming": get_streaming_settings(),
         "engine": config.whisper.engine,
         "hf_model_id": config.whisper.hf_model_id,
+        "onnx_precision": config.whisper.onnx_precision,
+        "lm_enabled": config.whisper.lm_enabled,
         "mic_muted": bool(pipeline.mic_muted) if pipeline else mic_muted_pref,
+        "app_mode": pipeline._app_mode if pipeline else _restore_app_mode,
+        "gutka_bani_id": (
+            pipeline._gutka_bani_id if pipeline else _restore_gutka_bani_id
+        ),
+        "gutka_bidirectional": (
+            pipeline._gutka_bidirectional if pipeline else _restore_gutka_bidirectional
+        ),
     }
     try:
         runtime_settings_path.write_text(
@@ -210,6 +313,19 @@ async def lifespan(app: FastAPI):
     if mic_muted_pref:
         pipeline.mic_muted = True
 
+    # Restore gutka-mode state from .runtime_settings.json. Order matters:
+    # set the direction first so the aligner is built with the right flag,
+    # then load the bani (which constructs the aligner), then flip into
+    # gutka mode if that was the last-saved app_mode.
+    pipeline._gutka_bidirectional = _restore_gutka_bidirectional
+    if _restore_gutka_bani_id is not None:
+        try:
+            await pipeline.set_gutka_bani(_restore_gutka_bani_id)
+        except Exception as e:
+            print(f"[Server] Could not restore gutka bani {_restore_gutka_bani_id}: {e}")
+    if _restore_app_mode == "gutka":
+        await pipeline.set_app_mode("gutka")
+
     from tests.eval.job_manager import EvalJobManager
     eval_manager = EvalJobManager(broadcast)
 
@@ -241,6 +357,7 @@ async def index():
 async def websocket_endpoint(websocket: WebSocket):
     """WebSocket endpoint for real-time dashboard communication."""
     global confidence_mode
+
     await websocket.accept()
     clients.append(websocket)
 
@@ -262,6 +379,19 @@ async def websocket_endpoint(websocket: WebSocket):
             "streaming_settings": get_streaming_settings(),
             "engine": config.whisper.engine,
             "engines": list(SUPPORTED_ENGINES),
+            "whisper_engines": list(WHISPER_ENGINES),
+            "indic_engines": list(INDIC_ENGINES),
+            "hf_model_id": config.whisper.hf_model_id,
+            "model_id": config.whisper.hf_model_id,
+            "available_models": list(config.whisper.available_models),
+            "model_families": dict(config.whisper.model_families),
+            "current_family": config.whisper.model_family(),
+            "onnx_precision": config.whisper.onnx_precision,
+            "available_precisions": list(config.whisper.available_precisions),
+            "lm_enabled": config.whisper.lm_enabled,
+            "lm_supported_engines": list(INDIC_ENGINES),
+            "available_banis": _available_banis_payload(),
+            **pipeline.get_gutka_state(),
         }
         if current and current.verses:
             init_state["verses"] = [
@@ -270,6 +400,16 @@ async def websocket_endpoint(websocket: WebSocket):
             ]
         await websocket.send_text(json.dumps(init_state, ensure_ascii=False))
 
+    # Defensive caps — guard against a runaway client OOM-ing the controller
+    # with giant frames or pinning a CPU by spamming commands. Cheap floors,
+    # not real DoS protection.
+    MAX_MESSAGE_BYTES = 16 * 1024  # 16 KiB; control messages are tiny
+    MAX_MESSAGES_PER_SECOND = 50
+
+    import time
+    msg_window_start = time.monotonic()
+    msg_window_count = 0
+
     try:
         while True:
             try:
@@ -277,7 +417,25 @@ async def websocket_endpoint(websocket: WebSocket):
             except (WebSocketDisconnect, RuntimeError):
                 break
 
-            msg = json.loads(data)
+            if len(data) > MAX_MESSAGE_BYTES:
+                await websocket.close(code=1009, reason="message too large")
+                break
+
+            now = time.monotonic()
+            if now - msg_window_start > 1.0:
+                msg_window_start = now
+                msg_window_count = 0
+            msg_window_count += 1
+            if msg_window_count > MAX_MESSAGES_PER_SECOND:
+                await websocket.close(code=1008, reason="rate limit")
+                break
+
+            try:
+                msg = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(msg, dict):
+                continue
 
             if not pipeline:
                 continue
@@ -323,6 +481,28 @@ async def websocket_endpoint(websocket: WebSocket):
 
             elif msg_type == "flush_context":
                 await pipeline.flush_context()
+
+            elif msg_type == "set_app_mode":
+                mode = msg.get("mode", "live")
+                if await pipeline.set_app_mode(mode):
+                    save_runtime_settings()
+
+            elif msg_type == "set_gutka_bani":
+                sqlite_bani_id = msg.get("sqlite_bani_id")
+                if sqlite_bani_id in (None, ""):
+                    await pipeline.set_gutka_bani(None)
+                    save_runtime_settings()
+                else:
+                    try:
+                        if await pipeline.set_gutka_bani(int(sqlite_bani_id)):
+                            save_runtime_settings()
+                    except (TypeError, ValueError):
+                        pass
+
+            elif msg_type == "set_gutka_direction":
+                bidirectional = bool(msg.get("bidirectional", False))
+                await pipeline.set_gutka_direction(bidirectional)
+                save_runtime_settings()
 
             elif msg_type == "set_confidence_mode":
                 mode = msg.get("mode", "balanced")
@@ -377,6 +557,19 @@ async def websocket_endpoint(websocket: WebSocket):
                     "toggles": get_decoder_toggles(),
                 })
 
+            elif msg_type == "set_lm_enabled":
+                # IndicConformer KenLM pair toggle. The engine watches
+                # ``config.whisper.lm_enabled`` and rebuilds the pyctcdecode
+                # decoder + char-LM scorer on the next transcribe(); we don't
+                # need to tear anything down here.
+                enabled = bool(msg.get("enabled", False))
+                config.whisper.lm_enabled = enabled
+                save_runtime_settings()
+                await broadcast({
+                    "type": "lm_enabled_updated",
+                    "lm_enabled": config.whisper.lm_enabled,
+                })
+
             elif msg_type == "set_streaming_settings":
                 # REA-10: streaming-mode + VAD + dedup + LocalAgreement toggles.
                 # Validation (enum values, type coercion) happens inside
@@ -402,40 +595,115 @@ async def websocket_endpoint(websocket: WebSocket):
                 })
 
             elif msg_type == "set_model":
-                # Switch the active Whisper model. Rewrites all engine-specific
-                # cache paths (CT2/MLX/GGML/GGML-q8) via apply_model_id() and
-                # reloads the current engine with the new paths so the swap is
-                # live without a server restart.
+                # Switch the active ASR model. Rewrites engine-specific cache
+                # paths via apply_model_id(), selects a compatible engine family,
+                # and force-reloads so same-engine model changes take effect.
                 model_id = msg.get("model_id")
-                if not isinstance(model_id, str) or model_id not in config.whisper.available_models:
+                if (
+                    not isinstance(model_id, str)
+                    or model_id not in config.whisper.available_models
+                    or not _is_model_selectable(model_id)
+                ):
                     await broadcast({
                         "type": "model_update_failed",
                         "model_id": model_id,
-                        "error": f"Unknown model '{model_id}'.",
+                        "error": (
+                            f"Model '{model_id}' is not available in live mode. "
+                            "Use the Hugging Face demo for Whisper comparison; "
+                            "this dashboard stays on IndicConformer fp32."
+                        ),
                         "current_model_id": config.whisper.hf_model_id,
+                        "current_engine": config.whisper.engine,
                     })
                 else:
+                    if (
+                        model_id == config.whisper.hf_model_id
+                        and config.whisper.engine in INDIC_ENGINES
+                    ):
+                        await broadcast({
+                            "type": "model_updated",
+                            "model_id": config.whisper.hf_model_id,
+                            "engine": config.whisper.engine,
+                            "current_family": config.whisper.model_family(),
+                            "decoder_toggles": get_decoder_toggles(),
+                            "streaming_settings": get_streaming_settings(),
+                        })
+                        continue
                     await broadcast({
                         "type": "model_loading",
                         "model_id": model_id,
                     })
                     previous_model_id = config.whisper.hf_model_id
+                    previous_engine = config.whisper.engine
                     config.whisper.apply_model_id(model_id)
-                    ok, err = await pipeline.switch_engine(config.whisper.engine)
+                    family = config.whisper.model_family(model_id)
+                    if family == "indicconformer":
+                        target_engine = INDIC_ENGINES[0]
+                    elif config.whisper.engine in WHISPER_ENGINES:
+                        target_engine = config.whisper.engine
+                    else:
+                        target_engine = WHISPER_ENGINES[0]
+                    ok, err = await pipeline.switch_engine(target_engine, force_reload=True)
                     if ok:
                         save_runtime_settings()
                         await broadcast({
                             "type": "model_updated",
                             "model_id": config.whisper.hf_model_id,
+                            "engine": config.whisper.engine,
+                            "current_family": config.whisper.model_family(),
+                            "decoder_toggles": get_decoder_toggles(),
+                            "streaming_settings": get_streaming_settings(),
                         })
                     else:
                         # Roll back so the dashboard reflects what's actually loaded.
                         config.whisper.apply_model_id(previous_model_id)
+                        config.whisper.engine = previous_engine
                         await broadcast({
                             "type": "model_update_failed",
                             "model_id": model_id,
                             "error": err or "Engine reload failed.",
                             "current_model_id": config.whisper.hf_model_id,
+                            "current_engine": config.whisper.engine,
+                        })
+
+            elif msg_type == "set_precision":
+                # IndicConformer ONNX precision swap. Same reload pattern as
+                # set_engine — the engine's reload_if_precision_changed() also
+                # handles in-flight transcribes, but doing the explicit
+                # switch_engine here keeps the dashboard's engine_loading /
+                # engine_updated flow consistent with the rest of the app.
+                prec = msg.get("precision")
+                if prec not in config.whisper.available_precisions:
+                    await broadcast({
+                        "type": "precision_update_failed",
+                        "precision": prec,
+                        "error": f"Unknown precision '{prec}'.",
+                        "current_precision": config.whisper.onnx_precision,
+                    })
+                elif config.whisper.engine not in INDIC_ENGINES:
+                    await broadcast({
+                        "type": "precision_update_failed",
+                        "precision": prec,
+                        "error": "Precision applies to IndicConformer engines only.",
+                        "current_precision": config.whisper.onnx_precision,
+                    })
+                else:
+                    previous = config.whisper.onnx_precision
+                    config.whisper.onnx_precision = prec
+                    ok, err = await pipeline.switch_engine(config.whisper.engine)
+                    if ok:
+                        save_runtime_settings()
+                        await broadcast({
+                            "type": "precision_updated",
+                            "precision": config.whisper.onnx_precision,
+                        })
+                    else:
+                        config.whisper.onnx_precision = previous
+                        await broadcast({
+                            "type": "precision_update_failed",
+                            "precision": prec,
+                            "error": err or "Engine reload failed.",
+                            "current_precision": config.whisper.onnx_precision,
                         })
 
             elif msg_type == "set_engine":
@@ -445,6 +713,17 @@ async def websocket_endpoint(websocket: WebSocket):
                         "type": "engine_update_failed",
                         "engine": name,
                         "error": f"Unknown engine '{name}'.",
+                    })
+                elif name in WHISPER_ENGINES:
+                    await broadcast({
+                        "type": "engine_update_failed",
+                        "engine": name,
+                        "error": (
+                            "Local Whisper engines are disabled in live mode. "
+                            "Use the Hugging Face demo for Whisper comparison; "
+                            "this dashboard stays on IndicConformer fp32."
+                        ),
+                        "current_engine": config.whisper.engine,
                     })
                 else:
                     await broadcast({

@@ -36,7 +36,13 @@ class AudioCapture:
     def _callback(self, indata: np.ndarray, frames: int, time_info, status):
         if status:
             print(f"[AudioCapture] status: {status}")
-        block = indata[:, 0]  # mono: first channel
+        # Downmix to mono. Loopback devices (BlackHole) carry stereo; averaging
+        # both channels preserves anything panned hard left/right (taking just
+        # channel 0 would drop the right side of a stereo source).
+        if indata.ndim > 1 and indata.shape[1] > 1:
+            block = indata.mean(axis=1)
+        else:
+            block = indata[:, 0] if indata.ndim > 1 else indata
         n = block.shape[0]
         if n == 0:
             return
@@ -64,10 +70,23 @@ class AudioCapture:
         with self._ring_lock:
             self._ring.fill(0.0)
             self._samples_written = 0
+        # Some devices (notably BlackHole loopback) only accept being opened at
+        # their native channel count — CoreAudio rejects channels=1 with
+        # PaErrorCode -9998. Query the device and request what it actually
+        # supports; the callback downmixes to mono.
+        channels = config.audio.channels
+        if self.device is not None:
+            try:
+                info = sd.query_devices(self.device)
+                max_in = int(info.get("max_input_channels", 0))
+                if max_in >= 1:
+                    channels = min(max(channels, 1), max_in) if max_in == 1 else max_in
+            except Exception as e:
+                print(f"[AudioCapture] Could not query device {self.device}: {e}")
         try:
             self._stream = sd.InputStream(
                 samplerate=self.samplerate,
-                channels=config.audio.channels,
+                channels=channels,
                 dtype=config.audio.dtype,
                 callback=self._callback,
                 blocksize=int(self.samplerate * 0.5),  # 500ms blocks
@@ -142,21 +161,35 @@ class AudioCapture:
             self._ring.fill(0.0)
             self._samples_written = 0
 
-    # Virtual / loopback devices we never want to expose in the dashboard picker.
-    _VIRTUAL_DEVICE_HINTS = (
-        "blackhole",
+    # Virtual conferencing devices we never want to expose in the dashboard picker
+    # (they capture nothing useful for kirtan recognition).
+    _HIDDEN_DEVICE_HINTS = (
         "microsoft teams",
         "teams audio",
         "speaker audio recorder",
         "zoom",
-        "loopback",
         "aggregate",
         "multi-output",
     )
 
+    # System-audio loopback devices — surfaced under a "System Audio" group so the
+    # user can recognize whatever's playing through the Mac (e.g. a YouTube
+    # gurdwara stream) instead of mic input. Requires the loopback driver to be
+    # installed (e.g. `brew install blackhole-2ch`) and routed via a Multi-Output
+    # Device — see scripts/setup_audio.py.
+    _LOOPBACK_DEVICE_HINTS = (
+        "blackhole",
+        "loopback",
+    )
+
     @staticmethod
-    def list_devices() -> list[dict]:
-        """List physical microphone input devices (virtual/loopback hidden)."""
+    def list_devices(include_loopback: bool = True) -> list[dict]:
+        """List input devices. Each entry carries `kind`: "mic" or "loopback".
+
+        Loopback devices (BlackHole etc.) are returned when `include_loopback` is
+        True so the dashboard can offer "System Audio" alongside physical mics.
+        Conferencing virtual devices stay hidden regardless.
+        """
         try:
             sd = _get_sd()
         except OSError:
@@ -167,13 +200,17 @@ class AudioCapture:
             if dev["max_input_channels"] <= 0:
                 continue
             name_lower = dev["name"].lower()
-            if any(hint in name_lower for hint in AudioCapture._VIRTUAL_DEVICE_HINTS):
+            if any(hint in name_lower for hint in AudioCapture._HIDDEN_DEVICE_HINTS):
+                continue
+            is_loopback = any(hint in name_lower for hint in AudioCapture._LOOPBACK_DEVICE_HINTS)
+            if is_loopback and not include_loopback:
                 continue
             inputs.append({
                 "index": i,
                 "name": dev["name"],
                 "channels": dev["max_input_channels"],
                 "default": i == sd.default.device[0],
+                "kind": "loopback" if is_loopback else "mic",
             })
         return inputs
 

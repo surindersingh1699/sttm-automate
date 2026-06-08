@@ -39,6 +39,7 @@ class WhisperConfig(BaseModel):
     # "faster-whisper" = CTranslate2 int8 (default, cross-platform CPU)
     # "mlx-whisper"    = Apple MLX (GPU/ANE, macOS Apple Silicon only)
     # "whisper-cpp"    = whisper.cpp via pywhispercpp (cross-platform incl. iOS)
+    # "indicconformer" = AI4Bharat IndicConformer hybrid CTC/RNN-T via NeMo
     engine: str = "faster-whisper"
     # Active model (HuggingFace repo id). User-selectable from the dashboard.
     # The engine-specific cache paths below derive from this — switching the
@@ -46,11 +47,21 @@ class WhisperConfig(BaseModel):
     hf_model_id: str = "surindersinghssj/surt-small-v3"
     # Registry of selectable models. Add a new HF repo id here to expose it
     # in the dashboard's model dropdown. Each entry is auto-converted to the
-    # active engine's cache format on first load (CT2 / MLX / GGML).
+    # active engine's cache format on first load (CT2 / MLX / GGML / .nemo).
     available_models: list[str] = [
         "surindersinghssj/surt-small-v3",
         "surindersinghssj/surt-small-turbo-baseline-v0",
+        "surindersinghssj/indicconformer-pa-v3-kirtan",
     ]
+    # Model family classifier — drives which engine set is valid for each
+    # entry in available_models, and which Whisper-style cache paths get
+    # rewritten by apply_model_id(). NeMo models bypass the GGML/CT2/MLX
+    # conversion machinery entirely.
+    model_families: dict[str, str] = {
+        "surindersinghssj/surt-small-v3": "whisper",
+        "surindersinghssj/surt-small-turbo-baseline-v0": "whisper",
+        "surindersinghssj/indicconformer-pa-v3-kirtan": "indicconformer",
+    }
     local_model_dir: str = "data/surt-small-v3-ct2"  # where the converted CT2 model lives
     # MLX-specific:
     mlx_model_dir: str = "data/surt-small-v3-mlx"  # converted MLX weights cache (Apple Metal)
@@ -91,17 +102,112 @@ class WhisperConfig(BaseModel):
     hg_logprob_thold: float = -2.5       # very lenient — sung speech has much lower per-token confidence
     hg_entropy_thold: float = 8.0        # loosened from 2.4 (kirtan refrains are legitimately repetitive)
     hg_temperature_inc: float = 0.2      # fallback ladder step (0 → no fallback)
+    # ── IndicConformer (ONNX, CTC) ──────────────────────────────────────
+    # CTC-only ONNX export of our fine-tuned IndicConformer-pa, served via
+    # sherpa-onnx. Three precisions live side-by-side under
+    # ``{onnx_model_dir}/{onnx_precision}/indicconformer-pa-ctc.onnx`` with a
+    # shared ``tokens.txt`` at the root; the engine downloads the relevant
+    # files from the HF repo on first load if they aren't already there.
+    onnx_model_dir: str = "~/models/exports-pa"
+    # Active precision — selectable from the dashboard.
+    #   fp32 — accuracy reference (~470 MB)
+    #   fp16 — currently BROKEN: NeMo→ONNX fp16 export left mixed float/half
+    #          tensors at /pre_encode/Add and onnxruntime refuses to load it.
+    #          Re-export with the cast fixed before re-enabling.
+    #   int8 — currently disabled: the export uses ConvInteger, which the
+    #          onnxruntime CPU execution provider cannot run reliably.
+    onnx_precision: str = "fp32"
+    available_precisions: tuple[str, ...] = ("fp32",)
+    # CPU thread count for the ONNX session.
+    onnx_threads: int = 4
+    # Chunked streaming for IndicConformer (StreamingConfig.streaming_mode="nemo_chunked").
+    # Decode every `nemo_chunk_len_s` seconds of audio standalone (no VAD gating,
+    # no rolling window). Latency ≈ chunk_len_s; CPU cost ≈ one decode per chunk.
+    # Wider chunk = more acoustic context per CTC decode → fewer boundary
+    # errors and stronger LM-fusion benefit; per-second decode work stays
+    # roughly flat because hop scales with chunk length. 2.5 s is the
+    # accuracy sweet spot for kirtan: long enough to capture a full pankti
+    # of context, short enough that line tracking stays responsive and we
+    # stay well inside the model's 15 s fine-tune cap.
+    nemo_chunk_len_s: float = 2.5
+    # Optional left-context audio fed to the model alongside each chunk to give
+    # the encoder a warm-up region before the new audio. We only KEEP the new
+    # text — context exists purely to stabilize the encoder's first frames.
+    # 0 disables; 0.6 s pairs naturally with the 2.5 s chunk above.
+    nemo_chunk_context_s: float = 0.6
+
+    # ── KenLM language-model fusion (IndicConformer only) ──────────────
+    # Two-LM pair, both gated by ``lm_enabled``:
+    #   - BPE 4-gram via pyctcdecode for in-beam shallow fusion
+    #   - char 6-gram run post-hoc as a hallucination PPL gate
+    # Either piece silently falls back to greedy/no-gate if its .bin or
+    # Python dep (kenlm / pyctcdecode) isn't available. See
+    # ``docs/asr-engines.md`` for the full picture.
+    # Default OFF based on 2026-05-23 eval: in-beam BPE LM fusion at α=0.3-0.5
+    # left lock accuracy/TTFCL unchanged but dragged composite pct_time_correct
+    # from 75% → 58% on the cached `-Dyi8-Qyx4I` session because canonical n-gram
+    # bias canonicalised CTC into a plausible-but-wrong pankti within the right
+    # shabad, fooling the line matcher. The post-hoc char gate (relaxed below)
+    # is still wired up so anyone flipping this on gets sensible defaults.
+    # Re-evaluate before re-defaulting to True — likely needs per-pankti rescore
+    # rather than in-beam fusion.
+    lm_enabled: bool = False
+    lm_bpe_path: str = "models/lm/gurbani_canon_bpe_4gram.bin"
+    lm_char_path: str = "models/lm/gurbani_canon_char_6gram.bin"
+    # In-beam fusion weights — sweep on the eval set if changed.
+    #   α weights log P_LM in the beam score
+    #   β is a word-insertion bonus (higher = more words per second)
+    # α at 0.3 (down from upstream 0.5) is the lightest fusion that still
+    # lifts standalone WER on alaap-heavy windows — used if the toggle is
+    # re-enabled. 0.5 was too strong and dragged line tracking measurably.
+    lm_alpha: float = 0.3
+    lm_beta: float = 1.5
+    # 64 beams is the tightest setting that keeps the LM accuracy lift on
+    # held-out kirtan while bringing decode latency well within the
+    # per-chunk budget. 100+ beams added <0.5 % WER for ~1.6× the CTC cost.
+    lm_beam_width: int = 64
+    # Hallucination gate (char-LM perplexity per char). Defaults calibrated
+    # to canon ~3-4 / modern Punjabi ~6-8 / garbage 200+ — see lm_scorer.py.
+    # Threshold raised to 80 (from 25) after live eval showed the strict
+    # gate was dropping real CTC outputs with vowel-attachment / word-
+    # boundary artifacts (per_char_PPL 30-110) that the matcher would
+    # otherwise have used for first-letter retrieval. 80 still blocks
+    # outright Devanagari/random hallucinations (PPL 200+) without
+    # penalising the model's everyday CTC noise.
+    lm_hallucination_ppl_threshold: float = 80.0
+    lm_low_confidence_ppl_threshold: float = 40.0
+    # Short outputs (< this many chars) skip the gate. Raised from 6 → 15
+    # so single-pankti fragments (which are first-letter useful even when
+    # noisy) don't get accidentally axed.
+    lm_gate_min_chars: int = 15
+
+    def model_family(self, model_id: str | None = None) -> str:
+        """Return ``"whisper"`` or ``"indicconformer"`` for the given model id.
+
+        Defaults to the active model. Unknown ids fall back to ``"whisper"``
+        — the legacy assumption — so config files written before the family
+        registry shipped continue to work.
+        """
+        mid = model_id or self.hf_model_id
+        return self.model_families.get(mid, "whisper")
 
     def apply_model_id(self, model_id: str) -> None:
-        """Switch the active model; rewrite all engine-specific cache paths.
+        """Switch the active model; rewrite engine-specific cache paths.
 
-        Each engine reads its model location from these fields, so the four
-        paths must move together. Caller is responsible for triggering an
-        engine reload (``pipeline.switch_engine(current_engine)``) afterward
-        so the new weights are actually loaded.
+        For Whisper models we update all four cache paths (CT2/MLX/GGML/GGML-q8)
+        together so any of the four engines can pick up the swap. For
+        IndicConformer the active artifacts live under ``onnx_model_dir`` and
+        track the HF repo id directly, so there's no per-model cache path to
+        rewrite here.
+
+        Caller is responsible for triggering an engine reload
+        (``pipeline.switch_engine(current_engine)``) afterward so the new
+        weights are actually loaded.
         """
         short = model_id.rsplit("/", 1)[-1]
         self.hf_model_id = model_id
+        if self.model_family(model_id) == "indicconformer":
+            return
         self.local_model_dir = f"data/{short}-ct2"
         self.mlx_model_dir = f"data/{short}-mlx"
         self.whisper_cpp_model_path = f"data/{short}.ggml"
@@ -187,10 +293,17 @@ class MatcherConfig(BaseModel):
     min_words_for_line_advance: int = 2
     # Line-advance gate — keeps the pointer on the current pangati until the ragi has
     # actually left it. Without this, the 3 s micro window advances mid-line as soon
-    # as the next line's first syllable bleeds in. Matches the micro window duration
-    # so the pointer cannot advance faster than one window tick.
-    min_line_dwell_seconds: float = 4.5
-    line_advance_override_score: float = 0.82  # next-line score that bypasses the dwell gate
+    # as the next line's first syllable bleeds in.
+    # Tightened 4.5 → 3.0 on 2026-05-23 after multi-video eval showed a
+    # consistent 2-3 line LAG behind GT on a 5-video sample (wrong_line
+    # median 28.6%). 4.5 s held the pointer for longer than the typical
+    # pankti, so each ragi advance landed 1-2 panktis behind. 3.0 s ≈ the
+    # naive-mode step duration — the pointer can now advance once per
+    # decode tick when evidence supports it.
+    min_line_dwell_seconds: float = 3.0
+    # Override score lowered 0.82 → 0.75 so a strong "we just jumped lines"
+    # match (e.g. the rahau looping back) bypasses dwell more readily.
+    line_advance_override_score: float = 0.75
     fast_speech_letters_per_second: float = 1.50  # above this, favor shorter windows
     slow_speech_letters_per_second: float = 0.65  # below this, favor longer windows
     speech_rate_ema_alpha: float = 0.35  # smoothing factor for speech-rate estimate
@@ -258,6 +371,19 @@ class MatcherConfig(BaseModel):
     fast_response_enabled: bool = False
     fast_min_line_dwell_seconds: float = 3.0
     fast_suggest_confirmation_seconds: float = 2.5
+    # IndicConformer ASR confidence gating — uses CTC acoustic confidence from
+    # TranscriptionSegment. Conservative by default: low-confidence windows lose
+    # lock/switch authority; high-confidence windows get a small score nudge.
+    indic_asr_confidence_enabled: bool = True
+    indic_asr_low_confidence: float = 0.45
+    indic_asr_high_confidence: float = 0.78
+    indic_asr_low_score_multiplier: float = 0.85
+    indic_asr_high_score_bonus: float = 0.03
+    # Optional learned lock ranker. The rule-based score remains the fallback;
+    # enabling this blends in a calibrated probability from a small sklearn model.
+    learned_ranker_enabled: bool = False
+    learned_ranker_model_path: str = "models/lock_ranker.joblib"
+    learned_ranker_weight: float = 0.35
 
 
 class StreamingConfig(BaseModel):
@@ -277,6 +403,11 @@ class StreamingConfig(BaseModel):
     #                     prefix two consecutive decodes agree on (Macháček 2023).
     # hybrid           — VAD-bounded utterance buffers + LocalAgreement-2 inside.
     #                     Production target.
+    # nemo_chunked     — IndicConformer-only: decode every `nemo_chunk_len_s` seconds
+    #                     of audio standalone. Bypasses VAD entirely so fast bani
+    #                     (no breath gaps) doesn't merge multiple panktis into one
+    #                     decode. Whisper-engine guard rails make this a no-op for
+    #                     non-NeMo engines — they fall back to naive automatically.
     streaming_mode: str = "naive"
 
     # ── VAD ─────────────────────────────────────────────────────────────
@@ -341,8 +472,14 @@ class STTMConfig(BaseModel):
 
 
 class DashboardConfig(BaseModel):
-    host: str = "0.0.0.0"
+    # Default to localhost-only. Token auth is meant as a polite gate, not a
+    # MITM defence — keeping the listener bound to 127.0.0.1 means an
+    # attacker has to already be on this Mac to even *try* a token guess.
+    # Set STTM_LAN_MODE=1 (or `lan_mode = true` in .runtime_settings.json)
+    # to expose the controller on the local network for sangat-mode clients.
+    host: str = "127.0.0.1"
     port: int = 8080
+    lan_mode: bool = False  # when True, host flips to 0.0.0.0
     max_candidates: int = 5  # top N candidates to show
 
 
@@ -353,6 +490,22 @@ class DatabaseConfig(BaseModel):
     hf_filename: str = "database.sqlite"
 
 
+class GutkaConfig(BaseModel):
+    # Gutka follow-along aligner tuning. Inert until the user flips app_mode
+    # to "gutka" and picks a bani — open-ended live recognition ignores these.
+    forward_window: int = 12          # candidate lines scanned ahead of current_idx
+    backward_window: int = 4          # additional lines scanned behind (bidirectional only)
+    min_score: float = 0.54           # span-alignment threshold to commit a move
+    min_margin: float = 0.04          # winner must beat runner-up by this margin
+    max_span_lines: int = 3           # score 1..N consecutive panktis per chunk
+    min_matched_letters: int = 2      # ignore extremely short/noisy ASR fragments
+    rahau_repeat_enabled: bool = True # re-fire current line on confident repeat
+    step_duration: float = 0.8        # naive-mode wake cadence while in gutka mode
+    window_duration: float = 2.4      # latest audio sent to ASR while in gutka mode
+    nemo_chunk_len_s: float = 1.0     # Indic chunk size when nemo_chunked + gutka
+    nemo_chunk_context_s: float = 0.4 # left context for short Indic gutka chunks
+
+
 class AppConfig(BaseModel):
     audio: AudioConfig = AudioConfig()
     whisper: WhisperConfig = WhisperConfig()
@@ -361,7 +514,89 @@ class AppConfig(BaseModel):
     sttm: STTMConfig = STTMConfig()
     dashboard: DashboardConfig = DashboardConfig()
     database: DatabaseConfig = DatabaseConfig()
+    gutka: GutkaConfig = GutkaConfig()
 
 
 # Global config instance
 config = AppConfig()
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Engine-family tuning profiles
+# ──────────────────────────────────────────────────────────────────────
+#
+# These profiles flip a small whitelist of audio + streaming knobs so the
+# capture pipeline matches what each engine family actually wants. They do
+# NOT touch matcher knobs — that's `set_confidence_mode`'s job. Call
+# `apply_engine_profile()` after a model/engine swap or at startup once
+# `.runtime_settings.json` has been merged in.
+#
+# Why a whitelist instead of full presets? The user-tunable knobs in
+# `.runtime_settings.json` should keep winning when they don't conflict
+# with engine-family invariants. We only override the keys whose "right
+# default" depends on the engine.
+
+# Per (family, speed) overlay. Speed is a hint — "normal" (default) is the
+# safe baseline; "fast" tightens VAD + capture cadence for fast recitation.
+_ENGINE_PROFILES: dict[tuple[str, str], dict[str, dict[str, object]]] = {
+    # Whisper baseline — restores legacy values so swapping back from
+    # IndicConformer doesn't strand the operator with indic-tuned VAD.
+    ("whisper", "normal"): {
+        "streaming": {
+            "vad_min_silence_ms": 200,
+            "vad_min_speech_ms": 300,
+            "vad_max_utterance_ms": 30000,
+        },
+        "audio": {
+            "fast_step_duration": 1.5,
+        },
+    },
+    # IndicConformer baseline — loosely matches what the existing
+    # `pin_indic_best_settings` already enforces, plus VAD knobs.
+    ("indicconformer", "normal"): {
+        "streaming": {
+            "vad_min_silence_ms": 180,
+            "vad_min_speech_ms": 250,
+            "vad_max_utterance_ms": 8000,
+        },
+        "audio": {
+            "fast_step_duration": 1.2,
+        },
+    },
+    # IndicConformer FAST — tuned for very rapid Nitnem-style recitation.
+    # Cuts utterances on shorter breaths, force-flushes utterances at 2.5 s
+    # so one decode ≈ one pankti even when the ragi barely pauses.
+    ("indicconformer", "fast"): {
+        "streaming": {
+            "vad_min_silence_ms": 100,
+            "vad_min_speech_ms": 150,
+            "vad_max_utterance_ms": 2500,
+            "vad_speech_pad_ms": 100,
+        },
+        "audio": {
+            "fast_step_duration": 0.8,
+        },
+    },
+}
+
+
+def apply_engine_profile(family: str | None = None, speed: str = "normal") -> bool:
+    """Apply audio/streaming defaults for the given engine family.
+
+    Returns True if a profile was applied. Unknown (family, speed) pairs are
+    a no-op (return False) so callers can pass through user input safely.
+    Idempotent — calling twice with the same args is identical to calling once.
+    """
+    if family is None:
+        family = config.whisper.model_family()
+    overlay = _ENGINE_PROFILES.get((family, speed))
+    if overlay is None:
+        return False
+    for section_name, section_overrides in overlay.items():
+        section = getattr(config, section_name, None)
+        if section is None:
+            continue
+        for key, value in section_overrides.items():
+            if hasattr(section, key):
+                setattr(section, key, value)
+    return True

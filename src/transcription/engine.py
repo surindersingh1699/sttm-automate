@@ -191,6 +191,9 @@ class FasterWhisperEngine(BaseTranscriptionEngine):
                         start=seg.start,
                         end=seg.end,
                         text=text,
+                        avg_logprob=float(seg.avg_logprob),
+                        confidence=None,
+                        entropy=float(seg.compression_ratio),
                     )
                 )
         return out
