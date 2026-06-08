@@ -194,6 +194,7 @@ class _IndexedLine:
     page_no: int
     words: frozenset[str]
     char4: frozenset[str]
+    full: str          # matras-kept normalized chars (spaces removed) — content signal
 
 
 @dataclass(frozen=True)
@@ -209,6 +210,7 @@ class _IndexedSpan:
     page_no: int
     words: frozenset[str]
     char4: frozenset[str]
+    full: str          # matras-kept normalized chars (spaces removed) — content signal
 
 
 class OfflineShabadSearcher:
@@ -404,6 +406,7 @@ class OfflineShabadSearcher:
                     page_no=row["source_page"] or 0,
                     words=frozenset(_tokenize_gurmukhi_words(normalized)),
                     char4=_char_4grams(normalized),
+                    full=normalized.replace(" ", ""),
                 )
             )
 
@@ -419,6 +422,7 @@ class OfflineShabadSearcher:
                 ascii_parts: list[str] = []
                 unicode_parts: list[str] = []
                 fl_parts: list[str] = []
+                full_parts: list[str] = []
                 words: set[str] = set()
                 char4: set[str] = set()
                 for end_idx in range(start_idx, min(len(lines), start_idx + 3)):
@@ -426,6 +430,7 @@ class OfflineShabadSearcher:
                     ascii_parts.append(part.gurmukhi_ascii)
                     unicode_parts.append(part.unicode)
                     fl_parts.append(part.first_letters_ascii)
+                    full_parts.append(part.full)
                     words.update(part.words)
                     char4.update(part.char4)
                     span_fl = "".join(fl_parts)
@@ -444,6 +449,7 @@ class OfflineShabadSearcher:
                         page_no=line.page_no,
                         words=frozenset(words),
                         char4=frozenset(char4),
+                        full="".join(full_parts),
                     )
                     span_index.append(span)
                     for gram in self._ascii_grams(span_fl):
@@ -499,6 +505,9 @@ class OfflineShabadSearcher:
         normalized = normalize_for_fullword_search(transcript_text) if transcript_text else ""
         q_words = frozenset(_tokenize_gurmukhi_words(normalized))
         q_char4 = _char_4grams(normalized)
+        # Matras-kept content string for the primary "matra" signal. Capped so a
+        # pathologically long window can't blow up the per-span LCS.
+        q_full = normalized.replace(" ", "")[:120]
 
         seed_ids: set[int] = set()
         for gram in self._ascii_grams(query_ascii):
@@ -514,19 +523,36 @@ class OfflineShabadSearcher:
         best_per_shabad: dict[int, tuple[float, _IndexedSpan, int, float, float, float]] = {}
         for span_id in seed_ids:
             span = self._span_index[span_id]
+            # Content-first scoring. The "matra" signal — normalized-LCS coverage
+            # over the full Gurmukhi text WITH matras kept — is the primary selector.
+            # An N=100 A/B on real ASR (docs/line-matching-encoding-ab.md) put matra
+            # at 69/100 top-1 vs first-letters' 9/100 and showed dropping matras
+            # costs ~12 top-1. Word overlap is secondary; first-letters are demoted
+            # to a minor cue (they still drive retrieval via the FL-gram seed index).
+            # char-4gram overlap is kept only for the recall gate, not the blend —
+            # matra coverage subsumes it.
+            matra_score = (
+                _lcs_len(q_full, span.full) / len(span.full)
+                if q_full and span.full else 0.0
+            )
             fl_score = _span_fl_score(query_ascii, span.first_letters_ascii)
             word_score = _overlap_coeff(q_words, span.words)
             char_score = _overlap_coeff(q_char4, span.char4)
-            if fl_score < 0.20 and word_score < 0.34 and char_score < config.matcher.ngram4_min_overlap:
+            if (
+                matra_score < 0.25
+                and word_score < 0.34
+                and fl_score < 0.20
+                and char_score < config.matcher.ngram4_min_overlap
+            ):
                 continue
 
             weights: list[tuple[float, float]] = []
-            if query_ascii:
-                weights.append((0.58, fl_score))
+            if q_full and span.full:
+                weights.append((0.60, matra_score))
             if q_words:
-                weights.append((0.27, word_score))
-            if q_char4:
-                weights.append((0.15, char_score))
+                weights.append((0.25, word_score))
+            if query_ascii:
+                weights.append((0.15, fl_score))
             if not weights:
                 continue
             total_weight = sum(weight for weight, _ in weights)
